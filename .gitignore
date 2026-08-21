@@ -39,3 +39,8 @@ next-env.d.ts
 # ~/Downloads/repurpose-projects, ~/Downloads/repurpose-overlays,
 # and $TMPDIR/repurpose-proxy — kept here in case a user relocates them)
 /.repurpose-data/
+
+# generated test media and browser artifacts
+/tests/fixtures/generated/
+/test-results/
+/.gstack/qa-reports/playwright-html/
