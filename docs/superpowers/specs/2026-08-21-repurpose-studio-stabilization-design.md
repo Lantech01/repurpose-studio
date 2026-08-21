@@ -2,7 +2,7 @@
 
 Date: 2026-08-21
 Branch: `fix/stabilize-editor`
-Status: Approved in conversation, pending written-spec review
+Status: Approved in conversation and written-spec review; implementation pending
 
 ## Context
 
