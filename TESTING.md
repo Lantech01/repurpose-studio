@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Node.js 20.19+ or Node.js 22.13+, and npm.
+- Node.js 20.19.x, Node.js 22.13.x, or Node.js 24+, and npm.
 - `ffmpeg` and `ffprobe` available on `PATH`; the ffmpeg build must include `libx265`.
 - Python 3.10 or newer and `uv` for the optional SFX engine and its future integration tests.
 - An installed Google Chrome browser. Playwright uses the installed `chrome` channel, so do not download a bundled browser.
