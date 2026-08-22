@@ -45,7 +45,11 @@ import {
   LockSimple,
   LockSimpleOpen,
 } from "@phosphor-icons/react";
-import { useRepurposeStore, PLAYBACK_RATES } from "@/lib/repurpose/store";
+import {
+  getPlaybackBlockedReason,
+  PLAYBACK_RATES,
+  useRepurposeStore,
+} from "@/lib/repurpose/store";
 import type { ClipTransition } from "@/lib/repurpose/types";
 
 export interface TransportBarProps {
@@ -150,6 +154,7 @@ export function TransportBar({ className }: TransportBarProps) {
   const outPoint = useRepurposeStore((s) => s.outPoint);
   const loopPlayback = useRepurposeStore((s) => s.loopPlayback);
   const fps = useRepurposeStore((s) => s.footageMeta?.fps) ?? FALLBACK_FPS;
+  const blockedReason = useRepurposeStore(getPlaybackBlockedReason);
 
   const togglePlay = useRepurposeStore((s) => s.togglePlay);
   const stepFrame = useRepurposeStore((s) => s.stepFrame);
@@ -237,6 +242,9 @@ export function TransportBar({ className }: TransportBarProps) {
   }, []);
 
   const disabled = duration <= 0;
+  const canPlay = blockedReason === null;
+  const playButtonDisabled = !canPlay;
+  const playbackStatusId = "transport-playback-status";
   const effectiveFps = fps > 0 ? fps : FALLBACK_FPS;
   const hasRegion = inPoint !== null || outPoint !== null;
 
@@ -431,12 +439,19 @@ export function TransportBar({ className }: TransportBarProps) {
         <button
           type="button"
           onClick={togglePlay}
-          disabled={disabled}
-          title={isPlaying ? "Pause (Space)" : "Play (Space)"}
+          disabled={playButtonDisabled}
+          title={
+            blockedReason
+              ? blockedReason
+              : isPlaying
+                ? "Pause (Space)"
+                : "Play (Space)"
+          }
           aria-label={isPlaying ? "Pause" : "Play"}
+          aria-describedby={blockedReason ? playbackStatusId : undefined}
           className="mx-1 grid h-11 w-11 place-items-center rounded-full bg-[#FF6B35] text-white transition-all hover:bg-[#FF8F6B] active:scale-95 disabled:opacity-40 disabled:hover:bg-[#FF6B35]"
           style={{
-            boxShadow: disabled
+            boxShadow: playButtonDisabled
               ? "none"
               : "0 6px 16px -4px rgba(255,107,53,0.5), 0 2px 6px -2px rgba(0,0,0,0.4)",
           }}
@@ -448,6 +463,17 @@ export function TransportBar({ className }: TransportBarProps) {
             <Play size={20} weight="fill" className="translate-x-px" />
           )}
         </button>
+
+        {blockedReason && (
+          <span
+            id={playbackStatusId}
+            role="status"
+            aria-live="polite"
+            className="max-w-36 text-center text-[11px] leading-tight text-amber-300"
+          >
+            {blockedReason}
+          </span>
+        )}
 
         <GhostButton
           onClick={() => stepFrame(1)}

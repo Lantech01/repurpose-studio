@@ -32,6 +32,16 @@ import {
   type OverlayDraw,
 } from "@/lib/repurpose/compositor";
 import { useRepurposeStore } from "@/lib/repurpose/store";
+import { synchronizeMediaTime } from "@/lib/repurpose/media-sync";
+import {
+  BASE_MEDIA_DRIFT_TOLERANCE_SEC,
+  EXTERNAL_SEEK_TOLERANCE_SEC,
+  OVERLAY_MEDIA_DRIFT_TOLERANCE_SEC,
+  reanchorTransport,
+  sampleTransport,
+  startTransport,
+  type TransportAnchor,
+} from "@/lib/repurpose/transport-clock";
 import {
   timelineToSourceTime,
   transitionProgressAt,
@@ -74,12 +84,28 @@ export interface PreviewCanvasProps {
   height?: number;
   /** Extra className applied to the outer wrapper (sizing/positioning is the caller's job). */
   className?: string;
+  /** Test/dev injection for deterministic monotonic-frame scheduling. */
+  frameScheduler?: PreviewFrameScheduler;
 }
+
+export interface PreviewFrameScheduler {
+  request(callback: FrameRequestCallback): number;
+  cancel(id: number): void;
+  now(): number;
+}
+
+const BROWSER_FRAME_SCHEDULER: PreviewFrameScheduler = {
+  request: (callback) => requestAnimationFrame(callback),
+  cancel: (id) => cancelAnimationFrame(id),
+  now: () => performance.now(),
+};
 
 const MIN_SPLIT = 0.4;
 const MAX_SPLIT = 0.6;
 const ZOOM_MIN = 1;
 const ZOOM_MAX = 6;
+const BASE_MEDIA_LOAD_ERROR =
+  "Chrome could not load this video. Re-import it to create a compatible copy.";
 
 // Size of the double-buffer video pool PER SOURCE: 1 active pair +
 // (SLOT_COUNT - 1) standby pairs. Depth 2 means the NEXT cut *and* the cut
@@ -90,20 +116,6 @@ const ZOOM_MAX = 6;
 const SLOT_COUNT = 3;
 const STANDBY_DEPTH = SLOT_COUNT - 1;
 const SLOT_INDICES = Array.from({ length: SLOT_COUNT }, (_, i) => i);
-
-// During playback the FACE video is the master clock: within one contiguous
-// clip we DERIVE the playhead from faceVideo.currentTime rather than advancing
-// it by wall time and re-seeking the video to match. That was the old glitch --
-// two independent clocks (the store playhead vs. the video's own currentTime)
-// disagreed every frame, so a >tolerance drift check hard-seeked the face video
-// back constantly, stuttering it. Now we only hard-seek at a CLIP CUT (a real
-// source discontinuity); mid-clip the video decodes smoothly and the playhead
-// follows it, so there is nothing to stutter.
-//
-// A tiny guard band: treat the video as "still inside this clip" until its
-// currentTime reaches within this many seconds of the clip's srcEnd, then hand
-// off to the next clip. One frame at 30fps.
-const CLIP_CUT_EPSILON = 1 / 30;
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
@@ -119,16 +131,6 @@ function activeClipAt(clips: readonly Clip[], t: number): Clip | null {
   }
   // At/just past the very end, the last kept clip is still the active one.
   if (lastKept && t >= lastKept.timelineEnd) return lastKept;
-  return null;
-}
-
-/** The next kept clip AFTER `clip` in array order, or null if it's the last. */
-function nextKeptClipAfter(clips: readonly Clip[], clip: Clip): Clip | null {
-  const idx = clips.indexOf(clip);
-  if (idx < 0) return null;
-  for (let i = idx + 1; i < clips.length; i++) {
-    if (clips[i].kept) return clips[i];
-  }
   return null;
 }
 
@@ -161,6 +163,7 @@ export function PreviewCanvas({
   width = DEFAULT_WIDTH,
   height = DEFAULT_HEIGHT,
   className,
+  frameScheduler = BROWSER_FRAME_SCHEDULER,
 }: PreviewCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // The consolidated interaction-layer div -- held so the wheel-zoom handler can
@@ -170,7 +173,7 @@ export function PreviewCanvas({
   // DOUBLE-BUFFERED base videos: SLOT_COUNT
   // hidden <video> slots per source file, ordered by slotOrderRef -- a ring
   // where order[0] is the ACTIVE pair (the compositor paints it and the face
-  // element of that pair is the master clock + the audio) and order[1..] are
+  // element of that pair carries audio) and order[1..] are
   // the STANDBY pairs: paused, pre-seeked (by the StandbySeekers below) to the
   // next STANDBY_DEPTH discontinuous cuts' source in-points. Crossing a cut
   // ROTATES the ring (order[1] promotes to active, the freed active goes to
@@ -185,12 +188,6 @@ export function PreviewCanvas({
     Array(SLOT_COUNT).fill(null)
   );
   const slotOrderRef = useRef<number[]>([...SLOT_INDICES]);
-  // Monotonic swap counter: the async autoplay-rejection revert in the rAF
-  // loop must only undo the swap it belongs to. If a rapid double-cut (or a
-  // user pause) lands between a swap and its play-promise rejection, the
-  // generation won't match and the stale revert becomes a no-op instead of
-  // rotating slotOrderRef against the wrong baseline.
-  const swapGenRef = useRef(0);
   const activeScreen = useCallback(
     () => screenElsRef.current[slotOrderRef.current[0]],
     []
@@ -223,17 +220,12 @@ export function PreviewCanvas({
   }
   const rafRef = useRef<number | null>(null);
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
-  // rAF timestamp of the previous playing frame; null forces the next frame to
-  // seed it (so the first frame after pressing play never takes a giant jump).
-  const lastTimestampRef = useRef<number | null>(null);
-  // The playhead value the rAF clock itself last wrote. While playing,
-  // the face video is the master clock: it DERIVES the playhead every frame,
-  // which silently overwrote any playhead someone ELSE set (timeline click,
-  // transcript word click) one frame later -- the "clicking the timeline does
-  // nothing during playback" bug. Each tick compares the store playhead to
-  // this ref: a mismatch beyond one frame means a deliberate external seek,
-  // which the clock must HONOR (hard-seek both videos there) instead of
-  // clobbering. null = playback just (re)started, nothing to compare yet.
+  // The sole playback authority: output time sampled from one monotonic anchor.
+  // Media currentTime values are followers and may only be drift-corrected.
+  const transportAnchorRef = useRef<TransportAnchor | null>(null);
+  const transportGenerationRef = useRef(0);
+  // The last output time written by the transport. A larger mismatch means an
+  // external timeline/transcript seek, which re-anchors before the next sample.
   const expectedPlayheadRef = useRef<number | null>(null);
   // The split ratio ACTUALLY composited this frame -- per-clip, eased across
   // cuts (splitRatioAt). The rAF loop writes it here every frame so the split
@@ -288,6 +280,48 @@ export function PreviewCanvas({
   const overlays = useRepurposeStore((s) => s.overlays);
   const setPlayhead = useRepurposeStore((s) => s.setPlayhead);
   const pause = useRepurposeStore((s) => s.pause);
+  const setMediaReadiness = useRepurposeStore((s) => s.setMediaReadiness);
+
+  const playRequiredBaseMedia = useCallback(
+    async (
+      screenVideo: HTMLVideoElement | null,
+      faceVideo: HTMLVideoElement | null
+    ) => {
+      if (!screenVideo || !faceVideo) return;
+      const results = await Promise.allSettled([
+        screenVideo.play(),
+        faceVideo.play(),
+      ]);
+      if (results.some((result) => result.status === "rejected")) {
+        pause();
+        setMediaReadiness(
+          "error",
+          "Chrome could not start this video. Re-import it to create a compatible copy."
+        );
+      }
+    },
+    [pause, setMediaReadiness]
+  );
+
+  const reportBaseReadiness = useCallback(() => {
+    const screenVideo = activeScreen();
+    const faceVideo = activeFace();
+    if (
+      screenVideo &&
+      faceVideo &&
+      screenVideo.videoWidth > 0 &&
+      screenVideo.videoHeight > 0 &&
+      faceVideo.videoWidth > 0 &&
+      faceVideo.videoHeight > 0
+    ) {
+      setMediaReadiness("ready");
+    }
+  }, [activeScreen, activeFace, setMediaReadiness]);
+
+  const reportRequiredBaseError = useCallback(() => {
+    pause();
+    setMediaReadiness("error", BASE_MEDIA_LOAD_ERROR);
+  }, [pause, setMediaReadiness]);
 
   // Make the generated SFX bed audible during live preview, synced to the
   // playhead and summing acoustically with the face-cam <video> audio.
@@ -571,27 +605,39 @@ export function PreviewCanvas({
     const screenVideo = activeScreen();
     const faceVideo = activeFace();
     if (isPlaying) {
-      lastTimestampRef.current = null; // first playing frame seeds the delta
-      expectedPlayheadRef.current = null; // fresh start -- no false "external seek"
+      const live = liveRef.current;
+      const rate = live.playbackRate > 0 ? live.playbackRate : 1;
+      transportAnchorRef.current = startTransport(
+        live.playhead,
+        frameScheduler.now(),
+        rate,
+        ++transportGenerationRef.current
+      );
+      expectedPlayheadRef.current = live.playhead;
       const srcTime = timelineToSourceTime(
-        liveRef.current.clips,
-        liveRef.current.playhead
+        live.clips,
+        live.playhead
       );
       if (srcTime !== null) {
-        if (screenVideo && Math.abs(screenVideo.currentTime - srcTime) > 1 / 60) {
-          screenVideo.currentTime = srcTime;
-        }
-        if (faceVideo && Math.abs(faceVideo.currentTime - srcTime) > 1 / 60) {
-          faceVideo.currentTime = srcTime;
-        }
+        if (screenVideo)
+          synchronizeMediaTime(
+            screenVideo,
+            srcTime,
+            BASE_MEDIA_DRIFT_TOLERANCE_SEC
+          );
+        if (faceVideo)
+          synchronizeMediaTime(
+            faceVideo,
+            srcTime,
+            BASE_MEDIA_DRIFT_TOLERANCE_SEC
+          );
       }
       // FACE carries the audio (see the unmuted FACE <video> below); SCREEN
       // stays muted, so only the narration plays. Both still .play() to keep
       // their frames advancing in real time. The playback-rate effect below
       // (keyed on isPlaying too) sets .playbackRate on both, so the first
       // playing frame already runs at the chosen speed.
-      screenVideo?.play().catch(() => {});
-      faceVideo?.play().catch(() => {});
+      void playRequiredBaseMedia(screenVideo, faceVideo);
       // Overlay videos: only the ones ACTIVE at the current playhead start; the
       // rest stay paused until the rAF loop reaches their window. Seek each to
       // its source frame first so it starts on the right picture. Always muted.
@@ -601,13 +647,19 @@ export function PreviewCanvas({
         const v = videoPoolRef.current.get(ov.id);
         if (!v) continue;
         if (t0 >= ov.timelineStart && t0 < ov.timelineEnd) {
-          v.currentTime = ov.srcStart + (t0 - ov.timelineStart);
+          synchronizeMediaTime(
+            v,
+            ov.srcStart + (t0 - ov.timelineStart),
+            OVERLAY_MEDIA_DRIFT_TOLERANCE_SEC
+          );
           v.play().catch(() => {});
         } else {
           v.pause();
         }
       }
     } else {
+      transportAnchorRef.current = null;
+      expectedPlayheadRef.current = null;
       // Pause BOTH slots -- the standby pair is normally already paused (it
       // only ever sits pre-seeked), but a swap that raced the pause could have
       // left the freed pair rolling; belt-and-braces stop everything.
@@ -615,15 +667,17 @@ export function PreviewCanvas({
       for (const v of faceElsRef.current) v?.pause();
       for (const v of videoPoolRef.current.values()) v.pause();
     }
-  }, [isPlaying, activeScreen, activeFace]);
+  }, [
+    isPlaying,
+    activeScreen,
+    activeFace,
+    frameScheduler,
+    playRequiredBaseMedia,
+  ]);
 
-  // --- Apply the playback-rate multiplier to both source <video>s ------------
-  // The FACE video is the master clock while playing (its currentTime derives
-  // the playhead), so setting its playbackRate is what actually makes playback
-  // fast/slow; the SCREEN video matches so the (silent) frames stay locked. Also
-  // re-applied when isPlaying flips true, because seeding a video can reset its
-  // rate. The wall-clock fallback in the rAF loop reads the same rate from the
-  // live ref, so BOTH clock paths honor it.
+  // --- Apply playback rate and re-anchor the one monotonic clock --------------
+  // Every media follower receives the same rate. A rate change during playback
+  // preserves the current output time and starts a fresh monotonic anchor.
   useEffect(() => {
     const rate = playbackRate > 0 ? playbackRate : 1;
     // BOTH slots get the rate -- the standby pair must already carry the right
@@ -631,10 +685,20 @@ export function PreviewCanvas({
     // post-cut frames would run at 1x.
     for (const v of screenElsRef.current) if (v) v.playbackRate = rate;
     for (const v of faceElsRef.current) if (v) v.playbackRate = rate;
-    // Overlay videos honor J/K/L speed too so their motion stays locked to the
-    // base composite (they are never the master clock -- just rate-matched).
+    // Overlay videos honor J/K/L speed too so their motion stays rate-matched.
     for (const v of videoPoolRef.current.values()) v.playbackRate = rate;
-  }, [playbackRate, isPlaying]);
+    const anchor = transportAnchorRef.current;
+    if (isPlaying && anchor && anchor.rate !== rate) {
+      const outputSec = expectedPlayheadRef.current ?? liveRef.current.playhead;
+      transportAnchorRef.current = reanchorTransport(
+        anchor,
+        outputSec,
+        frameScheduler.now(),
+        rate
+      );
+      transportGenerationRef.current = transportAnchorRef.current.generation;
+    }
+  }, [playbackRate, isPlaying, frameScheduler]);
 
   // --- Canvas setup (DPR-correct backing store, resizes with container) -----
   useEffect(() => {
@@ -673,212 +737,159 @@ export function PreviewCanvas({
   // regionEnd = outPoint ?? duration. Crossing regionEnd either wraps to
   // regionStart (loop) or clamps to regionEnd + pause()s and stops the videos.
   //
-  // Frame-lock: while playing the videos free-run as the real-time source, so
-  // each frame we compare the FACE video's currentTime to the EXPECTED source
-  // time for the current playhead; if it has drifted past PLAYBACK_DRIFT_TOLERANCE
-  // (e.g. crossing a clip cut, where source time jumps but wall time doesn't) we
-  // re-seek BOTH videos so trimmed/deleted retakes never leak in and screen+face
-  // stay locked.
+  // Frame-lock: source videos free-run as followers. Each sampled output time is
+  // mapped through the kept clips and only corrects media beyond its drift limit.
   useEffect(() => {
     const tick = (timestamp: number) => {
+      // The callback being executed is no longer pending. Only the single
+      // schedule at the bottom may populate rafRef again.
+      rafRef.current = null;
       const live = liveRef.current;
+      let sampledOutput: number | null = null;
       // Resolve the ACTIVE pair fresh every frame -- a cut swap in an earlier
       // frame changes which physical elements these are, so they can never be
       // captured once at effect mount like they used to be.
-      const screenVideo = screenElsRef.current[slotOrderRef.current[0]];
-      const faceVideo = faceElsRef.current[slotOrderRef.current[0]];
+      let screenVideo = screenElsRef.current[slotOrderRef.current[0]];
+      let faceVideo = faceElsRef.current[slotOrderRef.current[0]];
 
-      // 1) CLOCK -- the FACE video is the master timebase. Within one contiguous
-      // clip we DERIVE the playhead from faceVideo.currentTime (smooth, no
-      // re-seeking); we only hard-seek at a clip CUT, where source time jumps.
+      // 1) CLOCK -- output time comes only from the monotonic transport anchor.
+      // Base and overlay media follow the mapped source time within drift limits.
       if (live.isPlaying) {
         const regionStart = live.inPoint ?? 0;
         const regionEnd = live.outPoint ?? live.duration;
-        const last = lastTimestampRef.current;
-        lastTimestampRef.current = timestamp;
-
-        // EXTERNAL SEEK: the store playhead moved since this clock
-        // last wrote it -> a timeline/transcript click mid-playback. Honor it:
-        // hard-seek both videos to the clicked time so the clock re-derives
-        // from there, instead of dragging the playhead back to wherever the
-        // video happened to be (which read as "clicking does nothing").
-        // Threshold = well past one frame of self-written drift. The proxy
-        // makes this seek fast; the videoWidth render gate holds the last
-        // frame during it, exactly like any cut.
-        const expected = expectedPlayheadRef.current;
-        if (expected !== null && Math.abs(live.playhead - expected) > 0.25) {
-          const jumpSrc = timelineToSourceTime(live.clips, live.playhead);
-          if (jumpSrc !== null) {
-            if (faceVideo) faceVideo.currentTime = jumpSrc;
-            if (screenVideo) screenVideo.currentTime = jumpSrc;
-          }
-          expectedPlayheadRef.current = live.playhead;
+        const rate = live.playbackRate > 0 ? live.playbackRate : 1;
+        let anchor = transportAnchorRef.current;
+        if (!anchor) {
+          anchor = startTransport(
+            live.playhead,
+            timestamp,
+            rate,
+            ++transportGenerationRef.current
+          );
+          transportAnchorRef.current = anchor;
         }
 
-        const clip = activeClipAt(live.clips, live.playhead);
-        // Fall back to wall-clock advancement only when we can't read the video
-        // as a clock this frame (not ready, paused mid-buffer, or no clip).
-        const canUseVideoClock =
-          !!clip && !!faceVideo && faceVideo.readyState >= 2 && !faceVideo.paused;
+        let previousOutput = expectedPlayheadRef.current ?? live.playhead;
+        if (
+          expectedPlayheadRef.current !== null &&
+          Math.abs(live.playhead - expectedPlayheadRef.current) >
+            EXTERNAL_SEEK_TOLERANCE_SEC
+        ) {
+          anchor = reanchorTransport(anchor, live.playhead, timestamp, rate);
+          transportAnchorRef.current = anchor;
+          transportGenerationRef.current = anchor.generation;
+          previousOutput = live.playhead;
+        }
 
-        if (last !== null) {
-          let next: number;
-          if (canUseVideoClock && clip) {
-            const src = faceVideo.currentTime;
-            if (src >= clip.srcEnd - CLIP_CUT_EPSILON) {
-              // Reached this clip's out point -> CUT. Move to the next kept clip.
-              next = clip.timelineEnd;
-              const nextClip = nextKeptClipAfter(live.clips, clip);
-              // Only hard-seek when the next clip's source in-point is
-              // DISCONTINUOUS from where we are (a retake was trimmed out, or the
-              // clips were reordered). When the next line simply continues the
-              // same take back-to-back, the videos are already decoding the right
-              // frames -- seeking would stall the stream for ~1s and freeze the
-              // last frame. So we let playback roll straight through: seamless.
-              const contiguous =
-                !!nextClip &&
-                Math.abs(nextClip.srcStart - clip.srcEnd) <= CONTIGUOUS_CUT_EPSILON;
-              if (!contiguous) {
-                const seekSrc = timelineToSourceTime(live.clips, next);
-                if (seekSrc !== null) {
-                  // DOUBLE-BUFFER SWAP: the FIRST standby
-                  // pair has (usually) been sitting paused, pre-seeked to
-                  // exactly this source in-point since the pre-seek effect saw
-                  // this cut coming. If it's warm, promote it: rotate the slot
-                  // ring, match rate, move the audio (unmute new face / mute
-                  // old), play the new pair, park the old. The canvas paints
-                  // the new pair NEXT frame -- no live seek, no ~1s freeze on
-                  // the byte-range stream. The freed pair goes to the BACK of
-                  // the ring; the standby that was parked at the FOLLOWING cut
-                  // moves up to first, so a rapid double-cut swaps warm again
-                  // immediately.
-                  const order = slotOrderRef.current;
-                  const standbyFace = faceElsRef.current[order[1]];
-                  const standbyScreen = screenElsRef.current[order[1]];
-                  const swapReady =
-                    !!standbyFace &&
-                    !!standbyScreen &&
-                    !!faceVideo &&
-                    !!screenVideo &&
-                    !!faceSeekersRef.current?.[0]?.readyAt(seekSrc) &&
-                    !!screenSeekersRef.current?.[0]?.readyAt(seekSrc);
-                  if (swapReady) {
-                    const rate = live.playbackRate > 0 ? live.playbackRate : 1;
-                    const prevOrder = [...order];
-                    const gen = ++swapGenRef.current;
-                    slotOrderRef.current = [...order.slice(1), order[0]];
-                    standbyFace.playbackRate = rate;
-                    standbyScreen.playbackRate = rate;
-                    standbyFace.muted = false; // narration moves to the new face
-                    const playPromise = standbyFace.play();
-                    standbyScreen.play().catch(() => {});
-                    faceVideo.muted = true;
-                    faceVideo.pause();
-                    screenVideo.pause();
-                    // Re-target every standby seeker RIGHT NOW at the cuts
-                    // ahead of this boundary -- the React pre-seek effect will
-                    // also fire, but only after this tick's setPlayhead
-                    // renders, and a rapid double-cut can arrive sooner. Each
-                    // seeker rebinds to the element now sitting at its ring
-                    // position; the one already parked at the right in-point
-                    // no-ops, the freed pair starts seeking to the farthest
-                    // tracked cut immediately.
-                    const upcoming = nextDiscontinuousCutsAfter(
-                      live.clips,
-                      next,
-                      STANDBY_DEPTH
-                    );
-                    upcoming.forEach((c, k) => {
-                      faceSeekersRef.current?.[k]?.target(c.seekSrc);
-                      screenSeekersRef.current?.[k]?.target(c.seekSrc);
-                    });
-                    playPromise?.catch(() => {
-                      // Autoplay refused (shouldn't happen mid-session after a
-                      // real play gesture, but never leave a silent frozen
-                      // preview): revert THIS swap and fall back to the old
-                      // hard-seek of the original pair. The revert fires
-                      // async, so it is generation-guarded -- if a newer swap
-                      // (rapid double-cut) already rotated the ring, undoing
-                      // it here would corrupt the active/standby roles + mute
-                      // state; the stale revert must be a no-op instead.
-                      if (swapGenRef.current !== gen) return;
-                      slotOrderRef.current = prevOrder;
-                      // Drop every seeker's in-flight state -- their bindings
-                      // were re-targeted for the rotated ring above and would
-                      // fight the restored one; the pre-seek effect re-parks
-                      // them cleanly on its next run.
-                      faceSeekersRef.current?.forEach((s) => s.reset());
-                      screenSeekersRef.current?.forEach((s) => s.reset());
-                      standbyFace.muted = true;
-                      standbyFace.pause();
-                      standbyScreen.pause();
-                      faceVideo.muted = false;
-                      faceVideo.currentTime = seekSrc;
-                      screenVideo.currentTime = seekSrc;
-                      // Only resume if the user is still in playback -- a
-                      // pause that landed between swap and rejection wins.
-                      if (liveRef.current.isPlaying) {
-                        faceVideo.play().catch(() => {});
-                        screenVideo.play().catch(() => {});
-                      }
-                    });
-                  } else {
-                    // Standby not warm (project just loaded, a rapid
-                    // double-cut, or a clip shorter than the seek took): fall
-                    // back to hard-seeking the active pair -- exactly the old
-                    // behavior, never worse than before.
-                    if (faceVideo) faceVideo.currentTime = seekSrc;
-                    if (screenVideo) screenVideo.currentTime = seekSrc;
-                  }
-                }
-              }
-            } else {
-              // Mid-clip: playhead follows the smoothly-decoding video exactly.
-              next = clip.timelineStart + (src - clip.srcStart);
-              // Keep the (silent) screen video locked to the face timebase only
-              // if it has drifted noticeably -- a rare correction, not per-frame.
-              if (screenVideo && Math.abs(screenVideo.currentTime - src) > 0.15) {
-                screenVideo.currentTime = src;
-              }
-            }
-          } else {
-            // No usable video clock -> advance by real elapsed wall time, scaled
-            // by the playback rate (the video-clock path gets this for free via
-            // the videos' own playbackRate, so only the fallback multiplies here).
-            const rate = live.playbackRate > 0 ? live.playbackRate : 1;
-            next = live.playhead + ((timestamp - last) / 1000) * rate;
-          }
+        let next = sampleTransport(anchor, timestamp, regionStart, regionEnd);
+        let reachedEnd = next >= regionEnd;
+        if (reachedEnd && live.loopPlayback) {
+          next = regionStart;
+          reachedEnd = false;
+          anchor = reanchorTransport(anchor, next, timestamp, rate);
+          transportAnchorRef.current = anchor;
+          transportGenerationRef.current = anchor.generation;
+        }
 
-          if (next >= regionEnd) {
-            if (live.loopPlayback) {
-              setPlayhead(regionStart);
-              expectedPlayheadRef.current = regionStart;
-              const wrapSrc = timelineToSourceTime(live.clips, regionStart);
-              if (wrapSrc !== null) {
-                if (screenVideo) screenVideo.currentTime = wrapSrc;
-                if (faceVideo) faceVideo.currentTime = wrapSrc;
-              }
-            } else {
-              setPlayhead(regionEnd);
-              expectedPlayheadRef.current = regionEnd;
-              pause();
-              // Pause EVERY base slot, not the pair captured at the top of
-              // this tick: if a cut swap happened earlier in this same tick,
-              // screenVideo/faceVideo are the just-retired pair and the
-              // freshly promoted (unmuted, playing) pair would sail on for a
-              // frame until the isPlaying effect catches it. Sweeping both
-              // slots closes that gap; pausing an already-paused standby is a
-              // no-op.
-              for (const v of screenElsRef.current) v?.pause();
-              for (const v of faceElsRef.current) v?.pause();
-              lastTimestampRef.current = null;
+        const previousClip = activeClipAt(live.clips, previousOutput);
+        const nextClip = activeClipAt(live.clips, next);
+        const crossedCut =
+          !!previousClip && !!nextClip && previousClip.id !== nextClip.id;
+        if (crossedCut && previousClip && nextClip) {
+          const discontinuous =
+            Math.abs(nextClip.srcStart - previousClip.srcEnd) >
+            CONTIGUOUS_CUT_EPSILON;
+          if (discontinuous) {
+            const seekSrc = timelineToSourceTime(live.clips, next);
+            const order = slotOrderRef.current;
+            const standbyFace = faceElsRef.current[order[1]];
+            const standbyScreen = screenElsRef.current[order[1]];
+            const swapReady =
+              seekSrc !== null &&
+              !!standbyFace &&
+              !!standbyScreen &&
+              !!faceVideo &&
+              !!screenVideo &&
+              !!faceSeekersRef.current?.[0]?.readyAt(nextClip.srcStart) &&
+              !!screenSeekersRef.current?.[0]?.readyAt(nextClip.srcStart);
+            if (swapReady && standbyFace && standbyScreen) {
+              slotOrderRef.current = [...order.slice(1), order[0]];
+              standbyFace.playbackRate = rate;
+              standbyScreen.playbackRate = rate;
+              standbyFace.muted = false;
+              faceVideo!.muted = true;
+              faceVideo!.pause();
+              screenVideo!.pause();
+              void playRequiredBaseMedia(standbyScreen, standbyFace);
+
+              const upcoming = nextDiscontinuousCutsAfter(
+                live.clips,
+                next,
+                STANDBY_DEPTH
+              );
+              upcoming.forEach((cut, index) => {
+                faceSeekersRef.current?.[index]?.target(cut.seekSrc);
+                screenSeekersRef.current?.[index]?.target(cut.seekSrc);
+              });
             }
-          } else {
-            setPlayhead(next);
-            expectedPlayheadRef.current = next;
           }
+          anchor = reanchorTransport(anchor, next, timestamp, rate);
+          transportAnchorRef.current = anchor;
+          transportGenerationRef.current = anchor.generation;
+        }
+
+        const targetSource = timelineToSourceTime(live.clips, next);
+        const currentScreen = activeScreen();
+        const currentFace = activeFace();
+        if (targetSource !== null) {
+          if (currentScreen)
+            synchronizeMediaTime(
+              currentScreen,
+              targetSource,
+              BASE_MEDIA_DRIFT_TOLERANCE_SEC
+            );
+          if (currentFace)
+            synchronizeMediaTime(
+              currentFace,
+              targetSource,
+              BASE_MEDIA_DRIFT_TOLERANCE_SEC
+            );
+        }
+        for (const ov of live.overlays) {
+          if (
+            ov.kind !== "video" ||
+            next < ov.timelineStart ||
+            next >= ov.timelineEnd
+          )
+            continue;
+          const video = videoPoolRef.current.get(ov.id);
+          if (!video) continue;
+          synchronizeMediaTime(
+            video,
+            ov.srcStart + (next - ov.timelineStart),
+            OVERLAY_MEDIA_DRIFT_TOLERANCE_SEC
+          );
+        }
+
+        // Exactly one playhead write per playing tick.
+        sampledOutput = next;
+        setPlayhead(next);
+        expectedPlayheadRef.current = next;
+
+        if (reachedEnd) {
+          pause();
+          for (const video of screenElsRef.current) video?.pause();
+          for (const video of faceElsRef.current) video?.pause();
+          for (const video of videoPoolRef.current.values()) video.pause();
+          transportAnchorRef.current = null;
         }
       }
+
+      // A discontinuous cut may have rotated the ring above. Render the newly
+      // promoted pair in this same half-open-boundary frame, never the retired
+      // pair captured at the beginning of the tick.
+      screenVideo = activeScreen();
+      faceVideo = activeFace();
 
       // 3) RENDER -- composite the current frame (playing or paused). Read the
       // freshest playhead from the ref (setPlayhead above updates it next frame,
@@ -887,7 +898,7 @@ export function PreviewCanvas({
       if (ctx) {
         const {
           splitRatio: globalSplit,
-          playhead: t,
+          playhead: storedPlayhead,
           clips: liveClips,
           screenGrade: sg,
           faceGrade: fg,
@@ -897,6 +908,7 @@ export function PreviewCanvas({
           overlays: liveOverlays,
           isPlaying: playing,
         } = liveRef.current;
+        const t = sampledOutput ?? storedPlayhead;
 
         // PER-SCENE split, eased across cuts (splitRatioAt). This is the split
         // actually composited this frame -- a scene Manthan tucked the face up on
@@ -973,8 +985,7 @@ export function PreviewCanvas({
         // bottom-to-top by zIndex. Built from the SAME overlays array + window
         // filter + z-sort the export uses, so preview == export for overlays.
         //
-        // Video overlays: the FACE video stays the master clock -- an overlay is
-        // NEVER the clock. While SCRUBBING (paused) we hard-seek each active
+        // Video overlays are never a clock. While SCRUBBING (paused) we hard-seek each active
         // overlay video to its source frame `want`. While PLAYING the pooled
         // <video> free-runs at playbackRate and we only issue a LIGHT drift
         // resync when it strays > 0.25s (a rare correction, not per-frame), and
@@ -1004,7 +1015,11 @@ export function PreviewCanvas({
             if (playing) {
               // Light drift correction only -- the overlay is not the clock.
               if (v.paused) v.play().catch(() => {});
-              if (Math.abs(v.currentTime - want) > 0.25) v.currentTime = want;
+              synchronizeMediaTime(
+                v,
+                want,
+                OVERLAY_MEDIA_DRIFT_TOLERANCE_SEC
+              );
             } else {
               // Scrub: hard-seek to the exact source frame for this output time.
               if (Math.abs(v.currentTime - want) > 1 / 30) v.currentTime = want;
@@ -1082,14 +1097,30 @@ export function PreviewCanvas({
           });
         }
       }
-      rafRef.current = requestAnimationFrame(tick);
+      if (rafRef.current === null) {
+        rafRef.current = frameScheduler.request(tick);
+      }
     };
 
-    rafRef.current = requestAnimationFrame(tick);
+    if (rafRef.current === null) {
+      rafRef.current = frameScheduler.request(tick);
+    }
     return () => {
-      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      if (rafRef.current !== null) {
+        frameScheduler.cancel(rafRef.current);
+        rafRef.current = null;
+      }
     };
-  }, [width, height, setPlayhead, pause]);
+  }, [
+    width,
+    height,
+    setPlayhead,
+    pause,
+    activeScreen,
+    activeFace,
+    frameScheduler,
+    playRequiredBaseMedia,
+  ]);
 
   // ---------------------------------------------------------------------
   // Split-handle drag: pointer on the divider adjusts the split for the SCENE
@@ -1508,6 +1539,8 @@ export function PreviewCanvas({
       {SLOT_INDICES.map((slot) => (
         <video
           key={`screen-${slot}`}
+          data-source-role="screen"
+          data-slot-index={slot}
           ref={(el) => {
             screenElsRef.current[slot] = el;
           }}
@@ -1516,15 +1549,19 @@ export function PreviewCanvas({
           playsInline
           preload="auto"
           className="hidden"
+          onLoadedMetadata={reportBaseReadiness}
+          onError={reportRequiredBaseError}
         />
       ))}
       {/* Face slots read faceProxy.src -- the original streaming URL until the
           low-res preview proxy is built + a pause lets it swap in. Export
           never sees this: it reads footageMeta.faceCamPath directly. onError
-          falls back to the original if a purged proxy cache 404s mid-session. */}
+          falls back for a purged proxy, but reports a real raw-source failure. */}
       {SLOT_INDICES.map((slot) => (
         <video
           key={`face-${slot}`}
+          data-source-role="face"
+          data-slot-index={slot}
           ref={(el) => {
             faceElsRef.current[slot] = el;
           }}
@@ -1533,7 +1570,11 @@ export function PreviewCanvas({
           playsInline
           preload="auto"
           className="hidden"
-          onError={faceProxy.onSrcError}
+          onLoadedMetadata={reportBaseReadiness}
+          onError={() => {
+            if (faceProxy.usingProxy) faceProxy.onSrcError();
+            else reportRequiredBaseError();
+          }}
         />
       ))}
 
@@ -1547,6 +1588,7 @@ export function PreviewCanvas({
         .map((o) => (
           <video
             key={o.id}
+            data-overlay-id={o.id}
             ref={(el) => {
               if (el) videoPoolRef.current.set(o.id, el);
               else videoPoolRef.current.delete(o.id);

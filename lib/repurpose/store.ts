@@ -60,6 +60,40 @@ import {
 
 const MIN_CLIP_DURATION = 1 / 30; // seconds; never let a trim invert a clip
 
+export type MediaReadiness = "idle" | "loading" | "ready" | "error";
+
+const MEDIA_LOADING_REASON = "Media is still loading.";
+const MEDIA_ERROR_REASON = "Media could not be loaded.";
+
+type PlaybackPrerequisites = {
+  clips: Clip[];
+  duration: number;
+  footageMeta: FootageMeta | null;
+  mediaReadiness: MediaReadiness;
+  playbackBlockedReason: string | null;
+};
+
+/** One shared playback gate for the store action and every transport UI. */
+export function getPlaybackBlockedReason(
+  state: PlaybackPrerequisites
+): string | null {
+  if (state.duration <= 0) return "This project has no playable duration.";
+  if (state.clips.length === 0) return "Add a clip before playing.";
+  if (
+    !state.footageMeta?.faceCamPath.trim() ||
+    !state.footageMeta.screenPath.trim()
+  ) {
+    return "Choose both source videos before playing.";
+  }
+  if (state.mediaReadiness === "loading") {
+    return state.playbackBlockedReason ?? MEDIA_LOADING_REASON;
+  }
+  if (state.mediaReadiness === "error") {
+    return state.playbackBlockedReason ?? MEDIA_ERROR_REASON;
+  }
+  return null;
+}
+
 /**
  * Default filler words removeFillerWords strips (lowercase, punctuation-free).
  * The usual verbal-tic set for a talking-head reel -- hesitation sounds, never
@@ -1085,12 +1119,11 @@ interface RepurposeState {
   setOverlayDragging: (dragging: boolean) => void;
 
   /**
-   * Whether the preview is playing. The store owns this flag; the actual
-   * clock (advancing `playhead` over wall time and driving the source
-   * <video>s) lives in PreviewCanvas, which is the source of truth for
-   * `video.currentTime`. Toggling this here starts/stops that loop. Playback
-   * halts automatically at the end of the timeline (see the PreviewCanvas
-   * clock), which flips this back to false.
+   * Whether the preview is playing. The store owns this flag; PreviewCanvas's
+   * transport clock advances the output `playhead`, which is the authoritative
+   * timeline clock. Source <video> elements follow that clock and are corrected
+   * back to mapped source time when they drift. Playback halts automatically at
+   * the timeline end, which flips this back to false.
    */
   isPlaying: boolean;
   /**
@@ -1202,6 +1235,14 @@ interface RepurposeState {
   /** Raw dual-track source metadata (paths, fps, dims, duration). Null until footage is loaded/imported. */
   footageMeta: FootageMeta | null;
   setFootageMeta: (meta: FootageMeta | null) => void;
+  /** Transient readiness of the two preview media elements. Never persisted or captured in history. */
+  mediaReadiness: MediaReadiness;
+  /** Short user-facing explanation when playback cannot start. Transient UI state. */
+  playbackBlockedReason: string | null;
+  setMediaReadiness: (
+    state: MediaReadiness,
+    reason?: string | null
+  ) => void;
 
 
   /**
@@ -1572,6 +1613,8 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
       overlayDragging: false,
       markers: [],
       footageMeta: null,
+      mediaReadiness: "idle",
+      playbackBlockedReason: null,
       editStats: null,
     });
   },
@@ -1619,7 +1662,50 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   },
 
   footageMeta: null,
-  setFootageMeta: (meta) => set({ footageMeta: meta }),
+  mediaReadiness: "idle",
+  playbackBlockedReason: null,
+  setFootageMeta: (meta) => {
+    const hasBothPaths = Boolean(
+      meta?.faceCamPath.trim() && meta.screenPath.trim()
+    );
+    set({
+      footageMeta: meta,
+      mediaReadiness: hasBothPaths ? "loading" : "idle",
+      playbackBlockedReason: hasBothPaths ? MEDIA_LOADING_REASON : null,
+      ...(hasBothPaths
+        ? { isPlaying: false, playbackRate: 1 }
+        : {}),
+    });
+  },
+  setMediaReadiness: (mediaReadiness, reason) => {
+    const playbackBlockedReason =
+      mediaReadiness === "loading"
+        ? reason ?? MEDIA_LOADING_REASON
+        : mediaReadiness === "error"
+          ? reason ?? MEDIA_ERROR_REASON
+          : null;
+    const current = get();
+    const mustPause =
+      mediaReadiness === "loading" || mediaReadiness === "error";
+    const nextPlaying = mustPause ? false : current.isPlaying;
+    const nextRate = mustPause ? 1 : current.playbackRate;
+
+    if (
+      current.mediaReadiness === mediaReadiness &&
+      current.playbackBlockedReason === playbackBlockedReason &&
+      current.isPlaying === nextPlaying &&
+      current.playbackRate === nextRate
+    ) {
+      return;
+    }
+
+    set({
+      mediaReadiness,
+      playbackBlockedReason,
+      isPlaying: nextPlaying,
+      playbackRate: nextRate,
+    });
+  },
 
   editStats: null,
   setEditStats: (stats) => set({ editStats: stats }),
@@ -3169,18 +3255,36 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     // No-op if there's nothing to play. If the playhead sits at (or past) the
     // end of the region, rewind to the region start so pressing play from the
     // end restarts rather than doing nothing.
-    const { duration, playhead, inPoint, outPoint } = get();
-    if (duration <= 0) return;
+    const state = get();
+    const { duration, isPlaying, playhead, inPoint, outPoint } = state;
+    if (isPlaying) return;
+
+    const blockedReason = getPlaybackBlockedReason(state);
+
+    if (blockedReason !== null) {
+      if (state.playbackBlockedReason !== blockedReason) {
+        set({ playbackBlockedReason: blockedReason });
+      }
+      return;
+    }
 
     const regionStart = inPoint ?? 0;
     const regionEnd = outPoint ?? duration;
     const atEnd = playhead >= regionEnd - 1e-3;
-    set({ isPlaying: true, playhead: atEnd ? regionStart : playhead });
+    set({
+      isPlaying: true,
+      playhead: atEnd ? regionStart : playhead,
+      playbackBlockedReason: null,
+    });
   },
 
   // Pausing ends the shuttle: reset to 1x so the next plain Play/Space is real
   // time, not whatever fast rate the last L-shuttle left behind.
-  pause: () => set({ isPlaying: false, playbackRate: 1 }),
+  pause: () => {
+    const { isPlaying, playbackRate } = get();
+    if (!isPlaying && playbackRate === 1) return;
+    set({ isPlaying: false, playbackRate: 1 });
+  },
 
   togglePlay: () => {
     return get().isPlaying ? get().pause() : get().play();

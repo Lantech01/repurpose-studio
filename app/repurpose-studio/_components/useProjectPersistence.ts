@@ -361,7 +361,8 @@ function hydrateSnapshot(snapshot: ProjectSnapshot): boolean {
             : asset
         );
 
-  // Restore the plain, non-derived slices. Transient UI state stays at defaults.
+  // Restore the plain, non-derived slices. Transient UI state stays at defaults;
+  // footage goes through its action below so valid paths re-enter `loading`.
   useRepurposeStore.setState({
     splitRatio: snapshot.splitRatio,
     screenGrade: snapshot.screenGrade,
@@ -370,7 +371,6 @@ function hydrateSnapshot(snapshot: ProjectSnapshot): boolean {
     inPoint: snapshot.inPoint,
     outPoint: snapshot.outPoint,
     loopPlayback: snapshot.loopPlayback,
-    footageMeta: snapshot.footageMeta,
     ...(snapshot.words !== undefined ? { words: snapshot.words } : {}),
     ...(snapshot.captionsEnabled !== undefined
       ? { captionsEnabled: snapshot.captionsEnabled }
@@ -393,6 +393,7 @@ function hydrateSnapshot(snapshot: ProjectSnapshot): boolean {
     ...(restoredMusicTrack !== undefined ? { musicTrack: restoredMusicTrack } : {}),
     ...(restoredMediaAssets !== undefined ? { mediaAssets: restoredMediaAssets } : {}),
   });
+  store.setFootageMeta(snapshot.footageMeta);
 
   // Reseed id counters past every restored id (they reset to 0 on module re-eval).
   const seed = useRepurposeStore.getState();
