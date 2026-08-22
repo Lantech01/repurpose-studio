@@ -53,7 +53,7 @@ import {
 import { gradeFilter } from "@/lib/repurpose/color-grade";
 import { drawCaptions } from "@/lib/repurpose/captions";
 import { loadCaptionFonts } from "@/lib/repurpose/caption-fonts";
-import type { Clip } from "@/lib/repurpose/types";
+import type { Clip, Overlay } from "@/lib/repurpose/types";
 import {
   CONTIGUOUS_CUT_EPSILON,
   nextDiscontinuousCutsAfter,
@@ -106,6 +106,7 @@ const ZOOM_MIN = 1;
 const ZOOM_MAX = 6;
 const BASE_MEDIA_LOAD_ERROR =
   "Chrome could not load this video. Re-import it to create a compatible copy.";
+const BASE_MEDIA_FUTURE_DATA = 3;
 
 // Size of the double-buffer video pool PER SOURCE: 1 active pair +
 // (SLOT_COUNT - 1) standby pairs. Depth 2 means the NEXT cut *and* the cut
@@ -224,6 +225,17 @@ export function PreviewCanvas({
   // Media currentTime values are followers and may only be drift-corrected.
   const transportAnchorRef = useRef<TransportAnchor | null>(null);
   const transportGenerationRef = useRef(0);
+  const playbackAttemptRef = useRef(0);
+  const transportConfirmedRef = useRef(false);
+  const sourceIdentityRef = useRef("");
+  const mountedRef = useRef(true);
+  const overlayPlayPendingRef = useRef<Set<string>>(new Set());
+  const baseReadinessRef = useRef({
+    sourceIdentity: "",
+    failed: false,
+    screenReady: false,
+    faceReady: false,
+  });
   // The last output time written by the transport. A larger mismatch means an
   // external timeline/transcript seek, which re-anchors before the next sample.
   const expectedPlayheadRef = useRef<number | null>(null);
@@ -282,47 +294,6 @@ export function PreviewCanvas({
   const pause = useRepurposeStore((s) => s.pause);
   const setMediaReadiness = useRepurposeStore((s) => s.setMediaReadiness);
 
-  const playRequiredBaseMedia = useCallback(
-    async (
-      screenVideo: HTMLVideoElement | null,
-      faceVideo: HTMLVideoElement | null
-    ) => {
-      if (!screenVideo || !faceVideo) return;
-      const results = await Promise.allSettled([
-        screenVideo.play(),
-        faceVideo.play(),
-      ]);
-      if (results.some((result) => result.status === "rejected")) {
-        pause();
-        setMediaReadiness(
-          "error",
-          "Chrome could not start this video. Re-import it to create a compatible copy."
-        );
-      }
-    },
-    [pause, setMediaReadiness]
-  );
-
-  const reportBaseReadiness = useCallback(() => {
-    const screenVideo = activeScreen();
-    const faceVideo = activeFace();
-    if (
-      screenVideo &&
-      faceVideo &&
-      screenVideo.videoWidth > 0 &&
-      screenVideo.videoHeight > 0 &&
-      faceVideo.videoWidth > 0 &&
-      faceVideo.videoHeight > 0
-    ) {
-      setMediaReadiness("ready");
-    }
-  }, [activeScreen, activeFace, setMediaReadiness]);
-
-  const reportRequiredBaseError = useCallback(() => {
-    pause();
-    setMediaReadiness("error", BASE_MEDIA_LOAD_ERROR);
-  }, [pause, setMediaReadiness]);
-
   // Make the generated SFX bed audible during live preview, synced to the
   // playhead and summing acoustically with the face-cam <video> audio.
   const sfxTrack = useRepurposeStore((s) => s.sfxTrack);
@@ -340,6 +311,55 @@ export function PreviewCanvas({
     footageMeta?.faceCamPath,
     footageMeta?.durationSec,
     isPlaying
+  );
+  const baseSourceIdentity = `${footageMeta?.screenPath ?? ""}\u0000${faceProxy.src ?? ""}`;
+
+  const reportBaseCanPlay = useCallback(
+    (
+      role: "screen" | "face",
+      slot: number,
+      video: HTMLVideoElement
+    ) => {
+      const cycle = baseReadinessRef.current;
+      if (
+        cycle.sourceIdentity !== sourceIdentityRef.current ||
+        cycle.failed ||
+        slotOrderRef.current[0] !== slot ||
+        video.readyState < BASE_MEDIA_FUTURE_DATA ||
+        video.videoWidth <= 0 ||
+        video.videoHeight <= 0
+      )
+        return;
+
+      if (role === "screen") cycle.screenReady = true;
+      else cycle.faceReady = true;
+      if (cycle.screenReady && cycle.faceReady) setMediaReadiness("ready");
+    },
+    [setMediaReadiness]
+  );
+
+  const reportRequiredBaseError = useCallback(
+    (role: "screen" | "face", slot: number) => {
+      if (slotOrderRef.current[0] !== slot) {
+        const standbyIndex = slotOrderRef.current.indexOf(slot) - 1;
+        if (standbyIndex >= 0) {
+          const seekers =
+            role === "screen" ? screenSeekersRef.current : faceSeekersRef.current;
+          seekers?.[standbyIndex]?.reset();
+        }
+        return;
+      }
+      const cycle = baseReadinessRef.current;
+      if (
+        cycle.sourceIdentity !== sourceIdentityRef.current ||
+        cycle.failed
+      )
+        return;
+      cycle.failed = true;
+      pause();
+      setMediaReadiness("error", BASE_MEDIA_LOAD_ERROR);
+    },
+    [pause, setMediaReadiness]
   );
 
   // Keep latest store values in refs so the rAF loop (mounted once) always
@@ -398,6 +418,143 @@ export function PreviewCanvas({
     captionBlocks,
     overlays,
   ]);
+
+  const invalidatePlaybackAttempt = useCallback(() => {
+    playbackAttemptRef.current += 1;
+    transportConfirmedRef.current = false;
+    transportAnchorRef.current = null;
+    expectedPlayheadRef.current = null;
+  }, []);
+
+  const playRequiredBaseMedia = useCallback(
+    (
+      screenVideo: HTMLVideoElement | null,
+      faceVideo: HTMLVideoElement | null,
+      preferredOutput?: number,
+      anchorMonotonicMs = frameScheduler.now()
+    ): number | null => {
+      invalidatePlaybackAttempt();
+      if (!screenVideo || !faceVideo) return null;
+      const attempt = playbackAttemptRef.current;
+      const sourceIdentity = sourceIdentityRef.current;
+      const playPromises = [screenVideo, faceVideo].map((video) => {
+        try {
+          return Promise.resolve(video.play());
+        } catch (error) {
+          return Promise.reject(error);
+        }
+      });
+
+      void Promise.allSettled(playPromises).then((results) => {
+        const stillCurrent =
+          mountedRef.current &&
+          playbackAttemptRef.current === attempt &&
+          sourceIdentityRef.current === sourceIdentity &&
+          useRepurposeStore.getState().isPlaying;
+        if (!stillCurrent) return;
+
+        if (results.some((result) => result.status === "rejected")) {
+          pause();
+          setMediaReadiness(
+            "error",
+            "Chrome could not start this video. Re-import it to create a compatible copy."
+          );
+          return;
+        }
+
+        const state = useRepurposeStore.getState();
+        const outputSec = preferredOutput ?? state.playhead;
+        const rate = state.playbackRate > 0 ? state.playbackRate : 1;
+        transportAnchorRef.current = startTransport(
+          outputSec,
+          anchorMonotonicMs,
+          rate,
+          ++transportGenerationRef.current
+        );
+        expectedPlayheadRef.current = outputSec;
+        transportConfirmedRef.current = true;
+      });
+      return attempt;
+    },
+    [frameScheduler, invalidatePlaybackAttempt, pause, setMediaReadiness]
+  );
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      overlayPlayPendingRef.current.clear();
+      invalidatePlaybackAttempt();
+    };
+  }, [invalidatePlaybackAttempt]);
+
+  useEffect(() => {
+    sourceIdentityRef.current = baseSourceIdentity;
+    baseReadinessRef.current = {
+      sourceIdentity: baseSourceIdentity,
+      failed: false,
+      screenReady: false,
+      faceReady: false,
+    };
+    slotOrderRef.current = [...SLOT_INDICES];
+    faceSeekersRef.current?.forEach((seeker) => seeker.reset());
+    screenSeekersRef.current?.forEach((seeker) => seeker.reset());
+    invalidatePlaybackAttempt();
+    if (footageMeta?.screenPath && faceProxy.src) {
+      setMediaReadiness("loading");
+    }
+    return invalidatePlaybackAttempt;
+  }, [
+    baseSourceIdentity,
+    faceProxy.src,
+    footageMeta?.screenPath,
+    invalidatePlaybackAttempt,
+    setMediaReadiness,
+  ]);
+
+  const reportActiveOverlayError = useCallback(
+    (overlayId: string) => {
+      if (!mountedRef.current) return;
+      const state = useRepurposeStore.getState();
+      const activeOverlay = state.overlays.find(
+        (overlay) =>
+          overlay.id === overlayId &&
+          overlay.kind === "video" &&
+          state.playhead >= overlay.timelineStart &&
+          state.playhead < overlay.timelineEnd
+      );
+      if (!activeOverlay) return;
+      pause();
+      setMediaReadiness(
+        "error",
+        `Overlay video ${overlayId} could not play. Re-import it to create a compatible copy.`
+      );
+    },
+    [pause, setMediaReadiness]
+  );
+
+  const playActiveOverlay = useCallback(
+    (overlay: Overlay, video: HTMLVideoElement) => {
+      if (!video.paused || overlayPlayPendingRef.current.has(overlay.id)) return;
+      overlayPlayPendingRef.current.add(overlay.id);
+      let playPromise: Promise<void>;
+      try {
+        playPromise = Promise.resolve(video.play());
+      } catch (error) {
+        playPromise = Promise.reject(error);
+      }
+      void playPromise.then(
+        () => overlayPlayPendingRef.current.delete(overlay.id),
+        () => {
+          overlayPlayPendingRef.current.delete(overlay.id);
+          if (useRepurposeStore.getState().isPlaying) {
+            reportActiveOverlayError(overlay.id);
+          }
+        }
+      );
+    },
+    [reportActiveOverlayError]
+  );
 
   // --- Overlay media pools ----------------------------------------------------
   // Image overlays decode ONCE into an HTMLImageElement (kept in imgPoolRef,
@@ -602,18 +759,11 @@ export function PreviewCanvas({
   // stray rejection so a blocked promise never throws.
   // When flipping FALSE (pause / end-of-region): .pause() both videos.
   useEffect(() => {
+    let attempt: number | null = null;
     const screenVideo = activeScreen();
     const faceVideo = activeFace();
     if (isPlaying) {
       const live = liveRef.current;
-      const rate = live.playbackRate > 0 ? live.playbackRate : 1;
-      transportAnchorRef.current = startTransport(
-        live.playhead,
-        frameScheduler.now(),
-        rate,
-        ++transportGenerationRef.current
-      );
-      expectedPlayheadRef.current = live.playhead;
       const srcTime = timelineToSourceTime(
         live.clips,
         live.playhead
@@ -637,29 +787,10 @@ export function PreviewCanvas({
       // their frames advancing in real time. The playback-rate effect below
       // (keyed on isPlaying too) sets .playbackRate on both, so the first
       // playing frame already runs at the chosen speed.
-      void playRequiredBaseMedia(screenVideo, faceVideo);
-      // Overlay videos: only the ones ACTIVE at the current playhead start; the
-      // rest stay paused until the rAF loop reaches their window. Seek each to
-      // its source frame first so it starts on the right picture. Always muted.
-      const t0 = liveRef.current.playhead;
-      for (const ov of liveRef.current.overlays) {
-        if (ov.kind !== "video") continue;
-        const v = videoPoolRef.current.get(ov.id);
-        if (!v) continue;
-        if (t0 >= ov.timelineStart && t0 < ov.timelineEnd) {
-          synchronizeMediaTime(
-            v,
-            ov.srcStart + (t0 - ov.timelineStart),
-            OVERLAY_MEDIA_DRIFT_TOLERANCE_SEC
-          );
-          v.play().catch(() => {});
-        } else {
-          v.pause();
-        }
-      }
+      attempt = playRequiredBaseMedia(screenVideo, faceVideo);
     } else {
-      transportAnchorRef.current = null;
-      expectedPlayheadRef.current = null;
+      invalidatePlaybackAttempt();
+      overlayPlayPendingRef.current.clear();
       // Pause BOTH slots -- the standby pair is normally already paused (it
       // only ever sits pre-seeked), but a swap that raced the pause could have
       // left the freed pair rolling; belt-and-braces stop everything.
@@ -667,11 +798,17 @@ export function PreviewCanvas({
       for (const v of faceElsRef.current) v?.pause();
       for (const v of videoPoolRef.current.values()) v.pause();
     }
+    return () => {
+      if (attempt !== null && playbackAttemptRef.current === attempt) {
+        invalidatePlaybackAttempt();
+      }
+    };
   }, [
     isPlaying,
     activeScreen,
     activeFace,
-    frameScheduler,
+    baseSourceIdentity,
+    invalidatePlaybackAttempt,
     playRequiredBaseMedia,
   ]);
 
@@ -754,7 +891,7 @@ export function PreviewCanvas({
 
       // 1) CLOCK -- output time comes only from the monotonic transport anchor.
       // Base and overlay media follow the mapped source time within drift limits.
-      if (live.isPlaying) {
+      if (live.isPlaying && transportConfirmedRef.current) {
         const regionStart = live.inPoint ?? 0;
         const regionEnd = live.outPoint ?? live.duration;
         const rate = live.playbackRate > 0 ? live.playbackRate : 1;
@@ -814,13 +951,15 @@ export function PreviewCanvas({
               !!screenSeekersRef.current?.[0]?.readyAt(nextClip.srcStart);
             if (swapReady && standbyFace && standbyScreen) {
               slotOrderRef.current = [...order.slice(1), order[0]];
+              faceSeekersRef.current?.forEach((seeker) => seeker.reset());
+              screenSeekersRef.current?.forEach((seeker) => seeker.reset());
               standbyFace.playbackRate = rate;
               standbyScreen.playbackRate = rate;
               standbyFace.muted = false;
               faceVideo!.muted = true;
               faceVideo!.pause();
               screenVideo!.pause();
-              void playRequiredBaseMedia(standbyScreen, standbyFace);
+              playRequiredBaseMedia(standbyScreen, standbyFace, next, timestamp);
 
               const upcoming = nextDiscontinuousCutsAfter(
                 live.clips,
@@ -855,22 +994,6 @@ export function PreviewCanvas({
               BASE_MEDIA_DRIFT_TOLERANCE_SEC
             );
         }
-        for (const ov of live.overlays) {
-          if (
-            ov.kind !== "video" ||
-            next < ov.timelineStart ||
-            next >= ov.timelineEnd
-          )
-            continue;
-          const video = videoPoolRef.current.get(ov.id);
-          if (!video) continue;
-          synchronizeMediaTime(
-            video,
-            ov.srcStart + (next - ov.timelineStart),
-            OVERLAY_MEDIA_DRIFT_TOLERANCE_SEC
-          );
-        }
-
         // Exactly one playhead write per playing tick.
         sampledOutput = next;
         setPlayhead(next);
@@ -906,9 +1029,10 @@ export function PreviewCanvas({
           captionStyle: capStyle,
           captionBlocks: capBlocks,
           overlays: liveOverlays,
-          isPlaying: playing,
+          isPlaying: requestedPlaying,
         } = liveRef.current;
         const t = sampledOutput ?? storedPlayhead;
+        const playing = requestedPlaying && transportConfirmedRef.current;
 
         // PER-SCENE split, eased across cuts (splitRatioAt). This is the split
         // actually composited this frame -- a scene Manthan tucked the face up on
@@ -1014,13 +1138,13 @@ export function PreviewCanvas({
             const want = o.srcStart + (t - o.timelineStart);
             if (playing) {
               // Light drift correction only -- the overlay is not the clock.
-              if (v.paused) v.play().catch(() => {});
+              playActiveOverlay(o, v);
               synchronizeMediaTime(
                 v,
                 want,
                 OVERLAY_MEDIA_DRIFT_TOLERANCE_SEC
               );
-            } else {
+            } else if (!requestedPlaying) {
               // Scrub: hard-seek to the exact source frame for this output time.
               if (Math.abs(v.currentTime - want) > 1 / 30) v.currentTime = want;
             }
@@ -1119,6 +1243,7 @@ export function PreviewCanvas({
     activeScreen,
     activeFace,
     frameScheduler,
+    playActiveOverlay,
     playRequiredBaseMedia,
   ]);
 
@@ -1538,7 +1663,7 @@ export function PreviewCanvas({
           the imperative flips stick. */}
       {SLOT_INDICES.map((slot) => (
         <video
-          key={`screen-${slot}`}
+          key={`screen-${baseSourceIdentity}-${slot}`}
           data-source-role="screen"
           data-slot-index={slot}
           ref={(el) => {
@@ -1549,8 +1674,10 @@ export function PreviewCanvas({
           playsInline
           preload="auto"
           className="hidden"
-          onLoadedMetadata={reportBaseReadiness}
-          onError={reportRequiredBaseError}
+          onCanPlay={(event) =>
+            reportBaseCanPlay("screen", slot, event.currentTarget)
+          }
+          onError={() => reportRequiredBaseError("screen", slot)}
         />
       ))}
       {/* Face slots read faceProxy.src -- the original streaming URL until the
@@ -1559,7 +1686,7 @@ export function PreviewCanvas({
           falls back for a purged proxy, but reports a real raw-source failure. */}
       {SLOT_INDICES.map((slot) => (
         <video
-          key={`face-${slot}`}
+          key={`face-${baseSourceIdentity}-${slot}`}
           data-source-role="face"
           data-slot-index={slot}
           ref={(el) => {
@@ -1570,10 +1697,12 @@ export function PreviewCanvas({
           playsInline
           preload="auto"
           className="hidden"
-          onLoadedMetadata={reportBaseReadiness}
+          onCanPlay={(event) =>
+            reportBaseCanPlay("face", slot, event.currentTarget)
+          }
           onError={() => {
             if (faceProxy.usingProxy) faceProxy.onSrcError();
-            else reportRequiredBaseError();
+            else reportRequiredBaseError("face", slot);
           }}
         />
       ))}
@@ -1598,6 +1727,7 @@ export function PreviewCanvas({
             playsInline
             preload="auto"
             className="hidden"
+            onError={() => reportActiveOverlayError(o.id)}
             onLoadedMetadata={(e) => {
               const el = e.currentTarget;
               if (el.videoWidth <= 0 || el.videoHeight <= 0) return;
