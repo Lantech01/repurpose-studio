@@ -26,7 +26,12 @@ export async function POST(request: Request): Promise<Response> {
 
   try {
     return Response.json(
-      await storeUploadedVideo({ body: request.body, name, role: role as VideoRole })
+      await storeUploadedVideo({
+        body: request.body,
+        name,
+        role: role as VideoRole,
+        signal: request.signal,
+      })
     );
   } catch {
     return new Response("Footage upload failed", { status: 500 });

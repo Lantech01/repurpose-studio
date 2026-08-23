@@ -14,10 +14,12 @@ export async function storeUploadedVideo({
   body,
   name,
   role: _role,
+  signal,
 }: {
   body: ReadableStream<Uint8Array>;
   name: string;
   role: VideoRole;
+  signal?: AbortSignal;
 }): Promise<UploadedVideo> {
   await mkdir(ORIGINALS_DIR, { recursive: true });
 
@@ -37,8 +39,11 @@ export async function storeUploadedVideo({
     await pipeline(
       Readable.fromWeb(body as never),
       hasher,
-      createWriteStream(partialPath, { flags: "wx" })
+      createWriteStream(partialPath, { flags: "wx" }),
+      { signal }
     );
+
+    if (signal?.aborted) throw signal.reason ?? new Error("Footage upload aborted");
 
     const contentHash = hash.digest("hex");
     const originalPath = path.join(ORIGINALS_DIR, `${contentHash}${extension}`);

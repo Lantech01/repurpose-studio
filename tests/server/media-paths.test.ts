@@ -64,6 +64,16 @@ describe("resolveAllowedVideoPath", () => {
     await expect(policy.resolveAllowedVideoPath(path.join(linked, "private.mp4"))).resolves.toBeNull();
   });
 
+  it("accepts an allowed filename that starts with two dots", async () => {
+    const { home, policy } = await loadPolicy();
+    const file = path.join(home, "Downloads", "..hidden.mp4");
+    await writeFile(file, "video");
+
+    await expect(policy.resolveAllowedVideoPath(file)).resolves.toBe(
+      await import("node:fs/promises").then(({ realpath }) => realpath(file))
+    );
+  });
+
   it("allows only known video extensions", async () => {
     const { home, policy } = await loadPolicy();
     const source = path.join(home, "Downloads");

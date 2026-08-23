@@ -47,10 +47,16 @@ function chunkedBody(bytes: Uint8Array, chunkSize = 64 * 1024): ReadableStream<U
   });
 }
 
-function requestFor(name: string, role: string, body: ReadableStream<Uint8Array>): Request {
+function requestFor(
+  name: string,
+  role: string,
+  body: ReadableStream<Uint8Array>,
+  signal?: AbortSignal
+): Request {
   const request = new Request(`http://localhost/api/repurpose/footage?name=${encodeURIComponent(name)}&role=${role}`, {
     method: "POST",
     body,
+    signal,
     duplex: "half",
   } as RequestInit);
   Object.defineProperty(request, "formData", { value: vi.fn(() => { throw new Error("formData must not be called"); }) });
@@ -94,6 +100,38 @@ describe("POST /api/repurpose/footage", () => {
     const response = await route.POST(requestFor("failed.mp4", "screen", body));
 
     expect(response.status).toBe(500);
+    await expect(readdir(originals)).resolves.toEqual([]);
+  });
+
+  it("cancels an in-flight request and removes only its partial", async () => {
+    const { route, originals } = await loadRoute();
+    const aborter = new AbortController();
+    let cancelled = false;
+    let beginWaiting: () => void;
+    const waiting = new Promise<void>((resolve) => { beginWaiting = resolve; });
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2, 3]));
+      },
+      pull() {
+        beginWaiting();
+        return new Promise<void>(() => {});
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const upload = route.POST(requestFor("aborted.mp4", "screen", body, aborter.signal));
+
+    await waiting;
+    aborter.abort();
+    const response = await Promise.race([
+      upload,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("upload did not abort")), 250)),
+    ]);
+
+    expect(response.status).toBe(500);
+    expect(cancelled).toBe(true);
     await expect(readdir(originals)).resolves.toEqual([]);
   });
 
