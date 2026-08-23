@@ -14,10 +14,18 @@ export async function GET(request: Request): Promise<Response> {
   if (!mediaPath) return errorResponse("MEDIA_PATH_INVALID", "Select a local video file.", 400);
 
   try {
-    return Response.json(await inspectMedia(mediaPath));
+    return Response.json(await inspectMedia(mediaPath, { signal: request.signal }));
   } catch (cause) {
     if (cause instanceof MediaInspectionError) {
-      const status = cause.code === "FFPROBE_UNAVAILABLE" ? 503 : 422;
+      const status = cause.code === "FFPROBE_UNAVAILABLE"
+        ? 503
+        : cause.code === "MEDIA_PROBE_TIMEOUT"
+          ? 504
+          : cause.code === "MEDIA_PROBE_ABORTED"
+            ? 408
+            : cause.code === "MEDIA_CHANGED"
+              ? 409
+              : 422;
       return errorResponse(cause.code, cause.message, status);
     }
     return errorResponse("MEDIA_INVALID", "This file is not a readable video.", 422);

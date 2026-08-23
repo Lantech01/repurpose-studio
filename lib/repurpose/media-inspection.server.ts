@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -8,30 +9,47 @@ import type { MediaInspection } from "@/lib/repurpose/media-types";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_COMPATIBILITY_SETTINGS_VERSION = "compat-v1";
+const DEFAULT_FFPROBE_TIMEOUT_MS = 15_000;
 
-export type MediaInspectionErrorCode = "MEDIA_INVALID" | "FFPROBE_UNAVAILABLE";
+export type MediaInspectionErrorCode =
+  | "MEDIA_INVALID"
+  | "FFPROBE_UNAVAILABLE"
+  | "MEDIA_PROBE_TIMEOUT"
+  | "MEDIA_PROBE_ABORTED"
+  | "MEDIA_CHANGED";
 
 export class MediaInspectionError extends Error {
   constructor(
     public readonly code: MediaInspectionErrorCode,
     message: string,
     public readonly stderr = "",
-    options?: ErrorOptions,
   ) {
-    super(message, options);
+    super(message);
     this.name = "MediaInspectionError";
   }
+}
+
+export interface FfprobeControls {
+  signal: AbortSignal;
+  timeoutMs: number;
 }
 
 export type FfprobeRunner = (
   executable: string,
   args: string[],
+  controls: FfprobeControls,
 ) => Promise<{ stdout: string | Buffer; stderr?: string | Buffer }>;
+
+export type MediaStat = Pick<Stats, "size" | "mtimeMs" | "dev" | "ino" | "isFile">;
 
 export interface InspectMediaOptions {
   ffprobePath?: string;
   compatibilitySettingsVersion?: string;
   runFfprobe?: FfprobeRunner;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  statMedia?: (mediaPath: string) => Promise<MediaStat>;
+  realpathMedia?: (mediaPath: string) => Promise<string>;
 }
 
 interface ProbeStream {
@@ -47,6 +65,7 @@ interface ProbeStream {
   duration?: unknown;
   channels?: unknown;
   sample_rate?: unknown;
+  disposition?: unknown;
 }
 
 interface ProbeDocument {
@@ -85,21 +104,40 @@ function sanitizeStderr(stderr: unknown, mediaPath: string): string {
     .slice(0, 600);
 }
 
-function invalidMedia(stderr = "", cause?: unknown): MediaInspectionError {
-  return new MediaInspectionError("MEDIA_INVALID", "This file is not a readable video.", stderr, { cause });
+function invalidMedia(stderr = ""): MediaInspectionError {
+  return new MediaInspectionError("MEDIA_INVALID", "This file is not a readable video.", stderr);
 }
 
-const runFfprobe: FfprobeRunner = (executable, args) => execFileAsync(
+function probeError(code: MediaInspectionErrorCode): MediaInspectionError {
+  switch (code) {
+    case "MEDIA_PROBE_TIMEOUT":
+      return new MediaInspectionError(code, "Media inspection timed out.");
+    case "MEDIA_PROBE_ABORTED":
+      return new MediaInspectionError(code, "Media inspection was cancelled.");
+    case "MEDIA_CHANGED":
+      return new MediaInspectionError(code, "The media changed during inspection. Try again.");
+    default:
+      return invalidMedia();
+  }
+}
+
+const runFfprobe: FfprobeRunner = (executable, args, controls) => execFileAsync(
   executable,
   args,
-  { encoding: "utf8", windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
+  {
+    encoding: "utf8",
+    windowsHide: true,
+    maxBuffer: 4 * 1024 * 1024,
+    signal: controls.signal,
+    timeout: controls.timeoutMs,
+  },
 );
 
-export async function createMediaFingerprint(
-  mediaPath: string,
-  compatibilitySettingsVersion = DEFAULT_COMPATIBILITY_SETTINGS_VERSION,
-): Promise<string> {
-  const [resolvedPath, metadata] = await Promise.all([realpath(mediaPath), stat(mediaPath)]);
+function fingerprintSnapshot(
+  resolvedPath: string,
+  metadata: MediaStat,
+  compatibilitySettingsVersion: string,
+): string {
   return createHash("sha256")
     .update(JSON.stringify({
       path: resolvedPath,
@@ -110,35 +148,133 @@ export async function createMediaFingerprint(
     .digest("hex");
 }
 
+function sameSnapshot(before: MediaStat, after: MediaStat): boolean {
+  return before.isFile() && after.isFile()
+    && before.size === after.size
+    && before.mtimeMs === after.mtimeMs
+    && before.dev === after.dev
+    && before.ino === after.ino;
+}
+
+class ProbeControlError extends Error {
+  constructor(public readonly kind: "timeout" | "aborted") {
+    super(kind);
+  }
+}
+
+async function runControlledProbe(
+  runner: FfprobeRunner,
+  executable: string,
+  args: string[],
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+): Promise<{ stdout: string | Buffer; stderr?: string | Buffer }> {
+  if (signal?.aborted) throw new ProbeControlError("aborted");
+
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let handleCallerAbort: (() => void) | undefined;
+  const controlFailure = new Promise<never>((_resolve, reject) => {
+    handleCallerAbort = () => {
+      controller.abort();
+      reject(new ProbeControlError("aborted"));
+    };
+    signal?.addEventListener("abort", handleCallerAbort, { once: true });
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new ProbeControlError("timeout"));
+    }, timeoutMs);
+  });
+  const execution = Promise.resolve().then(() => runner(executable, args, {
+    signal: controller.signal,
+    timeoutMs,
+  }));
+
+  try {
+    return await Promise.race([execution, controlFailure]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (handleCallerAbort) signal?.removeEventListener("abort", handleCallerAbort);
+  }
+}
+
+export async function createMediaFingerprint(
+  mediaPath: string,
+  compatibilitySettingsVersion = DEFAULT_COMPATIBILITY_SETTINGS_VERSION,
+): Promise<string> {
+  const [resolvedPath, metadata] = await Promise.all([realpath(mediaPath), stat(mediaPath)]);
+  if (!metadata.isFile()) throw invalidMedia();
+  return fingerprintSnapshot(resolvedPath, metadata, compatibilitySettingsVersion);
+}
+
+function hasDisposition(stream: ProbeStream, name: "attached_pic" | "default"): boolean {
+  if (!stream.disposition || typeof stream.disposition !== "object" || Array.isArray(stream.disposition)) {
+    return false;
+  }
+  const value = (stream.disposition as Record<string, unknown>)[name];
+  return value === true || value === 1 || value === "1";
+}
+
 export async function inspectMedia(
   mediaPath: string,
   options: InspectMediaOptions = {},
 ): Promise<MediaInspection> {
+  const statMedia = options.statMedia ?? stat;
+  const realpathMedia = options.realpathMedia ?? realpath;
+  let resolvedPath: string;
+  let before: MediaStat;
+  try {
+    resolvedPath = await realpathMedia(mediaPath);
+    before = await statMedia(resolvedPath);
+  } catch {
+    throw invalidMedia();
+  }
+  if (!before.isFile()) throw invalidMedia();
+  if (options.signal?.aborted) throw probeError("MEDIA_PROBE_ABORTED");
+
   const ffprobePath = options.ffprobePath ?? "ffprobe";
-  const args = ["-v", "error", "-show_format", "-show_streams", "-of", "json", mediaPath];
+  const timeoutMs = Number.isFinite(options.timeoutMs) && (options.timeoutMs ?? 0) > 0
+    ? options.timeoutMs as number
+    : DEFAULT_FFPROBE_TIMEOUT_MS;
+  const args = ["-v", "error", "-show_format", "-show_streams", "-of", "json", resolvedPath];
   let stdout: string | Buffer;
   try {
-    ({ stdout } = await (options.runFfprobe ?? runFfprobe)(ffprobePath, args));
+    ({ stdout } = await runControlledProbe(
+      options.runFfprobe ?? runFfprobe,
+      ffprobePath,
+      args,
+      options.signal,
+      timeoutMs,
+    ));
   } catch (cause) {
+    if (cause instanceof ProbeControlError) {
+      throw probeError(cause.kind === "timeout" ? "MEDIA_PROBE_TIMEOUT" : "MEDIA_PROBE_ABORTED");
+    }
+    if (options.signal?.aborted) throw probeError("MEDIA_PROBE_ABORTED");
     const error = cause as NodeJS.ErrnoException & { stderr?: unknown };
     if (error.code === "ENOENT") {
-      throw new MediaInspectionError(
-        "FFPROBE_UNAVAILABLE",
-        "Media inspection is unavailable.",
-        "",
-        { cause },
-      );
+      throw new MediaInspectionError("FFPROBE_UNAVAILABLE", "Media inspection is unavailable.");
     }
-    throw invalidMedia(sanitizeStderr(error.stderr, mediaPath), cause);
+    throw invalidMedia(sanitizeStderr(error.stderr, resolvedPath));
   }
+
+  let afterPath: string;
+  let after: MediaStat;
+  try {
+    afterPath = await realpathMedia(resolvedPath);
+    after = await statMedia(afterPath);
+  } catch {
+    throw probeError("MEDIA_CHANGED");
+  }
+  if (afterPath !== resolvedPath || !sameSnapshot(before, after)) throw probeError("MEDIA_CHANGED");
 
   let document: ProbeDocument;
   try {
     const parsed = JSON.parse(stdout.toString()) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Invalid ffprobe document");
     document = parsed as ProbeDocument;
-  } catch (cause) {
-    throw invalidMedia("", cause);
+  } catch {
+    throw invalidMedia();
   }
 
   if (!Array.isArray(document.streams)) throw invalidMedia();
@@ -146,7 +282,8 @@ export async function inspectMedia(
     throw invalidMedia();
   }
   const streams = document.streams as ProbeStream[];
-  const video = streams.find((stream) => stream.codec_type === "video");
+  const videos = streams.filter((stream) => stream.codec_type === "video" && !hasDisposition(stream, "attached_pic"));
+  const video = videos.find((stream) => hasDisposition(stream, "default")) ?? videos[0];
   const audio = streams.find((stream) => stream.codec_type === "audio");
   const width = finiteNumber(video?.width);
   const height = finiteNumber(video?.height);
@@ -156,21 +293,17 @@ export async function inspectMedia(
   }
   if (!Number.isFinite(durationSec) || durationSec <= 0) throw invalidMedia();
 
-  const metadata = await stat(mediaPath).catch((cause) => {
-    throw invalidMedia("", cause);
-  });
-  const fingerprint = await createMediaFingerprint(
-    mediaPath,
+  const fingerprint = fingerprintSnapshot(
+    resolvedPath,
+    before,
     options.compatibilitySettingsVersion ?? DEFAULT_COMPATIBILITY_SETTINGS_VERSION,
-  ).catch((cause) => {
-    throw invalidMedia("", cause);
-  });
+  );
 
   return {
     fingerprint,
     container: stringValue(document.format?.format_name),
-    extension: path.extname(mediaPath).toLowerCase(),
-    size: metadata.size,
+    extension: path.extname(resolvedPath).toLowerCase(),
+    size: before.size,
     durationSec,
     video: {
       codec: stringValue(video.codec_name),
