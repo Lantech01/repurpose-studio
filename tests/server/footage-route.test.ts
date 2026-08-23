@@ -1,6 +1,6 @@
 // @vitest-environment node
 
-import { link as realLink, lstat, mkdtemp, mkdir, readdir, readFile, stat, symlink, unlink as realUnlink, utimes, writeFile } from "node:fs/promises";
+import { link as realLink, lstat, mkdtemp, mkdir, readdir, readFile, rename as realRename, stat, symlink, unlink as realUnlink, utimes, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -85,8 +85,31 @@ async function loadIndependentUploader(): Promise<MediaUploader> {
   return (await import("@/lib/repurpose/media-upload.server")) as MediaUploader;
 }
 
-function wait(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+type MediaUploadOverrides = NonNullable<Parameters<MediaUploader["storeUploadedVideo"]>[1]>;
+
+function lockAttemptBarrier(lockPath: string): {
+  attempted: Promise<void>;
+  release: () => void;
+  mkdir: NonNullable<MediaUploadOverrides["mkdir"]>;
+} {
+  let announceAttempt!: () => void;
+  const attempted = new Promise<void>((resolve) => { announceAttempt = resolve; });
+  let releaseAttempt!: () => void;
+  const mayContinue = new Promise<void>((resolve) => { releaseAttempt = resolve; });
+  let blocked = false;
+  const mkdirWithBarrier: NonNullable<MediaUploadOverrides["mkdir"]> = async (target, options) => {
+    try {
+      return await mkdir(target, options);
+    } catch (error) {
+      if (target === lockPath && !blocked && (error as NodeJS.ErrnoException).code === "EEXIST") {
+        blocked = true;
+        announceAttempt();
+        await mayContinue;
+      }
+      throw error;
+    }
+  };
+  return { attempted, release: releaseAttempt, mkdir: mkdirWithBarrier };
 }
 
 describe("POST /api/repurpose/footage", () => {
@@ -322,6 +345,7 @@ describe("POST /api/repurpose/footage", () => {
     const bytes = new Uint8Array([8, 8, 8]);
     const hash = createHash("sha256").update(bytes).digest("hex");
     const originalPath = path.join(originals, `${hash}.mp4`);
+    const lockPath = `${originalPath}.publish-lock`;
     const publisherAbort = new AbortController();
     let releasePublisherLink: (() => void) | undefined;
     const publisherMayFinish = new Promise<void>((resolve) => { releasePublisherLink = resolve; });
@@ -338,27 +362,30 @@ describe("POST /api/repurpose/footage", () => {
       { link }
     );
     await publisherHasLinked;
-    let followerSettled = false;
+    const followerLock = lockAttemptBarrier(lockPath);
     const follower = followerUploader.storeUploadedVideo(
-      { body: chunkedBody(bytes), name: "follower.mp4", role: "face" }
-    ).finally(() => { followerSettled = true; });
+      { body: chunkedBody(bytes), name: "follower.mp4", role: "face" },
+      { mkdir: followerLock.mkdir }
+    );
 
-    await wait(30);
-    expect(followerSettled).toBe(false);
+    await followerLock.attempted;
     publisherAbort.abort(abortReason);
     if (!releasePublisherLink) throw new Error("publisher barrier was not initialized");
     releasePublisherLink();
 
     await expect(publisher).rejects.toBe(abortReason);
+    followerLock.release();
     const uploaded = await follower;
     await expect(readFile(uploaded.originalPath)).resolves.toEqual(Buffer.from(bytes));
     await expect(lstat(originalPath)).resolves.toMatchObject({ size: bytes.byteLength });
   });
 
   it("preserves the AbortError and lets a follower proceed after transient rollback unlink failures", async () => {
-    const { uploader: publisherUploader } = await loadRoute();
+    const { uploader: publisherUploader, originals } = await loadRoute();
     const followerUploader = await loadIndependentUploader();
     const bytes = new Uint8Array([6, 6, 6]);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const lockPath = path.join(originals, `${hash}.mp4.publish-lock`);
     const publisherAbort = new AbortController();
     const abortReason = new Error("publisher cancelled");
     let releasePublisherLink: (() => void) | undefined;
@@ -380,29 +407,31 @@ describe("POST /api/repurpose/footage", () => {
       { link, unlink }
     );
     await publisherHasLinked;
+    const followerLock = lockAttemptBarrier(lockPath);
     const follower = followerUploader.storeUploadedVideo(
-      { body: chunkedBody(bytes), name: "follower.mp4", role: "face" }
+      { body: chunkedBody(bytes), name: "follower.mp4", role: "face" },
+      { mkdir: followerLock.mkdir }
     );
 
+    await followerLock.attempted;
     publisherAbort.abort(abortReason);
     if (!releasePublisherLink) throw new Error("publisher barrier was not initialized");
     releasePublisherLink();
 
     await expect(publisher).rejects.toBe(abortReason);
     expect(unlink).toHaveBeenCalledTimes(2);
+    followerLock.release();
     await expect(follower).resolves.toMatchObject({ size: bytes.byteLength });
   });
 
-  it("keeps a failed rollback owned and prevents follower success without replacing AbortError", async () => {
+  it("recovers a failed rollback under lock before the follower republishes", async () => {
     const { uploader: publisherUploader, originals } = await loadRoute();
     const followerUploader = await loadIndependentUploader();
     const bytes = new Uint8Array([3, 3, 3]);
     const hash = createHash("sha256").update(bytes).digest("hex");
     const originalPath = path.join(originals, `${hash}.mp4`);
     const publisherAbort = new AbortController();
-    const followerAbort = new AbortController();
     const abortReason = new Error("publisher cancelled");
-    const followerAbortReason = new Error("follower cancelled");
     let releasePublisherLink: (() => void) | undefined;
     const publisherMayFinish = new Promise<void>((resolve) => { releasePublisherLink = resolve; });
     let publisherLinked: () => void;
@@ -418,20 +447,25 @@ describe("POST /api/repurpose/footage", () => {
       { link, unlink }
     );
     await publisherHasLinked;
-    let followerSettled = false;
+    const followerLock = lockAttemptBarrier(`${originalPath}.publish-lock`);
+    const followerLink = vi.fn(async (source: string, destination: string) => {
+      await expect(lstat(destination)).rejects.toMatchObject({ code: "ENOENT" });
+      await realLink(source, destination);
+    });
     const follower = followerUploader.storeUploadedVideo(
-      { body: chunkedBody(bytes), name: "follower.mp4", role: "face", signal: followerAbort.signal }
-    ).finally(() => { followerSettled = true; });
+      { body: chunkedBody(bytes), name: "follower.mp4", role: "face" },
+      { link: followerLink, mkdir: followerLock.mkdir }
+    );
 
+    await followerLock.attempted;
     publisherAbort.abort(abortReason);
     if (!releasePublisherLink) throw new Error("publisher barrier was not initialized");
     releasePublisherLink();
     await expect(publisher).rejects.toBe(abortReason);
-    await wait(30);
-    expect(followerSettled).toBe(false);
-    await expect(lstat(originalPath)).resolves.toMatchObject({ size: bytes.byteLength });
-    followerAbort.abort(followerAbortReason);
-    await expect(follower).rejects.toBe(followerAbortReason);
+    followerLock.release();
+    const uploaded = await follower;
+    expect(followerLink).toHaveBeenCalledTimes(1);
+    await expect(readFile(uploaded.originalPath)).resolves.toEqual(Buffer.from(bytes));
   });
 
   it("reclaims only a stale publish lock whose recorded owner is no longer alive", async () => {
@@ -440,7 +474,7 @@ describe("POST /api/repurpose/footage", () => {
     const hash = createHash("sha256").update(bytes).digest("hex");
     const lockPath = path.join(originals, `${hash}.mp4.publish-lock`);
     await mkdir(lockPath, { recursive: true });
-    await writeFile(path.join(lockPath, "owner.json"), JSON.stringify({ token: "dead", pid: -1 }));
+    await writeFile(path.join(lockPath, "owner.json"), JSON.stringify({ token: "dead", pid: -1, phase: "publishing" }));
     const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
     await utimes(lockPath, old, old);
 
@@ -451,6 +485,149 @@ describe("POST /api/repurpose/footage", () => {
     await expect(readFile(uploaded.originalPath)).resolves.toEqual(Buffer.from(bytes));
     await expect(lstat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
+
+  it("recovers a fresh dead rollback-failed owner before a follower publishes", async () => {
+    const { uploader, originals } = await loadRoute();
+    const bytes = new Uint8Array([2, 4, 2]);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const originalPath = path.join(originals, `${hash}.mp4`);
+    const lockPath = `${originalPath}.publish-lock`;
+    await mkdir(lockPath, { recursive: true });
+    await writeFile(originalPath, bytes);
+    await writeFile(
+      path.join(lockPath, "owner.json"),
+      JSON.stringify({ token: "dead", pid: -1, phase: "rollback-failed" })
+    );
+    const link = vi.fn(async (source: string, destination: string) => {
+      await expect(lstat(destination)).rejects.toMatchObject({ code: "ENOENT" });
+      await realLink(source, destination);
+    });
+
+    const uploaded = await uploader.storeUploadedVideo(
+      { body: chunkedBody(bytes), name: "recovered.mp4", role: "face" },
+      { link }
+    );
+
+    expect(link).toHaveBeenCalledTimes(1);
+    await expect(readFile(uploaded.originalPath)).resolves.toEqual(Buffer.from(bytes));
+    await expect(lstat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  }, 1_000);
+
+  it("treats an already-missing rollback destination as recovered", async () => {
+    const { uploader, originals } = await loadRoute();
+    const bytes = new Uint8Array([2, 4, 3]);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const originalPath = path.join(originals, `${hash}.mp4`);
+    const lockPath = `${originalPath}.publish-lock`;
+    await mkdir(lockPath, { recursive: true });
+    await writeFile(
+      path.join(lockPath, "owner.json"),
+      JSON.stringify({ token: "dead", pid: -1, phase: "rollback-failed" })
+    );
+    const link = vi.fn(async (source: string, destination: string) => realLink(source, destination));
+
+    const uploaded = await uploader.storeUploadedVideo(
+      { body: chunkedBody(bytes), name: "missing-rollback.mp4", role: "face" },
+      { link }
+    );
+
+    expect(link).toHaveBeenCalledTimes(1);
+    await expect(readFile(uploaded.originalPath)).resolves.toEqual(Buffer.from(bytes));
+    await expect(lstat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  }, 1_000);
+
+  it("records committed and lets a follower reclaim a lock whose owner could not release it", async () => {
+    const { uploader, originals } = await loadRoute();
+    const followerUploader = await loadIndependentUploader();
+    const bytes = new Uint8Array([1, 4, 1]);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const originalPath = path.join(originals, `${hash}.mp4`);
+    const lockPath = `${originalPath}.publish-lock`;
+    const rename = vi.fn(async (from: string, to: string) => {
+      if (from === lockPath) throw errorWithCode("EBUSY");
+      await realRename(from, to);
+    });
+
+    const first = await uploader.storeUploadedVideo(
+      { body: chunkedBody(bytes), name: "committed.mp4", role: "face" },
+      { rename }
+    );
+    const owner = JSON.parse(await readFile(path.join(lockPath, "owner.json"), "utf8"));
+    const followerLock = lockAttemptBarrier(lockPath);
+    const followerUpload = followerUploader.storeUploadedVideo(
+      { body: chunkedBody(bytes), name: "follower.mp4", role: "face" },
+      { mkdir: followerLock.mkdir }
+    );
+    await followerLock.attempted;
+    followerLock.release();
+    const follower = await followerUpload;
+
+    expect(owner.phase).toBe("committed");
+    await expect(readFile(first.originalPath)).resolves.toEqual(Buffer.from(bytes));
+    expect(follower.originalPath).toBe(first.originalPath);
+    await expect(lstat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  }, 1_000);
+
+  it("reclaims old invalid phase metadata instead of treating a live PID as an owner", async () => {
+    const { uploader, originals } = await loadRoute();
+    const bytes = new Uint8Array([9, 4, 9]);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const lockPath = path.join(originals, `${hash}.mp4.publish-lock`);
+    await mkdir(lockPath, { recursive: true });
+    await writeFile(path.join(lockPath, "owner.json"), JSON.stringify({ token: "bad", pid: process.pid, phase: "unknown" }));
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await utimes(lockPath, old, old);
+
+    const uploaded = await uploader.storeUploadedVideo(
+      { body: chunkedBody(bytes), name: "invalid-phase.mp4", role: "face" }
+    );
+
+    await expect(readFile(uploaded.originalPath)).resolves.toEqual(Buffer.from(bytes));
+    await expect(lstat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  }, 1_000);
+
+  it("reclaims a fresh publishing lock immediately when its recorded PID is dead", async () => {
+    const { uploader, originals } = await loadRoute();
+    const bytes = new Uint8Array([5, 4, 5]);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const lockPath = path.join(originals, `${hash}.mp4.publish-lock`);
+    await mkdir(lockPath, { recursive: true });
+    await writeFile(path.join(lockPath, "owner.json"), JSON.stringify({ token: "dead", pid: -1, phase: "publishing" }));
+
+    const uploaded = await uploader.storeUploadedVideo(
+      { body: chunkedBody(bytes), name: "dead-owner.mp4", role: "face" }
+    );
+
+    await expect(readFile(uploaded.originalPath)).resolves.toEqual(Buffer.from(bytes));
+    await expect(lstat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  }, 1_000);
+
+  it("aborts a follower after its lock polling attempt is observed", async () => {
+    const { uploader, originals } = await loadRoute();
+    const bytes = new Uint8Array([5, 4, 6]);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const lockPath = path.join(originals, `${hash}.mp4.publish-lock`);
+    await mkdir(lockPath, { recursive: true });
+    await writeFile(
+      path.join(lockPath, "owner.json"),
+      JSON.stringify({ token: "live", pid: process.pid, phase: "publishing" })
+    );
+    const aborter = new AbortController();
+    const abortReason = new Error("follower cancelled");
+    const followerLock = lockAttemptBarrier(lockPath);
+    const follower = uploader.storeUploadedVideo(
+      { body: chunkedBody(bytes), name: "cancelled-follower.mp4", role: "face", signal: aborter.signal },
+      { mkdir: followerLock.mkdir }
+    );
+
+    await followerLock.attempted;
+    aborter.abort(abortReason);
+    followerLock.release();
+
+    await expect(follower).rejects.toBe(abortReason);
+    await expect(listPartialFiles(originals)).resolves.toEqual([]);
+    expect((await lstat(lockPath)).isDirectory()).toBe(true);
+  }, 1_000);
 
   it("reuses one original for byte-identical uploads without overwriting it", async () => {
     const { route, originals } = await loadRoute();

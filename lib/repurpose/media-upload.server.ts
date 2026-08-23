@@ -11,6 +11,7 @@ import type { UploadedVideo, VideoRole } from "@/lib/repurpose/media-types";
 const ORIGINALS_DIR = path.join(REPURPOSE_FOOTAGE_DIR, "originals");
 const PUBLISH_LOCK_SUFFIX = ".publish-lock";
 const PUBLISH_LOCK_OWNER_FILE = "owner.json";
+const PUBLISH_RECOVERY_OWNER_FILE = "recovery-owner.json";
 const LOCK_RETRY_MS = 10;
 const LOCK_STALE_MS = 60 * 60 * 1000;
 const RETRY_ATTEMPTS = 3;
@@ -37,7 +38,13 @@ type PublicationLock = {
 type PublicationOwner = {
   token: string;
   pid: number;
-  phase: "publishing" | "rollback-failed";
+  phase: "publishing" | "rollback-failed" | "committed";
+};
+
+type RecoveryOwner = {
+  token: string;
+  pid: number;
+  publicationToken: string;
 };
 
 function resolveFileOperations(overrides?: MediaUploadDependencies): UploadFileOperations {
@@ -94,16 +101,39 @@ async function readPublicationOwner(
 ): Promise<PublicationOwner | null> {
   try {
     const candidate: unknown = JSON.parse(await operations.readFile(ownerPath, "utf8"));
+    const phase = (candidate as { phase?: unknown } | null)?.phase;
     if (
       typeof candidate === "object" &&
       candidate !== null &&
       typeof (candidate as { token?: unknown }).token === "string" &&
-      typeof (candidate as { pid?: unknown }).pid === "number"
+      typeof (candidate as { pid?: unknown }).pid === "number" &&
+      (phase === "publishing" || phase === "rollback-failed" || phase === "committed")
     ) {
       return candidate as PublicationOwner;
     }
   } catch {
     // A partially-written/corrupt owner file is reclaimable only after the lock ages out.
+  }
+  return null;
+}
+
+async function readRecoveryOwner(
+  recoveryPath: string,
+  operations: UploadFileOperations
+): Promise<RecoveryOwner | null> {
+  try {
+    const candidate: unknown = JSON.parse(await operations.readFile(recoveryPath, "utf8"));
+    if (
+      typeof candidate === "object" &&
+      candidate !== null &&
+      typeof (candidate as { token?: unknown }).token === "string" &&
+      typeof (candidate as { pid?: unknown }).pid === "number" &&
+      typeof (candidate as { publicationToken?: unknown }).publicationToken === "string"
+    ) {
+      return candidate as RecoveryOwner;
+    }
+  } catch {
+    // A corrupt recovery claim is handled conservatively until it becomes stale.
   }
   return null;
 }
@@ -121,29 +151,146 @@ async function writePublicationOwner(
   );
 }
 
-async function reclaimStaleLock(lockPath: string, operations: UploadFileOperations): Promise<void> {
+async function retireLock(
+  lockPath: string,
+  label: "released" | "recovered" | "stale",
+  operations: UploadFileOperations
+): Promise<boolean> {
+  const retiredPath = `${lockPath}.${label}-${randomUUID()}`;
+  try {
+    await operations.rename(lockPath, retiredPath);
+  } catch (error: unknown) {
+    if (isErrno(error, "ENOENT")) return true;
+    return false;
+  }
+  await operations.rm(retiredPath, { recursive: true, force: true }).catch(() => {});
+  return true;
+}
+
+async function removeRecoveryClaim(
+  recoveryPath: string,
+  claim: RecoveryOwner,
+  operations: UploadFileOperations
+): Promise<void> {
+  try {
+    await operations.rm(recoveryPath, { force: true });
+  } catch {
+    // Make an otherwise-stuck claim immediately reclaimable if cleanup fails.
+    await operations.writeFile(recoveryPath, JSON.stringify({ ...claim, pid: -1 }), { flag: "w" }).catch(() => {});
+  }
+}
+
+async function claimRecovery(
+  lockPath: string,
+  owner: PublicationOwner,
+  operations: UploadFileOperations
+): Promise<{ claim: RecoveryOwner; recoveryPath: string } | null> {
+  const recoveryPath = path.join(lockPath, PUBLISH_RECOVERY_OWNER_FILE);
+  const claim: RecoveryOwner = {
+    token: randomUUID(),
+    pid: process.pid,
+    publicationToken: owner.token,
+  };
+  try {
+    await operations.writeFile(recoveryPath, JSON.stringify(claim), { flag: "wx" });
+    return { claim, recoveryPath };
+  } catch (error: unknown) {
+    if (!isErrno(error, "EEXIST")) throw error;
+  }
+
+  const existing = await readRecoveryOwner(recoveryPath, operations);
+  if (existing && isProcessAlive(existing.pid)) return null;
+  if (!existing) {
+    try {
+      const info = await operations.lstat(recoveryPath);
+      if (Date.now() - info.mtimeMs < LOCK_STALE_MS) return null;
+    } catch (error: unknown) {
+      if (isErrno(error, "ENOENT")) return null;
+      throw error;
+    }
+  }
+
+  const retiredPath = `${recoveryPath}.stale-${randomUUID()}`;
+  try {
+    await operations.rename(recoveryPath, retiredPath);
+  } catch (error: unknown) {
+    if (isErrno(error, "ENOENT")) return null;
+    throw error;
+  }
+  await operations.rm(retiredPath, { force: true }).catch(() => {});
+  return null;
+}
+
+async function rollbackCreatedOriginal(
+  originalPath: string,
+  operations: UploadFileOperations
+): Promise<boolean> {
+  for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
+    try {
+      await operations.unlink(originalPath);
+      return true;
+    } catch (error: unknown) {
+      if (isErrno(error, "ENOENT")) return true;
+      if (attempt + 1 < RETRY_ATTEMPTS) await wait(LOCK_RETRY_MS);
+    }
+  }
+  return false;
+}
+
+async function recoverPublicationLock(
+  originalPath: string,
+  operations: UploadFileOperations
+): Promise<boolean> {
+  const lockPath = `${originalPath}${PUBLISH_LOCK_SUFFIX}`;
   let info: Stats;
   try {
     info = await operations.lstat(lockPath);
   } catch (error: unknown) {
-    if (isErrno(error, "ENOENT")) return;
+    if (isErrno(error, "ENOENT")) return true;
     throw error;
   }
-  if (Date.now() - info.mtimeMs < LOCK_STALE_MS) return;
-
   const owner = await readPublicationOwner(path.join(lockPath, PUBLISH_LOCK_OWNER_FILE), operations);
-  if (owner && isProcessAlive(owner.pid)) return;
-
-  const retiredPath = `${lockPath}.stale-${randomUUID()}`;
-  try {
-    // Rename removes the canonical lock atomically, so an old owner can never
-    // release or delete a lock acquired by a new publisher.
-    await operations.rename(lockPath, retiredPath);
-  } catch (error: unknown) {
-    if (isErrno(error, "ENOENT")) return;
-    throw error;
+  if (!owner) {
+    if (Date.now() - info.mtimeMs < LOCK_STALE_MS) return false;
+    const recovery = await readRecoveryOwner(
+      path.join(lockPath, PUBLISH_RECOVERY_OWNER_FILE),
+      operations
+    );
+    if (recovery && isProcessAlive(recovery.pid)) return false;
+    return retireLock(lockPath, "stale", operations);
   }
-  await operations.rm(retiredPath, { recursive: true, force: true }).catch(() => {});
+
+  if (owner.phase === "publishing" && isProcessAlive(owner.pid)) return false;
+
+  const recovery = await claimRecovery(lockPath, owner, operations);
+  if (!recovery) return false;
+  let retired = false;
+  try {
+    const currentOwner = await readPublicationOwner(
+      path.join(lockPath, PUBLISH_LOCK_OWNER_FILE),
+      operations
+    );
+    if (
+      !currentOwner ||
+      currentOwner.token !== owner.token ||
+      currentOwner.pid !== owner.pid ||
+      currentOwner.phase !== owner.phase
+    ) {
+      return false;
+    }
+
+    if (owner.phase === "rollback-failed") {
+      const rolledBack = await rollbackCreatedOriginal(originalPath, operations);
+      if (!rolledBack) return false;
+    }
+
+    retired = await retireLock(lockPath, "recovered", operations);
+    return retired;
+  } finally {
+    if (!retired) {
+      await removeRecoveryClaim(recovery.recoveryPath, recovery.claim, operations);
+    }
+  }
 }
 
 async function acquirePublicationLock(
@@ -171,8 +318,8 @@ async function acquirePublicationLock(
       }
     } catch (error: unknown) {
       if (!isErrno(error, "EEXIST")) throw error;
-      await reclaimStaleLock(lockPath, operations);
-      await wait(LOCK_RETRY_MS, signal);
+      const recovered = await recoverPublicationLock(originalPath, operations);
+      if (!recovered) await wait(LOCK_RETRY_MS, signal);
     }
   }
 }
@@ -182,15 +329,8 @@ async function releasePublicationLock(lock: PublicationLock, operations: UploadF
   if (!owner || owner.token !== lock.token) return;
 
   for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
-    const retiredPath = `${lock.lockPath}.released-${randomUUID()}`;
-    try {
-      await operations.rename(lock.lockPath, retiredPath);
-      await operations.rm(retiredPath, { recursive: true, force: true }).catch(() => {});
-      return;
-    } catch (error: unknown) {
-      if (isErrno(error, "ENOENT")) return;
-      if (attempt + 1 < RETRY_ATTEMPTS) await wait(LOCK_RETRY_MS);
-    }
+    if (await retireLock(lock.lockPath, "released", operations)) return;
+    if (attempt + 1 < RETRY_ATTEMPTS) await wait(LOCK_RETRY_MS);
   }
 }
 
@@ -224,21 +364,6 @@ async function cleanupPartial(partialPath: string, operations: UploadFileOperati
       // leave only this UUID partial for later recovery.
     }
   }
-}
-
-async function rollbackCreatedOriginal(
-  originalPath: string,
-  operations: UploadFileOperations
-): Promise<boolean> {
-  for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
-    try {
-      await operations.unlink(originalPath);
-      return true;
-    } catch {
-      if (attempt + 1 < RETRY_ATTEMPTS) await wait(LOCK_RETRY_MS);
-    }
-  }
-  return false;
 }
 
 export async function storeUploadedVideo({
@@ -299,6 +424,9 @@ export async function storeUploadedVideo({
         await cleanupPartial(partialPath, operations);
         // Cleanup can yield, so check once more before reporting success.
         throwIfAborted(signal);
+        // This terminal phase lets another worker preserve the committed original
+        // and recover the lock if release repeatedly fails.
+        await writePublicationOwner(lock, "committed", "w", operations);
         return { originalPath, contentHash, size, name };
       } catch (error) {
         if (createdDestination) {
