@@ -594,6 +594,28 @@ describe("PreviewCanvas transport", () => {
     expect(rafCallbacks.size).toBe(0);
   });
 
+  test("hard-seeks both active base videos after an external seek within drift tolerance", async () => {
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const media = mediaFor(container);
+    decode(media.screen[0]);
+    decode(media.face[0]);
+
+    act(() => useRepurposeStore.getState().play());
+    await act(async () => Promise.resolve());
+    runFrame(1_000);
+
+    media.screen[0].currentTime = 0.5;
+    media.face[0].currentTime = 0.7;
+    act(() => useRepurposeStore.getState().setPlayhead(0.6));
+    runFrame(1_100);
+
+    expect(useRepurposeStore.getState().playhead).toBeCloseTo(0.6, 5);
+    expect(media.screen[0].currentTime).toBe(0.6);
+    expect(media.face[0].currentTime).toBe(0.6);
+  });
+
   test("pauses with an actionable reason when an active overlay play rejects", async () => {
     playImpl
       .mockImplementationOnce(() => Promise.resolve())
@@ -620,6 +642,95 @@ describe("PreviewCanvas transport", () => {
       mediaReadiness: "error",
       playbackBlockedReason:
         "Overlay video overlay-video could not play. Re-import it to create a compatible copy.",
+    });
+  });
+
+  test("ignores an old overlay rejection after Pause then a new Play", async () => {
+    const oldOverlayPlay = deferred<void>();
+    const newOverlayPlay = deferred<void>();
+    playImpl
+      .mockImplementationOnce(() => Promise.resolve())
+      .mockImplementationOnce(() => Promise.resolve())
+      .mockImplementationOnce(() => oldOverlayPlay.promise)
+      .mockImplementationOnce(() => Promise.resolve())
+      .mockImplementationOnce(() => Promise.resolve())
+      .mockImplementationOnce(() => newOverlayPlay.promise);
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const media = mediaFor(container);
+    decode(media.screen[0]);
+    decode(media.face[0]);
+    decode(media.overlay);
+
+    act(() => useRepurposeStore.getState().play());
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    runFrame(1_000);
+
+    act(() => useRepurposeStore.getState().pause());
+    act(() => useRepurposeStore.getState().play());
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    runFrame(1_200);
+
+    await act(async () => {
+      oldOverlayPlay.reject(new Error("old overlay session"));
+      await Promise.resolve();
+    });
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      isPlaying: true,
+      mediaReadiness: "ready",
+      playbackBlockedReason: null,
+    });
+  });
+
+  test("ignores an old overlay rejection when the same id receives a new source", async () => {
+    const oldOverlayPlay = deferred<void>();
+    const newOverlayPlay = deferred<void>();
+    playImpl
+      .mockImplementationOnce(() => Promise.resolve())
+      .mockImplementationOnce(() => Promise.resolve())
+      .mockImplementationOnce(() => oldOverlayPlay.promise)
+      .mockImplementationOnce(() => newOverlayPlay.promise);
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const media = mediaFor(container);
+    decode(media.screen[0]);
+    decode(media.face[0]);
+    decode(media.overlay);
+
+    act(() => useRepurposeStore.getState().play());
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    runFrame(1_000);
+
+    act(() =>
+      useRepurposeStore.setState({
+        overlays: [{ ...overlay, src: "/media/overlay-replacement.mp4" }],
+      })
+    );
+    playingMedia.delete(media.overlay);
+    runFrame(1_100);
+
+    await act(async () => {
+      oldOverlayPlay.reject(new Error("old overlay source"));
+      await Promise.resolve();
+    });
+
+    expect(playImpl).toHaveBeenCalledTimes(4);
+    expect(useRepurposeStore.getState()).toMatchObject({
+      isPlaying: true,
+      mediaReadiness: "ready",
+      playbackBlockedReason: null,
     });
   });
 

@@ -229,7 +229,20 @@ export function PreviewCanvas({
   const transportConfirmedRef = useRef(false);
   const sourceIdentityRef = useRef("");
   const mountedRef = useRef(true);
-  const overlayPlayPendingRef = useRef<Set<string>>(new Set());
+  const overlayPlaybackSessionRef = useRef(0);
+  const overlayPlaybackAttemptRef = useRef(0);
+  const overlayPlayPendingRef = useRef<
+    Map<
+      string,
+      {
+        attempt: number;
+        session: number;
+        video: HTMLVideoElement;
+        src: string;
+      }
+    >
+  >(new Map());
+  const videoPoolRef = useRef<Map<string, HTMLVideoElement>>(new Map());
   const baseReadinessRef = useRef({
     sourceIdentity: "",
     failed: false,
@@ -426,6 +439,11 @@ export function PreviewCanvas({
     expectedPlayheadRef.current = null;
   }, []);
 
+  const invalidateOverlayPlayback = useCallback(() => {
+    overlayPlaybackSessionRef.current += 1;
+    overlayPlayPendingRef.current.clear();
+  }, []);
+
   const playRequiredBaseMedia = useCallback(
     (
       screenVideo: HTMLVideoElement | null,
@@ -483,10 +501,10 @@ export function PreviewCanvas({
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      overlayPlayPendingRef.current.clear();
+      invalidateOverlayPlayback();
       invalidatePlaybackAttempt();
     };
-  }, [invalidatePlaybackAttempt]);
+  }, [invalidateOverlayPlayback, invalidatePlaybackAttempt]);
 
   useEffect(() => {
     sourceIdentityRef.current = baseSourceIdentity;
@@ -499,6 +517,7 @@ export function PreviewCanvas({
     slotOrderRef.current = [...SLOT_INDICES];
     faceSeekersRef.current?.forEach((seeker) => seeker.reset());
     screenSeekersRef.current?.forEach((seeker) => seeker.reset());
+    invalidateOverlayPlayback();
     invalidatePlaybackAttempt();
     if (footageMeta?.screenPath && faceProxy.src) {
       setMediaReadiness("loading");
@@ -508,6 +527,7 @@ export function PreviewCanvas({
     baseSourceIdentity,
     faceProxy.src,
     footageMeta?.screenPath,
+    invalidateOverlayPlayback,
     invalidatePlaybackAttempt,
     setMediaReadiness,
   ]);
@@ -535,8 +555,23 @@ export function PreviewCanvas({
 
   const playActiveOverlay = useCallback(
     (overlay: Overlay, video: HTMLVideoElement) => {
-      if (!video.paused || overlayPlayPendingRef.current.has(overlay.id)) return;
-      overlayPlayPendingRef.current.add(overlay.id);
+      const session = overlayPlaybackSessionRef.current;
+      const pending = overlayPlayPendingRef.current.get(overlay.id);
+      if (
+        !video.paused ||
+        (pending &&
+          pending.session === session &&
+          pending.video === video &&
+          pending.src === overlay.src)
+      )
+        return;
+      const attempt = {
+        attempt: ++overlayPlaybackAttemptRef.current,
+        session,
+        video,
+        src: overlay.src,
+      };
+      overlayPlayPendingRef.current.set(overlay.id, attempt);
       let playPromise: Promise<void>;
       try {
         playPromise = Promise.resolve(video.play());
@@ -544,10 +579,29 @@ export function PreviewCanvas({
         playPromise = Promise.reject(error);
       }
       void playPromise.then(
-        () => overlayPlayPendingRef.current.delete(overlay.id),
         () => {
+          if (overlayPlayPendingRef.current.get(overlay.id) === attempt) {
+            overlayPlayPendingRef.current.delete(overlay.id);
+          }
+        },
+        () => {
+          const state = useRepurposeStore.getState();
+          const currentOverlay = state.overlays.find(
+            (candidate) =>
+              candidate.id === overlay.id &&
+              candidate.kind === "video" &&
+              candidate.src === attempt.src
+          );
+          const isCurrent =
+            mountedRef.current &&
+            overlayPlaybackSessionRef.current === attempt.session &&
+            overlayPlayPendingRef.current.get(overlay.id) === attempt &&
+            videoPoolRef.current.get(overlay.id) === attempt.video &&
+            state.isPlaying &&
+            !!currentOverlay;
+          if (!isCurrent) return;
           overlayPlayPendingRef.current.delete(overlay.id);
-          if (useRepurposeStore.getState().isPlaying) {
+          if (state.isPlaying) {
             reportActiveOverlayError(overlay.id);
           }
         }
@@ -555,6 +609,19 @@ export function PreviewCanvas({
     },
     [reportActiveOverlayError]
   );
+
+  useEffect(() => {
+    const currentSources = new Map(
+      overlays
+        .filter((overlay) => overlay.kind === "video")
+        .map((overlay) => [overlay.id, overlay.src])
+    );
+    for (const [id, pending] of overlayPlayPendingRef.current) {
+      if (currentSources.get(id) !== pending.src) {
+        overlayPlayPendingRef.current.delete(id);
+      }
+    }
+  }, [overlays]);
 
   // --- Overlay media pools ----------------------------------------------------
   // Image overlays decode ONCE into an HTMLImageElement (kept in imgPoolRef,
@@ -565,7 +632,6 @@ export function PreviewCanvas({
   // like the two base videos. A video overlay is ALWAYS muted (an overlay never
   // emits audio); the pooled <video> below sets `muted`.
   const imgPoolRef = useRef<Map<string, HTMLImageElement>>(new Map());
-  const videoPoolRef = useRef<Map<string, HTMLVideoElement>>(new Map());
 
   // --- Register the caption faces for canvas text (once on mount) -------------
   // Captions are drawn via ctx.fillText, so the browser must have loaded + added
@@ -790,7 +856,7 @@ export function PreviewCanvas({
       attempt = playRequiredBaseMedia(screenVideo, faceVideo);
     } else {
       invalidatePlaybackAttempt();
-      overlayPlayPendingRef.current.clear();
+      invalidateOverlayPlayback();
       // Pause BOTH slots -- the standby pair is normally already paused (it
       // only ever sits pre-seeked), but a swap that raced the pause could have
       // left the freed pair rolling; belt-and-braces stop everything.
@@ -808,6 +874,7 @@ export function PreviewCanvas({
     activeScreen,
     activeFace,
     baseSourceIdentity,
+    invalidateOverlayPlayback,
     invalidatePlaybackAttempt,
     playRequiredBaseMedia,
   ]);
@@ -907,15 +974,23 @@ export function PreviewCanvas({
         }
 
         let previousOutput = expectedPlayheadRef.current ?? live.playhead;
-        if (
+        const isExternalSeek =
           expectedPlayheadRef.current !== null &&
           Math.abs(live.playhead - expectedPlayheadRef.current) >
-            EXTERNAL_SEEK_TOLERANCE_SEC
-        ) {
+            EXTERNAL_SEEK_TOLERANCE_SEC;
+        if (isExternalSeek) {
           anchor = reanchorTransport(anchor, live.playhead, timestamp, rate);
           transportAnchorRef.current = anchor;
           transportGenerationRef.current = anchor.generation;
           previousOutput = live.playhead;
+          const externalSeekSource = timelineToSourceTime(
+            live.clips,
+            live.playhead
+          );
+          if (externalSeekSource !== null) {
+            screenVideo && (screenVideo.currentTime = externalSeekSource);
+            faceVideo && (faceVideo.currentTime = externalSeekSource);
+          }
         }
 
         let next = sampleTransport(anchor, timestamp, regionStart, regionEnd);
