@@ -1,6 +1,6 @@
 // @vitest-environment node
 
-import { mkdtemp, mkdir, readdir, readFile, stat } from "node:fs/promises";
+import { link as realLink, lstat, mkdtemp, mkdir, readdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 type FootageRoute = typeof import("@/app/api/repurpose/footage/route");
 type MediaPaths = typeof import("@/lib/repurpose/media-paths.server");
+type MediaUploader = typeof import("@/lib/repurpose/media-upload.server");
 
 const tempRoots: string[] = [];
 
@@ -17,7 +18,12 @@ afterEach(async () => {
   await Promise.all(tempRoots.splice(0).map((root) => import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }))));
 });
 
-async function loadRoute(): Promise<{ route: FootageRoute; paths: MediaPaths; originals: string }> {
+async function loadRoute(): Promise<{
+  route: FootageRoute;
+  paths: MediaPaths;
+  uploader: MediaUploader;
+  originals: string;
+}> {
   const root = await mkdtemp(path.join(os.tmpdir(), "repurpose-footage-route-"));
   tempRoots.push(root);
   const home = path.join(root, "home");
@@ -32,7 +38,8 @@ async function loadRoute(): Promise<{ route: FootageRoute; paths: MediaPaths; or
   }));
   const route = (await import("@/app/api/repurpose/footage/route")) as FootageRoute;
   const paths = (await import("@/lib/repurpose/media-paths.server")) as MediaPaths;
-  return { route, paths, originals: path.join(home, "Downloads", "repurpose-footage", "originals") };
+  const uploader = (await import("@/lib/repurpose/media-upload.server")) as MediaUploader;
+  return { route, paths, uploader, originals: path.join(home, "Downloads", "repurpose-footage", "originals") };
 }
 
 function chunkedBody(bytes: Uint8Array, chunkSize = 64 * 1024): ReadableStream<Uint8Array> {
@@ -61,6 +68,16 @@ function requestFor(
   } as RequestInit);
   Object.defineProperty(request, "formData", { value: vi.fn(() => { throw new Error("formData must not be called"); }) });
   return request;
+}
+
+function errorWithCode(code: string): NodeJS.ErrnoException {
+  const error = new Error(code) as NodeJS.ErrnoException;
+  error.code = code;
+  return error;
+}
+
+async function listPartialFiles(originals: string): Promise<string[]> {
+  return (await readdir(originals)).filter((name) => name.endsWith(".partial"));
 }
 
 describe("POST /api/repurpose/footage", () => {
@@ -133,6 +150,161 @@ describe("POST /api/repurpose/footage", () => {
     expect(response.status).toBe(500);
     expect(cancelled).toBe(true);
     await expect(readdir(originals)).resolves.toEqual([]);
+  });
+
+  it("rolls back an original when the request aborts while publication is blocked", async () => {
+    const { uploader, originals } = await loadRoute();
+    const bytes = new Uint8Array([5, 6, 7]);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const originalPath = path.join(originals, `${hash}.mp4`);
+    const aborter = new AbortController();
+    let releaseLink: (() => void) | undefined;
+    const linkMayFinish = new Promise<void>((resolve) => { releaseLink = resolve; });
+    let enteredLink: () => void;
+    const linkStarted = new Promise<void>((resolve) => { enteredLink = resolve; });
+    const link = vi.fn(async (source: string, destination: string) => {
+      enteredLink();
+      await linkMayFinish;
+      await realLink(source, destination);
+    });
+
+    const upload = uploader.storeUploadedVideo(
+      { body: chunkedBody(bytes), name: "blocked.mp4", role: "face", signal: aborter.signal },
+      { link }
+    );
+    await linkStarted;
+    aborter.abort();
+    if (!releaseLink) throw new Error("publication barrier was not initialized");
+    releaseLink();
+
+    await expect(upload).rejects.toBeDefined();
+    expect(link).toHaveBeenCalledTimes(1);
+    await expect(lstat(originalPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(listPartialFiles(originals)).resolves.toEqual([]);
+  }, 1_000);
+
+  it.each([
+    {
+      label: "a directory",
+      create: async (destination: string) => mkdir(destination),
+      assertIntact: async (destination: string) => expect((await stat(destination)).isDirectory()).toBe(true),
+    },
+    {
+      label: "a symlink",
+      create: async (destination: string, originals: string) => symlink(originals, destination, "junction"),
+      assertIntact: async (destination: string) => expect((await lstat(destination)).isSymbolicLink()).toBe(true),
+    },
+    {
+      label: "a truncated file",
+      create: async (destination: string) => writeFile(destination, new Uint8Array([9, 8])),
+      assertIntact: async (destination: string) => expect(await readFile(destination)).toEqual(Buffer.from([9, 8])),
+    },
+    {
+      label: "a same-sized file with different bytes",
+      create: async (destination: string) => writeFile(destination, new Uint8Array([9, 9, 9])),
+      assertIntact: async (destination: string) => expect(await readFile(destination)).toEqual(Buffer.from([9, 9, 9])),
+    },
+  ])("rejects EEXIST for %s and preserves the destination", async ({ create, assertIntact }) => {
+    const { uploader, originals } = await loadRoute();
+    const bytes = new Uint8Array([5, 6, 7]);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const destination = path.join(originals, `${hash}.mp4`);
+    await mkdir(originals, { recursive: true });
+    await create(destination, originals);
+    const link = vi.fn(async () => { throw errorWithCode("EEXIST"); });
+
+    await expect(
+      uploader.storeUploadedVideo(
+        { body: chunkedBody(bytes), name: "collision.mp4", role: "face" },
+        { link }
+      )
+    ).rejects.toThrow("does not match");
+
+    expect(link).toHaveBeenCalledTimes(1);
+    await assertIntact(destination);
+    await expect(listPartialFiles(originals)).resolves.toEqual([]);
+  });
+
+  it("keeps an unrelated partial sentinel when publication is rejected", async () => {
+    const { uploader, originals } = await loadRoute();
+    const bytes = new Uint8Array([5, 6, 7]);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const destination = path.join(originals, `${hash}.mp4`);
+    const sentinel = path.join(originals, ".sentinel.partial");
+    await mkdir(destination, { recursive: true });
+    await writeFile(sentinel, "keep me");
+    const link = vi.fn(async () => { throw errorWithCode("EEXIST"); });
+
+    await expect(
+      uploader.storeUploadedVideo(
+        { body: chunkedBody(bytes), name: "collision.mp4", role: "face" },
+        { link }
+      )
+    ).rejects.toThrow("does not match");
+
+    await expect(readFile(sentinel, "utf8")).resolves.toBe("keep me");
+    await expect(readdir(originals)).resolves.toEqual([".sentinel.partial", `${hash}.mp4`]);
+  });
+
+  it("returns success when a transient partial cleanup fails after publication", async () => {
+    const { uploader, originals } = await loadRoute();
+    const bytes = new Uint8Array([4, 3, 2, 1]);
+    let partialCleanupAttempts = 0;
+    const rm = vi.fn(async (target: string) => {
+      if (target.endsWith(".partial") && partialCleanupAttempts++ === 0) {
+        throw errorWithCode("EBUSY");
+      }
+      await import("node:fs/promises").then(({ rm: realRm }) => realRm(target, { force: true }));
+    });
+
+    const uploaded = await uploader.storeUploadedVideo(
+      { body: chunkedBody(bytes), name: "transient.mp4", role: "face" },
+      { rm }
+    );
+
+    await expect(readFile(uploaded.originalPath)).resolves.toEqual(Buffer.from(bytes));
+    expect(partialCleanupAttempts).toBe(2);
+    await expect(listPartialFiles(originals)).resolves.toEqual([]);
+  });
+
+  it("returns success and leaves only its own retryable partial when cleanup keeps failing", async () => {
+    const { uploader, originals } = await loadRoute();
+    const bytes = new Uint8Array([4, 3, 2, 1]);
+    const sentinel = path.join(originals, ".sentinel.partial");
+    await mkdir(originals, { recursive: true });
+    await writeFile(sentinel, "keep me");
+    const rm = vi.fn(async (target: string) => {
+      if (target.endsWith(".partial")) throw errorWithCode("EBUSY");
+      await import("node:fs/promises").then(({ rm: realRm }) => realRm(target, { force: true }));
+    });
+
+    const uploaded = await uploader.storeUploadedVideo(
+      { body: chunkedBody(bytes), name: "persistent.mp4", role: "face" },
+      { rm }
+    );
+
+    await expect(readFile(uploaded.originalPath)).resolves.toEqual(Buffer.from(bytes));
+    await expect(readFile(sentinel, "utf8")).resolves.toBe("keep me");
+    expect(await listPartialFiles(originals)).toHaveLength(2);
+  });
+
+  it("coordinates concurrent identical uploads around one immutable original", async () => {
+    const { uploader, originals } = await loadRoute();
+    const bytes = new Uint8Array([7, 7, 7, 7]);
+    const link = vi.fn(async (source: string, destination: string) => realLink(source, destination));
+
+    const uploads = await Promise.all(
+      Array.from({ length: 4 }, (_, index) => uploader.storeUploadedVideo(
+        { body: chunkedBody(bytes), name: `same-${index}.mp4`, role: "library" },
+        { link }
+      ))
+    );
+
+    const expectedPath = uploads[0].originalPath;
+    expect(uploads.map((upload) => upload.originalPath)).toEqual([expectedPath, expectedPath, expectedPath, expectedPath]);
+    await expect(readFile(expectedPath)).resolves.toEqual(Buffer.from(bytes));
+    expect(link).toHaveBeenCalledTimes(4);
+    await expect(listPartialFiles(originals)).resolves.toEqual([]);
   });
 
   it("reuses one original for byte-identical uploads without overwriting it", async () => {
