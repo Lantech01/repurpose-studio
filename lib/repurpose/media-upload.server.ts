@@ -1,5 +1,5 @@
-import { createReadStream, createWriteStream, type Stats } from "node:fs";
-import { link, lstat, mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { createReadStream, createWriteStream, linkSync, type Stats } from "node:fs";
+import { lstat, mkdir, rm } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { Readable, Transform } from "node:stream";
@@ -9,54 +9,22 @@ import { REPURPOSE_FOOTAGE_DIR } from "@/lib/repurpose/media-paths.server";
 import type { UploadedVideo, VideoRole } from "@/lib/repurpose/media-types";
 
 const ORIGINALS_DIR = path.join(REPURPOSE_FOOTAGE_DIR, "originals");
-const PUBLISH_LOCK_SUFFIX = ".publish-lock";
-const PUBLISH_LOCK_OWNER_FILE = "owner.json";
-const PUBLISH_RECOVERY_OWNER_FILE = "recovery-owner.json";
-const LOCK_RETRY_MS = 10;
-const LOCK_STALE_MS = 60 * 60 * 1000;
-const RETRY_ATTEMPTS = 3;
 
 export type MediaUploadDependencies = Partial<{
-  link: (existingPath: string, newPath: string) => Promise<void>;
+  linkSync: (existingPath: string, newPath: string) => void;
   lstat: (targetPath: string) => Promise<Stats>;
   mkdir: (targetPath: string, options?: { recursive?: boolean }) => Promise<string | undefined>;
-  readFile: (targetPath: string, encoding: BufferEncoding) => Promise<string>;
-  writeFile: (targetPath: string, data: string, options: { flag: "w" | "wx" }) => Promise<void>;
-  rename: (oldPath: string, newPath: string) => Promise<void>;
   rm: (targetPath: string, options: { force: boolean; recursive?: boolean }) => Promise<void>;
-  unlink: (targetPath: string) => Promise<void>;
 }>;
 
 type UploadFileOperations = Required<MediaUploadDependencies>;
 
-type PublicationLock = {
-  lockPath: string;
-  ownerPath: string;
-  token: string;
-};
-
-type PublicationOwner = {
-  token: string;
-  pid: number;
-  phase: "publishing" | "rollback-failed" | "committed";
-};
-
-type RecoveryOwner = {
-  token: string;
-  pid: number;
-  publicationToken: string;
-};
-
 function resolveFileOperations(overrides?: MediaUploadDependencies): UploadFileOperations {
   return {
-    link: overrides?.link ?? link,
+    linkSync: overrides?.linkSync ?? linkSync,
     lstat: overrides?.lstat ?? lstat,
     mkdir: overrides?.mkdir ?? mkdir,
-    readFile: overrides?.readFile ?? readFile,
-    writeFile: overrides?.writeFile ?? writeFile,
-    rename: overrides?.rename ?? rename,
     rm: overrides?.rm ?? rm,
-    unlink: overrides?.unlink ?? unlink,
   };
 }
 
@@ -66,272 +34,6 @@ function isErrno(error: unknown, code: string): boolean {
 
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw signal.reason ?? new Error("Footage upload aborted");
-}
-
-function wait(milliseconds: number, signal?: AbortSignal): Promise<void> {
-  throwIfAborted(signal);
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(done, milliseconds);
-    function done(): void {
-      signal?.removeEventListener("abort", abort);
-      resolve();
-    }
-    function abort(): void {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", abort);
-      reject(signal?.reason ?? new Error("Footage upload aborted"));
-    }
-    signal?.addEventListener("abort", abort, { once: true });
-  });
-}
-
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error: unknown) {
-    return isErrno(error, "EPERM");
-  }
-}
-
-async function readPublicationOwner(
-  ownerPath: string,
-  operations: UploadFileOperations
-): Promise<PublicationOwner | null> {
-  try {
-    const candidate: unknown = JSON.parse(await operations.readFile(ownerPath, "utf8"));
-    const phase = (candidate as { phase?: unknown } | null)?.phase;
-    if (
-      typeof candidate === "object" &&
-      candidate !== null &&
-      typeof (candidate as { token?: unknown }).token === "string" &&
-      typeof (candidate as { pid?: unknown }).pid === "number" &&
-      (phase === "publishing" || phase === "rollback-failed" || phase === "committed")
-    ) {
-      return candidate as PublicationOwner;
-    }
-  } catch {
-    // A partially-written/corrupt owner file is reclaimable only after the lock ages out.
-  }
-  return null;
-}
-
-async function readRecoveryOwner(
-  recoveryPath: string,
-  operations: UploadFileOperations
-): Promise<RecoveryOwner | null> {
-  try {
-    const candidate: unknown = JSON.parse(await operations.readFile(recoveryPath, "utf8"));
-    if (
-      typeof candidate === "object" &&
-      candidate !== null &&
-      typeof (candidate as { token?: unknown }).token === "string" &&
-      typeof (candidate as { pid?: unknown }).pid === "number" &&
-      typeof (candidate as { publicationToken?: unknown }).publicationToken === "string"
-    ) {
-      return candidate as RecoveryOwner;
-    }
-  } catch {
-    // A corrupt recovery claim is handled conservatively until it becomes stale.
-  }
-  return null;
-}
-
-async function writePublicationOwner(
-  lock: PublicationLock,
-  phase: PublicationOwner["phase"],
-  flag: "w" | "wx",
-  operations: UploadFileOperations
-): Promise<void> {
-  await operations.writeFile(
-    lock.ownerPath,
-    JSON.stringify({ token: lock.token, pid: process.pid, phase }),
-    { flag }
-  );
-}
-
-async function retireLock(
-  lockPath: string,
-  label: "released" | "recovered" | "stale",
-  operations: UploadFileOperations
-): Promise<boolean> {
-  const retiredPath = `${lockPath}.${label}-${randomUUID()}`;
-  try {
-    await operations.rename(lockPath, retiredPath);
-  } catch (error: unknown) {
-    if (isErrno(error, "ENOENT")) return true;
-    return false;
-  }
-  await operations.rm(retiredPath, { recursive: true, force: true }).catch(() => {});
-  return true;
-}
-
-async function removeRecoveryClaim(
-  recoveryPath: string,
-  claim: RecoveryOwner,
-  operations: UploadFileOperations
-): Promise<void> {
-  try {
-    await operations.rm(recoveryPath, { force: true });
-  } catch {
-    // Make an otherwise-stuck claim immediately reclaimable if cleanup fails.
-    await operations.writeFile(recoveryPath, JSON.stringify({ ...claim, pid: -1 }), { flag: "w" }).catch(() => {});
-  }
-}
-
-async function claimRecovery(
-  lockPath: string,
-  owner: PublicationOwner,
-  operations: UploadFileOperations
-): Promise<{ claim: RecoveryOwner; recoveryPath: string } | null> {
-  const recoveryPath = path.join(lockPath, PUBLISH_RECOVERY_OWNER_FILE);
-  const claim: RecoveryOwner = {
-    token: randomUUID(),
-    pid: process.pid,
-    publicationToken: owner.token,
-  };
-  try {
-    await operations.writeFile(recoveryPath, JSON.stringify(claim), { flag: "wx" });
-    return { claim, recoveryPath };
-  } catch (error: unknown) {
-    if (!isErrno(error, "EEXIST")) throw error;
-  }
-
-  const existing = await readRecoveryOwner(recoveryPath, operations);
-  if (existing && isProcessAlive(existing.pid)) return null;
-  if (!existing) {
-    try {
-      const info = await operations.lstat(recoveryPath);
-      if (Date.now() - info.mtimeMs < LOCK_STALE_MS) return null;
-    } catch (error: unknown) {
-      if (isErrno(error, "ENOENT")) return null;
-      throw error;
-    }
-  }
-
-  const retiredPath = `${recoveryPath}.stale-${randomUUID()}`;
-  try {
-    await operations.rename(recoveryPath, retiredPath);
-  } catch (error: unknown) {
-    if (isErrno(error, "ENOENT")) return null;
-    throw error;
-  }
-  await operations.rm(retiredPath, { force: true }).catch(() => {});
-  return null;
-}
-
-async function rollbackCreatedOriginal(
-  originalPath: string,
-  operations: UploadFileOperations
-): Promise<boolean> {
-  for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
-    try {
-      await operations.unlink(originalPath);
-      return true;
-    } catch (error: unknown) {
-      if (isErrno(error, "ENOENT")) return true;
-      if (attempt + 1 < RETRY_ATTEMPTS) await wait(LOCK_RETRY_MS);
-    }
-  }
-  return false;
-}
-
-async function recoverPublicationLock(
-  originalPath: string,
-  operations: UploadFileOperations
-): Promise<boolean> {
-  const lockPath = `${originalPath}${PUBLISH_LOCK_SUFFIX}`;
-  let info: Stats;
-  try {
-    info = await operations.lstat(lockPath);
-  } catch (error: unknown) {
-    if (isErrno(error, "ENOENT")) return true;
-    throw error;
-  }
-  const owner = await readPublicationOwner(path.join(lockPath, PUBLISH_LOCK_OWNER_FILE), operations);
-  if (!owner) {
-    if (Date.now() - info.mtimeMs < LOCK_STALE_MS) return false;
-    const recovery = await readRecoveryOwner(
-      path.join(lockPath, PUBLISH_RECOVERY_OWNER_FILE),
-      operations
-    );
-    if (recovery && isProcessAlive(recovery.pid)) return false;
-    return retireLock(lockPath, "stale", operations);
-  }
-
-  if (owner.phase === "publishing" && isProcessAlive(owner.pid)) return false;
-
-  const recovery = await claimRecovery(lockPath, owner, operations);
-  if (!recovery) return false;
-  let retired = false;
-  try {
-    const currentOwner = await readPublicationOwner(
-      path.join(lockPath, PUBLISH_LOCK_OWNER_FILE),
-      operations
-    );
-    if (
-      !currentOwner ||
-      currentOwner.token !== owner.token ||
-      currentOwner.pid !== owner.pid ||
-      currentOwner.phase !== owner.phase
-    ) {
-      return false;
-    }
-
-    if (owner.phase === "rollback-failed") {
-      const rolledBack = await rollbackCreatedOriginal(originalPath, operations);
-      if (!rolledBack) return false;
-    }
-
-    retired = await retireLock(lockPath, "recovered", operations);
-    return retired;
-  } finally {
-    if (!retired) {
-      await removeRecoveryClaim(recovery.recoveryPath, recovery.claim, operations);
-    }
-  }
-}
-
-async function acquirePublicationLock(
-  originalPath: string,
-  signal: AbortSignal | undefined,
-  operations: UploadFileOperations
-): Promise<PublicationLock> {
-  const lockPath = `${originalPath}${PUBLISH_LOCK_SUFFIX}`;
-  const lock: PublicationLock = {
-    lockPath,
-    ownerPath: path.join(lockPath, PUBLISH_LOCK_OWNER_FILE),
-    token: randomUUID(),
-  };
-
-  while (true) {
-    throwIfAborted(signal);
-    try {
-      await operations.mkdir(lockPath);
-      try {
-        await writePublicationOwner(lock, "publishing", "wx", operations);
-        return lock;
-      } catch (error) {
-        await operations.rm(lockPath, { recursive: true, force: true }).catch(() => {});
-        throw error;
-      }
-    } catch (error: unknown) {
-      if (!isErrno(error, "EEXIST")) throw error;
-      const recovered = await recoverPublicationLock(originalPath, operations);
-      if (!recovered) await wait(LOCK_RETRY_MS, signal);
-    }
-  }
-}
-
-async function releasePublicationLock(lock: PublicationLock, operations: UploadFileOperations): Promise<void> {
-  const owner = await readPublicationOwner(lock.ownerPath, operations);
-  if (!owner || owner.token !== lock.token) return;
-
-  for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
-    if (await retireLock(lock.lockPath, "released", operations)) return;
-    if (attempt + 1 < RETRY_ATTEMPTS) await wait(LOCK_RETRY_MS);
-  }
 }
 
 async function hashFile(filePath: string): Promise<string> {
@@ -353,15 +55,14 @@ async function verifyExistingOriginal(
 }
 
 async function cleanupPartial(partialPath: string, operations: UploadFileOperations): Promise<void> {
-  // Cleanup is deliberately best-effort after commit: a valid immutable original
-  // remains a success even if Windows temporarily holds the partial open.
+  // Cleanup remains best-effort after commit: a valid immutable original is success
+  // even if Windows temporarily keeps the caller's UUID partial open.
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       await operations.rm(partialPath, { force: true });
       return;
     } catch {
-      // A second attempt handles transient sharing violations; persistent failures
-      // leave only this UUID partial for later recovery.
+      // A persistent failure leaves only this upload's unique partial for recovery.
     }
   }
 }
@@ -402,47 +103,21 @@ export async function storeUploadedVideo({
 
     const contentHash = hash.digest("hex");
     const originalPath = path.join(ORIGINALS_DIR, `${contentHash}${extension}`);
-    const lock = await acquirePublicationLock(originalPath, signal, operations);
-    let retainLock = false;
-    try {
-      let createdDestination = false;
-      try {
-        // Pre-commit: an aborted upload must never start publication.
-        throwIfAborted(signal);
-        try {
-          // Commit: hard-link publication is atomic and never overwrites.
-          await operations.link(partialPath, originalPath);
-          createdDestination = true;
-        } catch (error: unknown) {
-          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-          await verifyExistingOriginal(originalPath, size, contentHash, operations);
-        }
 
-        // An abort racing with link() rolls back only the destination this caller made.
-        throwIfAborted(signal);
-        // Cleanup: failure is non-fatal after a successful immutable commit.
-        await cleanupPartial(partialPath, operations);
-        // Cleanup can yield, so check once more before reporting success.
-        throwIfAborted(signal);
-        // This terminal phase lets another worker preserve the committed original
-        // and recover the lock if release repeatedly fails.
-        await writePublicationOwner(lock, "committed", "w", operations);
-        return { originalPath, contentHash, size, name };
-      } catch (error) {
-        if (createdDestination) {
-          const rolledBack = await rollbackCreatedOriginal(originalPath, operations);
-          if (!rolledBack) {
-            retainLock = true;
-            // Retaining this owner lock prevents any follower from accepting the
-            // still-published file as a valid deduplication result.
-            await writePublicationOwner(lock, "rollback-failed", "w", operations).catch(() => {});
-          }
-        }
-        throw error;
-      }
-    } finally {
-      if (!retainLock) await releasePublicationLock(lock, operations);
+    // The signal is observed immediately before the synchronous, atomic hard-link.
+    // That call is the commit point: after it starts, the upload is committed and
+    // cancellation never deletes an immutable original. EEXIST is an earlier commit
+    // by another worker and succeeds only after validating the existing bytes.
+    throwIfAborted(signal);
+    try {
+      operations.linkSync(partialPath, originalPath);
+    } catch (error: unknown) {
+      if (!isErrno(error, "EEXIST")) throw error;
+      await verifyExistingOriginal(originalPath, size, contentHash, operations);
     }
+
+    await cleanupPartial(partialPath, operations);
+    return { originalPath, contentHash, size, name };
   } catch (error) {
     await cleanupPartial(partialPath, operations);
     throw error;
