@@ -17,7 +17,7 @@
 
 import { stat } from "node:fs/promises";
 
-import { resolveAllowed } from "@/app/api/repurpose/video/route";
+import { resolveAllowedVideoPath } from "@/lib/repurpose/media-paths.server";
 import { getProxyState, startProxyBuild, type ProxyState } from "@/lib/repurpose/proxy-cache";
 
 export const runtime = "nodejs";
@@ -45,7 +45,7 @@ async function resolveSource(
   rawPath: string | null
 ): Promise<{ resolvedPath: string; mtimeMs: number; size: number } | null> {
   if (!rawPath) return null;
-  const resolvedPath = await resolveAllowed(rawPath);
+  const resolvedPath = await resolveAllowedVideoPath(rawPath);
   if (!resolvedPath) return null;
   try {
     const info = await stat(resolvedPath);
