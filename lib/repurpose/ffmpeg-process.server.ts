@@ -2,6 +2,12 @@ import { spawn } from "node:child_process";
 
 import type { MediaInspection } from "@/lib/repurpose/media-types";
 
+export const MAX_PROCESS_DIAGNOSTIC_CHARS = 64 * 1024;
+
+export function boundProcessDiagnostic(current: string, chunk: string): string {
+  return `${current}${chunk}`.slice(-MAX_PROCESS_DIAGNOSTIC_CHARS);
+}
+
 export type CompatibilityEncoder =
   | "h264_nvenc"
   | "h264_qsv"
@@ -84,10 +90,10 @@ function nodeProcessAdapter(): ProcessAdapter {
         child.stdout?.setEncoding("utf8");
         child.stderr?.setEncoding("utf8");
         child.stdout?.on("data", (chunk: string) => {
-          stdout += chunk;
+          stdout = boundProcessDiagnostic(stdout, chunk);
           options.onStdout?.(chunk);
         });
-        child.stderr?.on("data", (chunk: string) => { stderr += chunk; });
+        child.stderr?.on("data", (chunk: string) => { stderr = boundProcessDiagnostic(stderr, chunk); });
         child.once("error", reject);
         child.once("close", (code) => resolve({ code: code ?? -1, stdout, stderr }));
       });
@@ -134,6 +140,7 @@ export function buildCompatibilityArguments(input: {
 }): string[] {
   const args = [
     "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+    "-noautorotate",
     "-i", input.inputPath,
     "-map", "0:v:0", "-map", "0:a:0?",
     "-c:v", input.encoder,
@@ -142,9 +149,6 @@ export function buildCompatibilityArguments(input: {
     "-c:a", "aac", "-b:a", "192k",
     "-movflags", "+faststart",
   ];
-  if (Number.isFinite(input.inspection.video.fps) && input.inspection.video.fps > 0) {
-    args.push("-r", String(input.inspection.video.fps));
-  }
   args.push("-progress", "pipe:1", "-nostats", input.outputPath);
   return args;
 }

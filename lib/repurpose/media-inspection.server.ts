@@ -66,6 +66,8 @@ interface ProbeStream {
   channels?: unknown;
   sample_rate?: unknown;
   disposition?: unknown;
+  side_data_list?: unknown;
+  tags?: unknown;
 }
 
 interface ProbeDocument {
@@ -215,6 +217,30 @@ function hasDisposition(stream: ProbeStream, name: "attached_pic" | "default"): 
   return value === true || value === 1 || value === "1";
 }
 
+function normalizedRotation(value: unknown): number {
+  const numeric = finiteNumber(value);
+  if (!Number.isFinite(numeric)) return 0;
+  const normalized = ((numeric % 360) + 360) % 360;
+  const signed = normalized > 180 ? normalized - 360 : normalized;
+  return Math.abs(signed) < 0.000_001 ? 0 : signed;
+}
+
+function streamRotation(stream: ProbeStream): number {
+  if (Array.isArray(stream.side_data_list)) {
+    for (const entry of stream.side_data_list) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const record = entry as Record<string, unknown>;
+      if (record.side_data_type === "Display Matrix" && Number.isFinite(finiteNumber(record.rotation))) {
+        return normalizedRotation(record.rotation);
+      }
+    }
+  }
+  if (stream.tags && typeof stream.tags === "object" && !Array.isArray(stream.tags)) {
+    return normalizedRotation((stream.tags as Record<string, unknown>).rotate);
+  }
+  return 0;
+}
+
 export async function inspectMedia(
   mediaPath: string,
   options: InspectMediaOptions = {},
@@ -313,6 +339,7 @@ export async function inspectMedia(
       width,
       height,
       fps: parseRationalFrameRate(video.avg_frame_rate) || parseRationalFrameRate(video.r_frame_rate),
+      rotationDeg: streamRotation(video),
     },
     audio: audio
       ? {

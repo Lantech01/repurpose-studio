@@ -21,6 +21,7 @@ export interface MediaInspection {
     width: number;
     height: number;
     fps: number;
+    rotationDeg?: number;
   };
   audio: null | {
     codec: string;
