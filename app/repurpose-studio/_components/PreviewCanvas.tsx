@@ -106,6 +106,8 @@ const ZOOM_MIN = 1;
 const ZOOM_MAX = 6;
 const BASE_MEDIA_LOAD_ERROR =
   "Chrome could not load this video. Re-import it to create a compatible copy.";
+const BASE_MEDIA_PLAY_ERROR =
+  "Chrome could not start this video. Re-import it to create a compatible copy.";
 const BASE_MEDIA_FUTURE_DATA = 3;
 
 interface OverlayFailure {
@@ -208,6 +210,15 @@ export function PreviewCanvas({
     () => faceElsRef.current[slotOrderRef.current[0]],
     []
   );
+  const normalizeBaseMute = useCallback(() => {
+    const activeSlot = slotOrderRef.current[0];
+    for (const video of screenElsRef.current) {
+      if (video) video.muted = true;
+    }
+    for (const [slot, video] of faceElsRef.current.entries()) {
+      if (video) video.muted = slot !== activeSlot;
+    }
+  }, []);
   // Serialized pre-seek managers, one per STANDBY ring position (k = 0 parks
   // at the next cut, k = 1 at the cut after, ...). getEl() is resolved fresh
   // on every call because WHICH element sits at each position rotates at every
@@ -260,6 +271,7 @@ export function PreviewCanvas({
   const baseReadinessRef = useRef({
     sourceIdentity: "",
     failed: false,
+    errorReason: null as string | null,
     screenReady: false,
     faceReady: false,
   });
@@ -343,6 +355,57 @@ export function PreviewCanvas({
   const faceSourceIdentity = faceProxy.src ?? "";
   const baseSourceIdentity = `${screenSourceIdentity}\u0000${faceSourceIdentity}`;
 
+  const reconcileMediaReadiness = useCallback(() => {
+    const state = useRepurposeStore.getState();
+    let activeOverlayFailure: [string, OverlayFailure] | null = null;
+    for (const [key, failure] of overlayFailuresRef.current) {
+      const overlay = state.overlays.find(
+        (candidate) =>
+          candidate.id === failure.id &&
+          candidate.kind === "video" &&
+          candidate.src === failure.src
+      );
+      if (!overlay) {
+        overlayFailuresRef.current.delete(key);
+        continue;
+      }
+      const isActive =
+        state.playhead >= overlay.timelineStart &&
+        state.playhead < overlay.timelineEnd;
+      if (isActive) {
+        failure.wasActive = true;
+        activeOverlayFailure ??= [key, failure];
+      } else if (failure.wasActive) {
+        overlayFailuresRef.current.delete(key);
+      }
+    }
+
+    const cycle = baseReadinessRef.current;
+    if (
+      cycle.sourceIdentity === sourceIdentityRef.current &&
+      cycle.failed
+    ) {
+      setMediaReadiness("error", cycle.errorReason ?? BASE_MEDIA_LOAD_ERROR);
+      return;
+    }
+    if (activeOverlayFailure) {
+      const [key, failure] = activeOverlayFailure;
+      blockedOverlayFailureRef.current = key;
+      pause();
+      setMediaReadiness("error", failure.reason);
+      return;
+    }
+
+    blockedOverlayFailureRef.current = null;
+    if (!screenSourceIdentity || !faceSourceIdentity) {
+      setMediaReadiness("idle");
+      return;
+    }
+    setMediaReadiness(
+      cycle.screenReady && cycle.faceReady ? "ready" : "loading"
+    );
+  }, [faceSourceIdentity, pause, screenSourceIdentity, setMediaReadiness]);
+
   const reportBaseCanPlay = useCallback(
     (
       role: "screen" | "face",
@@ -362,14 +425,9 @@ export function PreviewCanvas({
 
       if (role === "screen") cycle.screenReady = true;
       else cycle.faceReady = true;
-      if (
-        cycle.screenReady &&
-        cycle.faceReady &&
-        useRepurposeStore.getState().mediaReadiness === "loading"
-      )
-        setMediaReadiness("ready");
+      reconcileMediaReadiness();
     },
-    [setMediaReadiness]
+    [reconcileMediaReadiness]
   );
 
   const reportRequiredBaseError = useCallback(
@@ -390,10 +448,11 @@ export function PreviewCanvas({
       )
         return;
       cycle.failed = true;
+      cycle.errorReason = BASE_MEDIA_LOAD_ERROR;
       pause();
-      setMediaReadiness("error", BASE_MEDIA_LOAD_ERROR);
+      reconcileMediaReadiness();
     },
-    [pause, setMediaReadiness]
+    [pause, reconcileMediaReadiness]
   );
 
   // Keep latest store values in refs so the rAF loop (mounted once) always
@@ -483,14 +542,14 @@ export function PreviewCanvas({
           useRepurposeStore.getState().isPlaying;
         if (!stillCurrent) return;
         const cycle = baseReadinessRef.current;
-        if (cycle.sourceIdentity === sourceIdentity) cycle.failed = true;
+        if (cycle.sourceIdentity === sourceIdentity) {
+          cycle.failed = true;
+          cycle.errorReason = BASE_MEDIA_PLAY_ERROR;
+        }
         screenVideo.pause();
         faceVideo.pause();
         pause();
-        setMediaReadiness(
-          "error",
-          "Chrome could not start this video. Re-import it to create a compatible copy."
-        );
+        reconcileMediaReadiness();
       };
       const playPromises = [screenVideo, faceVideo].map((video) => {
         try {
@@ -530,7 +589,12 @@ export function PreviewCanvas({
       });
       return attempt;
     },
-    [frameScheduler, invalidatePlaybackAttempt, pause, setMediaReadiness]
+    [
+      frameScheduler,
+      invalidatePlaybackAttempt,
+      pause,
+      reconcileMediaReadiness,
+    ]
   );
 
   useEffect(() => {
@@ -550,6 +614,7 @@ export function PreviewCanvas({
     baseReadinessRef.current = {
       sourceIdentity: baseSourceIdentity,
       failed: false,
+      errorReason: null,
       screenReady: false,
       faceReady: false,
     };
@@ -568,68 +633,21 @@ export function PreviewCanvas({
         );
       }
     }
+    normalizeBaseMute();
     invalidateOverlayPlayback();
     invalidatePlaybackAttempt();
-    if (footageMeta?.screenPath && faceProxy.src) {
-      setMediaReadiness("loading");
-    }
+    reconcileMediaReadiness();
     return invalidatePlaybackAttempt;
   }, [
     baseSourceIdentity,
     screenSourceIdentity,
     activeScreen,
-    faceProxy.src,
-    footageMeta?.screenPath,
     invalidateOverlayPlayback,
     invalidatePlaybackAttempt,
+    normalizeBaseMute,
     reportBaseCanPlay,
-    setMediaReadiness,
+    reconcileMediaReadiness,
   ]);
-
-  const restoreBaseReadiness = useCallback(() => {
-    const cycle = baseReadinessRef.current;
-    if (cycle.sourceIdentity !== sourceIdentityRef.current || cycle.failed) return;
-    setMediaReadiness(
-      cycle.screenReady && cycle.faceReady ? "ready" : "loading"
-    );
-  }, [setMediaReadiness]);
-
-  const reconcileOverlayFailures = useCallback(() => {
-    const state = useRepurposeStore.getState();
-    let activeFailure: [string, OverlayFailure] | null = null;
-    for (const [key, failure] of overlayFailuresRef.current) {
-      const overlay = state.overlays.find(
-        (candidate) =>
-          candidate.id === failure.id &&
-          candidate.kind === "video" &&
-          candidate.src === failure.src
-      );
-      if (!overlay) {
-        overlayFailuresRef.current.delete(key);
-        continue;
-      }
-      const isActive =
-        state.playhead >= overlay.timelineStart &&
-        state.playhead < overlay.timelineEnd;
-      if (isActive) {
-        failure.wasActive = true;
-        activeFailure ??= [key, failure];
-      } else if (failure.wasActive) {
-        overlayFailuresRef.current.delete(key);
-      }
-    }
-    if (activeFailure) {
-      const [key, failure] = activeFailure;
-      blockedOverlayFailureRef.current = key;
-      pause();
-      setMediaReadiness("error", failure.reason);
-      return;
-    }
-    if (blockedOverlayFailureRef.current !== null) {
-      blockedOverlayFailureRef.current = null;
-      restoreBaseReadiness();
-    }
-  }, [pause, restoreBaseReadiness, setMediaReadiness]);
 
   const reportOverlayFailure = useCallback(
     (overlayId: string, src: string) => {
@@ -643,9 +661,9 @@ export function PreviewCanvas({
           wasActive: false,
         });
       }
-      reconcileOverlayFailures();
+      reconcileMediaReadiness();
     },
-    [reconcileOverlayFailures]
+    [reconcileMediaReadiness]
   );
 
   const playActiveOverlay = useCallback(
@@ -719,8 +737,8 @@ export function PreviewCanvas({
   }, [overlays]);
 
   useEffect(() => {
-    reconcileOverlayFailures();
-  }, [overlays, playhead, reconcileOverlayFailures]);
+    reconcileMediaReadiness();
+  }, [overlays, playhead, reconcileMediaReadiness]);
 
   // --- Overlay media pools ----------------------------------------------------
   // Image overlays decode ONCE into an HTMLImageElement (kept in imgPoolRef,
@@ -891,6 +909,7 @@ export function PreviewCanvas({
   // clips/playhead/footageMeta are all unchanged by a src swap).
   useEffect(() => {
     if (!faceProxy.src) return;
+    normalizeBaseMute();
     faceSeekersRef.current?.forEach((s) => s.reset());
     const live = liveRef.current;
     const srcTime = timelineToSourceTime(live.clips, live.playhead);
@@ -911,7 +930,7 @@ export function PreviewCanvas({
       STANDBY_DEPTH
     );
     cuts.forEach((cut, k) => faceSeekersRef.current?.[k]?.target(cut.seekSrc));
-  }, [faceProxy.src, activeFace]);
+  }, [faceProxy.src, activeFace, normalizeBaseMute]);
 
   // --- Start/stop the source <video>s in lockstep with isPlaying -------------
   // Synchronizing the real play state of two external <video> elements with the
@@ -952,6 +971,7 @@ export function PreviewCanvas({
       // their frames advancing in real time. The playback-rate effect below
       // (keyed on isPlaying too) sets .playbackRate on both, so the first
       // playing frame already runs at the chosen speed.
+      normalizeBaseMute();
       attempt = playRequiredBaseMedia(screenVideo, faceVideo);
     } else {
       invalidatePlaybackAttempt();
@@ -975,6 +995,7 @@ export function PreviewCanvas({
     baseSourceIdentity,
     invalidateOverlayPlayback,
     invalidatePlaybackAttempt,
+    normalizeBaseMute,
     playRequiredBaseMedia,
   ]);
 
@@ -1129,8 +1150,7 @@ export function PreviewCanvas({
               screenSeekersRef.current?.forEach((seeker) => seeker.reset());
               standbyFace.playbackRate = rate;
               standbyScreen.playbackRate = rate;
-              standbyFace.muted = false;
-              faceVideo!.muted = true;
+              normalizeBaseMute();
               faceVideo!.pause();
               screenVideo!.pause();
               playRequiredBaseMedia(standbyScreen, standbyFace, next);
@@ -1417,6 +1437,7 @@ export function PreviewCanvas({
     activeScreen,
     activeFace,
     frameScheduler,
+    normalizeBaseMute,
     playActiveOverlay,
     playRequiredBaseMedia,
   ]);
@@ -1842,6 +1863,7 @@ export function PreviewCanvas({
           data-slot-index={slot}
           ref={(el) => {
             screenElsRef.current[slot] = el;
+            if (el) normalizeBaseMute();
           }}
           src={footageMeta?.screenPath || undefined}
           muted
@@ -1865,9 +1887,10 @@ export function PreviewCanvas({
           data-slot-index={slot}
           ref={(el) => {
             faceElsRef.current[slot] = el;
+            if (el) normalizeBaseMute();
           }}
           src={faceProxy.src}
-          muted={slot !== 0}
+          muted
           playsInline
           preload="auto"
           className="hidden"
@@ -1890,11 +1913,15 @@ export function PreviewCanvas({
         .filter((o) => o.kind === "video")
         .map((o) => (
           <video
-            key={o.id}
+            key={`${o.id}\u0000${o.src}`}
             data-overlay-id={o.id}
+            data-overlay-src={o.src}
             ref={(el) => {
               if (el) videoPoolRef.current.set(o.id, el);
-              else videoPoolRef.current.delete(o.id);
+              else if (
+                videoPoolRef.current.get(o.id)?.dataset.overlaySrc === o.src
+              )
+                videoPoolRef.current.delete(o.id);
             }}
             src={o.src}
             muted
@@ -1907,7 +1934,7 @@ export function PreviewCanvas({
               if (el.videoWidth <= 0 || el.videoHeight <= 0) return;
               const cur = useRepurposeStore
                 .getState()
-                .overlays.find((ov) => ov.id === o.id);
+                .overlays.find((ov) => ov.id === o.id && ov.src === o.src);
               if (cur && (cur.naturalWidth <= 0 || cur.naturalHeight <= 0)) {
                 // Metadata backfill only (bypasses history via setState).
                 useRepurposeStore.setState((s) => ({

@@ -528,6 +528,105 @@ describe("PreviewCanvas transport", () => {
     expect(useRepurposeStore.getState().mediaReadiness).toBe("ready");
   });
 
+  test("keeps an active overlay failure over base source loading and ready events", () => {
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const media = mediaFor(container);
+    decode(media.screen[0]);
+    decode(media.face[0]);
+    fireEvent.error(media.overlay);
+
+    act(() =>
+      useRepurposeStore.getState().setFootageMeta({
+        ...footageMeta,
+        screenPath: "/media/overlay-priority-screen.mp4",
+        faceCamPath: "/media/overlay-priority-face.mp4",
+      })
+    );
+    const replacement = mediaFor(container);
+    decode(replacement.screen[0]);
+    decode(replacement.face[0]);
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      mediaReadiness: "error",
+      playbackBlockedReason:
+        "Overlay video overlay-video could not play. Re-import it to create a compatible copy.",
+    });
+  });
+
+  test("keeps the base error reason when an active overlay fails, exits, changes, or is removed", () => {
+    const baseError =
+      "Chrome could not load this video. Re-import it to create a compatible copy.";
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const media = mediaFor(container);
+    decode(media.screen[0]);
+    decode(media.face[0]);
+    fireEvent.error(media.screen[0]);
+    fireEvent.error(media.overlay);
+
+    const expectBaseError = () =>
+      expect(useRepurposeStore.getState()).toMatchObject({
+        mediaReadiness: "error",
+        playbackBlockedReason: baseError,
+      });
+
+    expectBaseError();
+    act(() => useRepurposeStore.getState().setPlayhead(3));
+    expectBaseError();
+
+    act(() => useRepurposeStore.getState().setPlayhead(0));
+    fireEvent.error(media.overlay);
+    act(() =>
+      useRepurposeStore.setState({
+        overlays: [{ ...overlay, src: "/media/overlay-replacement.mp4" }],
+      })
+    );
+    expectBaseError();
+
+    act(() => useRepurposeStore.setState({ overlays: [] }));
+    expectBaseError();
+  });
+
+  test("recovers readiness when the active overlay and failed base cycle are both replaced", () => {
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const media = mediaFor(container);
+    decode(media.screen[0]);
+    decode(media.face[0]);
+    fireEvent.error(media.overlay);
+    fireEvent.error(media.screen[0]);
+
+    act(() =>
+      useRepurposeStore.getState().setFootageMeta({
+        ...footageMeta,
+        screenPath: "/media/recovered-screen.mp4",
+        faceCamPath: "/media/recovered-face.mp4",
+      })
+    );
+    const replacement = mediaFor(container);
+    decode(replacement.screen[0]);
+    decode(replacement.face[0]);
+
+    expect(useRepurposeStore.getState().playbackBlockedReason).toBe(
+      "Overlay video overlay-video could not play. Re-import it to create a compatible copy."
+    );
+
+    act(() =>
+      useRepurposeStore.setState({
+        overlays: [{ ...overlay, src: "/media/recovered-overlay.mp4" }],
+      })
+    );
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      mediaReadiness: "ready",
+      playbackBlockedReason: null,
+    });
+  });
+
   test("keeps the screen standby warm across a paused face proxy swap", async () => {
     useRepurposeStore.setState({ playhead: 0.8 });
     const { container } = render(
@@ -562,6 +661,64 @@ describe("PreviewCanvas transport", () => {
     const lastDraw = drawFrameMock.mock.calls.at(-1)?.[1];
     expect(lastDraw.screen.source).toBe(afterProxy.screen[1]);
     expect(lastDraw.face.source).toBe(afterProxy.face[1]);
+  });
+
+  test("keeps the promoted face slot audible after a paused proxy swap", async () => {
+    useRepurposeStore.setState({ playhead: 0.8 });
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const beforeProxy = mediaFor(container);
+    beforeProxy.screen.forEach((video) => decode(video));
+    beforeProxy.face.forEach((video) => decode(video));
+    fireEvent(beforeProxy.screen[1], new Event("seeked"));
+    fireEvent(beforeProxy.face[1], new Event("seeked"));
+
+    act(() => useRepurposeStore.getState().play());
+    await act(async () => Promise.resolve());
+    runFrame(1_000);
+    runFrame(1_200);
+    act(() => useRepurposeStore.getState().pause());
+
+    faceProxyMock.src = "/media/face-proxy.mp4";
+    act(() => useRepurposeStore.setState({ showGrid: true }));
+    const afterProxy = mediaFor(container);
+
+    expect(afterProxy.screen.every((video) => video.muted)).toBe(true);
+    expect(afterProxy.face[0].muted).toBe(true);
+    expect(afterProxy.face[1].muted).toBe(false);
+    expect(afterProxy.face[2].muted).toBe(true);
+  });
+
+  test("restores slot zero as the only audible face after a screen-only source reset", async () => {
+    useRepurposeStore.setState({ playhead: 0.8 });
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const beforeScreenSwap = mediaFor(container);
+    beforeScreenSwap.screen.forEach((video) => decode(video));
+    beforeScreenSwap.face.forEach((video) => decode(video));
+    fireEvent(beforeScreenSwap.screen[1], new Event("seeked"));
+    fireEvent(beforeScreenSwap.face[1], new Event("seeked"));
+
+    act(() => useRepurposeStore.getState().play());
+    await act(async () => Promise.resolve());
+    runFrame(1_000);
+    runFrame(1_200);
+    act(() => useRepurposeStore.getState().pause());
+
+    act(() =>
+      useRepurposeStore.getState().setFootageMeta({
+        ...footageMeta,
+        screenPath: "/media/replacement-screen.mp4",
+      })
+    );
+    const afterScreenSwap = mediaFor(container);
+
+    expect(afterScreenSwap.screen.every((video) => video.muted)).toBe(true);
+    expect(afterScreenSwap.face[0].muted).toBe(false);
+    expect(afterScreenSwap.face[1].muted).toBe(true);
+    expect(afterScreenSwap.face[2].muted).toBe(true);
   });
 
   test.each(["screen", "face"] as const)(
@@ -789,7 +946,9 @@ describe("PreviewCanvas transport", () => {
         overlays: [{ ...overlay, src: "/media/overlay-replacement.mp4" }],
       })
     );
-    playingMedia.delete(media.overlay);
+    const replacement = mediaFor(container).overlay;
+    decode(replacement);
+    playingMedia.delete(replacement);
     runFrame(1_100);
 
     await act(async () => {
@@ -923,6 +1082,53 @@ describe("PreviewCanvas transport", () => {
     });
     act(() => useRepurposeStore.getState().play());
     expect(useRepurposeStore.getState().isPlaying).toBe(true);
+  });
+
+  test("ignores stale DOM overlay events after the same id receives a new source", () => {
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const media = mediaFor(container);
+    decode(media.screen[0]);
+    decode(media.face[0]);
+    const staleOverlay = media.overlay;
+
+    act(() =>
+      useRepurposeStore.setState({
+        overlays: [
+          {
+            ...overlay,
+            src: "/media/overlay-dom-replacement.mp4",
+            naturalWidth: 0,
+            naturalHeight: 0,
+          },
+        ],
+      })
+    );
+    const replacement = mediaFor(container).overlay;
+    expect(replacement).not.toBe(staleOverlay);
+
+    Object.defineProperties(staleOverlay, {
+      videoWidth: { configurable: true, value: 640 },
+      videoHeight: { configurable: true, value: 360 },
+    });
+    fireEvent.error(staleOverlay);
+    fireEvent.loadedMetadata(staleOverlay);
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      mediaReadiness: "ready",
+      playbackBlockedReason: null,
+      overlays: [
+        expect.objectContaining({ naturalWidth: 0, naturalHeight: 0 }),
+      ],
+    });
+
+    fireEvent.error(replacement);
+    expect(useRepurposeStore.getState()).toMatchObject({
+      mediaReadiness: "error",
+      playbackBlockedReason:
+        "Overlay video overlay-video could not play. Re-import it to create a compatible copy.",
+    });
   });
 
   test("synchronizes an active overlay exactly once per playing frame", async () => {
