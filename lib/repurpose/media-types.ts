@@ -36,3 +36,19 @@ export interface BrowserMediaProbe {
   height: number;
   reason?: string;
 }
+
+export type CompatibilityStatus =
+  | "none"
+  | "queued"
+  | "building"
+  | "ready"
+  | "failed"
+  | "cancelled"
+  | "unavailable";
+
+export interface CompatibilityState {
+  status: CompatibilityStatus;
+  progress: number | null;
+  workingPath?: string;
+  error?: { code: string; message: string };
+}
