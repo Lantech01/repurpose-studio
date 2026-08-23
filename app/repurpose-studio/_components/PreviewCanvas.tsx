@@ -108,6 +108,17 @@ const BASE_MEDIA_LOAD_ERROR =
   "Chrome could not load this video. Re-import it to create a compatible copy.";
 const BASE_MEDIA_FUTURE_DATA = 3;
 
+interface OverlayFailure {
+  id: string;
+  src: string;
+  reason: string;
+  wasActive: boolean;
+}
+
+function overlayFailureKey(id: string, src: string): string {
+  return `${id}\u0000${src}`;
+}
+
 // Size of the double-buffer video pool PER SOURCE: 1 active pair +
 // (SLOT_COUNT - 1) standby pairs. Depth 2 means the NEXT cut *and* the cut
 // AFTER it are both pre-seeked, so a rapid double-cut (<1s apart) is two warm
@@ -228,6 +239,7 @@ export function PreviewCanvas({
   const playbackAttemptRef = useRef(0);
   const transportConfirmedRef = useRef(false);
   const sourceIdentityRef = useRef("");
+  const screenSourceIdentityRef = useRef("");
   const mountedRef = useRef(true);
   const overlayPlaybackSessionRef = useRef(0);
   const overlayPlaybackAttemptRef = useRef(0);
@@ -243,6 +255,8 @@ export function PreviewCanvas({
     >
   >(new Map());
   const videoPoolRef = useRef<Map<string, HTMLVideoElement>>(new Map());
+  const overlayFailuresRef = useRef<Map<string, OverlayFailure>>(new Map());
+  const blockedOverlayFailureRef = useRef<string | null>(null);
   const baseReadinessRef = useRef({
     sourceIdentity: "",
     failed: false,
@@ -325,7 +339,9 @@ export function PreviewCanvas({
     footageMeta?.durationSec,
     isPlaying
   );
-  const baseSourceIdentity = `${footageMeta?.screenPath ?? ""}\u0000${faceProxy.src ?? ""}`;
+  const screenSourceIdentity = footageMeta?.screenPath ?? "";
+  const faceSourceIdentity = faceProxy.src ?? "";
+  const baseSourceIdentity = `${screenSourceIdentity}\u0000${faceSourceIdentity}`;
 
   const reportBaseCanPlay = useCallback(
     (
@@ -346,7 +362,12 @@ export function PreviewCanvas({
 
       if (role === "screen") cycle.screenReady = true;
       else cycle.faceReady = true;
-      if (cycle.screenReady && cycle.faceReady) setMediaReadiness("ready");
+      if (
+        cycle.screenReady &&
+        cycle.faceReady &&
+        useRepurposeStore.getState().mediaReadiness === "loading"
+      )
+        setMediaReadiness("ready");
     },
     [setMediaReadiness]
   );
@@ -448,13 +469,29 @@ export function PreviewCanvas({
     (
       screenVideo: HTMLVideoElement | null,
       faceVideo: HTMLVideoElement | null,
-      preferredOutput?: number,
-      anchorMonotonicMs = frameScheduler.now()
+      preferredOutput?: number
     ): number | null => {
       invalidatePlaybackAttempt();
       if (!screenVideo || !faceVideo) return null;
       const attempt = playbackAttemptRef.current;
       const sourceIdentity = sourceIdentityRef.current;
+      const failRequiredBaseMedia = () => {
+        const stillCurrent =
+          mountedRef.current &&
+          playbackAttemptRef.current === attempt &&
+          sourceIdentityRef.current === sourceIdentity &&
+          useRepurposeStore.getState().isPlaying;
+        if (!stillCurrent) return;
+        const cycle = baseReadinessRef.current;
+        if (cycle.sourceIdentity === sourceIdentity) cycle.failed = true;
+        screenVideo.pause();
+        faceVideo.pause();
+        pause();
+        setMediaReadiness(
+          "error",
+          "Chrome could not start this video. Re-import it to create a compatible copy."
+        );
+      };
       const playPromises = [screenVideo, faceVideo].map((video) => {
         try {
           return Promise.resolve(video.play());
@@ -462,6 +499,9 @@ export function PreviewCanvas({
           return Promise.reject(error);
         }
       });
+      for (const playPromise of playPromises) {
+        void playPromise.catch(failRequiredBaseMedia);
+      }
 
       void Promise.allSettled(playPromises).then((results) => {
         const stillCurrent =
@@ -472,11 +512,7 @@ export function PreviewCanvas({
         if (!stillCurrent) return;
 
         if (results.some((result) => result.status === "rejected")) {
-          pause();
-          setMediaReadiness(
-            "error",
-            "Chrome could not start this video. Re-import it to create a compatible copy."
-          );
+          failRequiredBaseMedia();
           return;
         }
 
@@ -485,7 +521,7 @@ export function PreviewCanvas({
         const rate = state.playbackRate > 0 ? state.playbackRate : 1;
         transportAnchorRef.current = startTransport(
           outputSec,
-          anchorMonotonicMs,
+          frameScheduler.now(),
           rate,
           ++transportGenerationRef.current
         );
@@ -507,6 +543,9 @@ export function PreviewCanvas({
   }, [invalidateOverlayPlayback, invalidatePlaybackAttempt]);
 
   useEffect(() => {
+    const screenChanged =
+      screenSourceIdentityRef.current !== screenSourceIdentity;
+    screenSourceIdentityRef.current = screenSourceIdentity;
     sourceIdentityRef.current = baseSourceIdentity;
     baseReadinessRef.current = {
       sourceIdentity: baseSourceIdentity,
@@ -514,9 +553,21 @@ export function PreviewCanvas({
       screenReady: false,
       faceReady: false,
     };
-    slotOrderRef.current = [...SLOT_INDICES];
-    faceSeekersRef.current?.forEach((seeker) => seeker.reset());
-    screenSeekersRef.current?.forEach((seeker) => seeker.reset());
+    if (screenChanged) {
+      slotOrderRef.current = [...SLOT_INDICES];
+      faceSeekersRef.current?.forEach((seeker) => seeker.reset());
+      screenSeekersRef.current?.forEach((seeker) => seeker.reset());
+    } else {
+      faceSeekersRef.current?.forEach((seeker) => seeker.reset());
+      const screenVideo = activeScreen();
+      if (screenVideo) {
+        reportBaseCanPlay(
+          "screen",
+          slotOrderRef.current[0],
+          screenVideo
+        );
+      }
+    }
     invalidateOverlayPlayback();
     invalidatePlaybackAttempt();
     if (footageMeta?.screenPath && faceProxy.src) {
@@ -525,32 +576,76 @@ export function PreviewCanvas({
     return invalidatePlaybackAttempt;
   }, [
     baseSourceIdentity,
+    screenSourceIdentity,
+    activeScreen,
     faceProxy.src,
     footageMeta?.screenPath,
     invalidateOverlayPlayback,
     invalidatePlaybackAttempt,
+    reportBaseCanPlay,
     setMediaReadiness,
   ]);
 
-  const reportActiveOverlayError = useCallback(
-    (overlayId: string) => {
-      if (!mountedRef.current) return;
-      const state = useRepurposeStore.getState();
-      const activeOverlay = state.overlays.find(
-        (overlay) =>
-          overlay.id === overlayId &&
-          overlay.kind === "video" &&
-          state.playhead >= overlay.timelineStart &&
-          state.playhead < overlay.timelineEnd
+  const restoreBaseReadiness = useCallback(() => {
+    const cycle = baseReadinessRef.current;
+    if (cycle.sourceIdentity !== sourceIdentityRef.current || cycle.failed) return;
+    setMediaReadiness(
+      cycle.screenReady && cycle.faceReady ? "ready" : "loading"
+    );
+  }, [setMediaReadiness]);
+
+  const reconcileOverlayFailures = useCallback(() => {
+    const state = useRepurposeStore.getState();
+    let activeFailure: [string, OverlayFailure] | null = null;
+    for (const [key, failure] of overlayFailuresRef.current) {
+      const overlay = state.overlays.find(
+        (candidate) =>
+          candidate.id === failure.id &&
+          candidate.kind === "video" &&
+          candidate.src === failure.src
       );
-      if (!activeOverlay) return;
+      if (!overlay) {
+        overlayFailuresRef.current.delete(key);
+        continue;
+      }
+      const isActive =
+        state.playhead >= overlay.timelineStart &&
+        state.playhead < overlay.timelineEnd;
+      if (isActive) {
+        failure.wasActive = true;
+        activeFailure ??= [key, failure];
+      } else if (failure.wasActive) {
+        overlayFailuresRef.current.delete(key);
+      }
+    }
+    if (activeFailure) {
+      const [key, failure] = activeFailure;
+      blockedOverlayFailureRef.current = key;
       pause();
-      setMediaReadiness(
-        "error",
-        `Overlay video ${overlayId} could not play. Re-import it to create a compatible copy.`
-      );
+      setMediaReadiness("error", failure.reason);
+      return;
+    }
+    if (blockedOverlayFailureRef.current !== null) {
+      blockedOverlayFailureRef.current = null;
+      restoreBaseReadiness();
+    }
+  }, [pause, restoreBaseReadiness, setMediaReadiness]);
+
+  const reportOverlayFailure = useCallback(
+    (overlayId: string, src: string) => {
+      if (!mountedRef.current) return;
+      const key = overlayFailureKey(overlayId, src);
+      if (!overlayFailuresRef.current.has(key)) {
+        overlayFailuresRef.current.set(key, {
+          id: overlayId,
+          src,
+          reason: `Overlay video ${overlayId} could not play. Re-import it to create a compatible copy.`,
+          wasActive: false,
+        });
+      }
+      reconcileOverlayFailures();
     },
-    [pause, setMediaReadiness]
+    [reconcileOverlayFailures]
   );
 
   const playActiveOverlay = useCallback(
@@ -602,12 +697,12 @@ export function PreviewCanvas({
           if (!isCurrent) return;
           overlayPlayPendingRef.current.delete(overlay.id);
           if (state.isPlaying) {
-            reportActiveOverlayError(overlay.id);
+            reportOverlayFailure(overlay.id, attempt.src);
           }
         }
       );
     },
-    [reportActiveOverlayError]
+    [reportOverlayFailure]
   );
 
   useEffect(() => {
@@ -622,6 +717,10 @@ export function PreviewCanvas({
       }
     }
   }, [overlays]);
+
+  useEffect(() => {
+    reconcileOverlayFailures();
+  }, [overlays, playhead, reconcileOverlayFailures]);
 
   // --- Overlay media pools ----------------------------------------------------
   // Image overlays decode ONCE into an HTMLImageElement (kept in imgPoolRef,
@@ -1034,7 +1133,7 @@ export function PreviewCanvas({
               faceVideo!.muted = true;
               faceVideo!.pause();
               screenVideo!.pause();
-              playRequiredBaseMedia(standbyScreen, standbyFace, next, timestamp);
+              playRequiredBaseMedia(standbyScreen, standbyFace, next);
 
               const upcoming = nextDiscontinuousCutsAfter(
                 live.clips,
@@ -1738,7 +1837,7 @@ export function PreviewCanvas({
           the imperative flips stick. */}
       {SLOT_INDICES.map((slot) => (
         <video
-          key={`screen-${baseSourceIdentity}-${slot}`}
+          key={`screen-${screenSourceIdentity}-${slot}`}
           data-source-role="screen"
           data-slot-index={slot}
           ref={(el) => {
@@ -1761,7 +1860,7 @@ export function PreviewCanvas({
           falls back for a purged proxy, but reports a real raw-source failure. */}
       {SLOT_INDICES.map((slot) => (
         <video
-          key={`face-${baseSourceIdentity}-${slot}`}
+          key={`face-${faceSourceIdentity}-${slot}`}
           data-source-role="face"
           data-slot-index={slot}
           ref={(el) => {
@@ -1802,7 +1901,7 @@ export function PreviewCanvas({
             playsInline
             preload="auto"
             className="hidden"
-            onError={() => reportActiveOverlayError(o.id)}
+            onError={() => reportOverlayFailure(o.id, o.src)}
             onLoadedMetadata={(e) => {
               const el = e.currentTarget;
               if (el.videoWidth <= 0 || el.videoHeight <= 0) return;

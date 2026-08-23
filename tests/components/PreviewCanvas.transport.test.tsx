@@ -8,9 +8,10 @@ import {
 import { useRepurposeStore } from "@/lib/repurpose/store";
 import type { Clip, FootageMeta, Overlay } from "@/lib/repurpose/types";
 
-const { drawFrameMock, synchronizeMediaTimeMock } = vi.hoisted(() => ({
+const { drawFrameMock, synchronizeMediaTimeMock, faceProxyMock } = vi.hoisted(() => ({
   drawFrameMock: vi.fn(),
   synchronizeMediaTimeMock: vi.fn(),
+  faceProxyMock: { src: undefined as string | undefined },
 }));
 
 vi.mock("@/lib/engine/crisp-canvas", () => ({
@@ -43,7 +44,7 @@ vi.mock("@/app/repurpose-studio/_components/useSfxPreview", () => ({
 }));
 vi.mock("@/app/repurpose-studio/_components/useFacecamProxy", () => ({
   useFacecamProxy: (src: string | undefined) => ({
-    src,
+    src: faceProxyMock.src ?? src,
     usingProxy: false,
     buildProgress: null,
     onSrcError: () => undefined,
@@ -134,6 +135,7 @@ let playImpl: ReturnType<
 let rafCallbacks: Map<number, FrameRequestCallback>;
 let nextRafId: number;
 let frameScheduler: PreviewFrameScheduler;
+let schedulerNow: number;
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -176,11 +178,13 @@ function runFrame(timestamp: number) {
   expect(rafCallbacks.size).toBe(1);
   const [id, callback] = Array.from(rafCallbacks.entries())[0];
   rafCallbacks.delete(id);
+  schedulerNow = timestamp;
   act(() => callback(timestamp));
 }
 
 beforeEach(() => {
   resetStore();
+  faceProxyMock.src = undefined;
   mediaTimes = new WeakMap();
   mediaReadyStates = new WeakMap();
   playingMedia = new WeakSet();
@@ -218,6 +222,7 @@ beforeEach(() => {
 
   rafCallbacks = new Map();
   nextRafId = 1;
+  schedulerNow = 1_000;
   frameScheduler = {
     request(callback) {
       const id = nextRafId++;
@@ -227,7 +232,7 @@ beforeEach(() => {
     cancel(id) {
       rafCallbacks.delete(id);
     },
-    now: () => performance.now(),
+    now: () => schedulerNow,
   };
   vi.stubGlobal(
     "ResizeObserver",
@@ -301,6 +306,36 @@ describe("PreviewCanvas transport", () => {
       isPlaying: true,
       playhead: 0,
     });
+  });
+
+  test("anchors transport when both delayed base plays confirm", async () => {
+    const screenPlay = deferred<void>();
+    const facePlay = deferred<void>();
+    playImpl
+      .mockImplementationOnce(() => screenPlay.promise)
+      .mockImplementationOnce(() => facePlay.promise);
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const media = mediaFor(container);
+    decode(media.screen[0]);
+    decode(media.face[0]);
+
+    act(() => useRepurposeStore.getState().play());
+    runFrame(1_000);
+    runFrame(2_000);
+    expect(useRepurposeStore.getState().playhead).toBe(0);
+
+    await act(async () => {
+      screenPlay.resolve();
+      facePlay.resolve();
+      await Promise.resolve();
+    });
+    runFrame(2_000);
+    expect(useRepurposeStore.getState().playhead).toBe(0);
+
+    runFrame(2_200);
+    expect(useRepurposeStore.getState().playhead).toBeCloseTo(0.2, 5);
   });
 
   test("ignores a late AbortError after Play then Pause", async () => {
@@ -491,6 +526,42 @@ describe("PreviewCanvas transport", () => {
     expect(useRepurposeStore.getState().mediaReadiness).toBe("loading");
     decode(newMedia.face[0]);
     expect(useRepurposeStore.getState().mediaReadiness).toBe("ready");
+  });
+
+  test("keeps the screen standby warm across a paused face proxy swap", async () => {
+    useRepurposeStore.setState({ playhead: 0.8 });
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const beforeProxy = mediaFor(container);
+    beforeProxy.screen.forEach((video) => decode(video));
+    beforeProxy.face.forEach((video) => decode(video));
+    decode(beforeProxy.overlay);
+    fireEvent(beforeProxy.screen[1], new Event("seeked"));
+    fireEvent(beforeProxy.face[1], new Event("seeked"));
+
+    faceProxyMock.src = "/media/face-proxy.mp4";
+    act(() => useRepurposeStore.setState({ showGrid: true }));
+    const afterProxy = mediaFor(container);
+    expect(afterProxy.screen[0]).toBe(beforeProxy.screen[0]);
+    expect(afterProxy.screen[1]).toBe(beforeProxy.screen[1]);
+
+    afterProxy.face.forEach((video) => decode(video));
+    fireEvent(afterProxy.face[1], new Event("seeked"));
+    useRepurposeStore.getState().setMediaReadiness("ready");
+
+    act(() => useRepurposeStore.getState().play());
+    await act(async () => Promise.resolve());
+    runFrame(1_000);
+    runFrame(1_200);
+
+    expect(playImpl.mock.contexts).toContain(afterProxy.screen[1]);
+    expect(playImpl.mock.contexts).toContain(afterProxy.face[1]);
+    await act(async () => Promise.resolve());
+    runFrame(1_400);
+    const lastDraw = drawFrameMock.mock.calls.at(-1)?.[1];
+    expect(lastDraw.screen.source).toBe(afterProxy.screen[1]);
+    expect(lastDraw.face.source).toBe(afterProxy.face[1]);
   });
 
   test.each(["screen", "face"] as const)(
@@ -764,6 +835,96 @@ describe("PreviewCanvas transport", () => {
     });
   });
 
+  test("blocks when an overlay that failed outside its window enters the timeline", () => {
+    useRepurposeStore.setState({
+      overlays: [{ ...overlay, timelineStart: 1, timelineEnd: 2 }],
+      playhead: 0,
+    });
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const media = mediaFor(container);
+    decode(media.screen[0]);
+    decode(media.face[0]);
+
+    fireEvent.error(media.overlay);
+    expect(useRepurposeStore.getState().mediaReadiness).toBe("ready");
+
+    act(() => useRepurposeStore.getState().setPlayhead(1));
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      isPlaying: false,
+      mediaReadiness: "error",
+      playbackBlockedReason:
+        "Overlay video overlay-video could not play. Re-import it to create a compatible copy.",
+    });
+  });
+
+  test("clears an active overlay failure after seeking outside its window", () => {
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const media = mediaFor(container);
+    decode(media.screen[0]);
+    decode(media.face[0]);
+
+    fireEvent.error(media.overlay);
+    expect(useRepurposeStore.getState().mediaReadiness).toBe("error");
+
+    act(() => useRepurposeStore.getState().setPlayhead(3));
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      mediaReadiness: "ready",
+      playbackBlockedReason: null,
+    });
+    act(() => useRepurposeStore.getState().play());
+    expect(useRepurposeStore.getState().isPlaying).toBe(true);
+  });
+
+  test("clears an active overlay failure when that overlay is removed", () => {
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const media = mediaFor(container);
+    decode(media.screen[0]);
+    decode(media.face[0]);
+
+    fireEvent.error(media.overlay);
+    expect(useRepurposeStore.getState().mediaReadiness).toBe("error");
+
+    act(() => useRepurposeStore.setState({ overlays: [] }));
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      mediaReadiness: "ready",
+      playbackBlockedReason: null,
+    });
+  });
+
+  test("clears an active overlay failure when the same id receives a new source", () => {
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const media = mediaFor(container);
+    decode(media.screen[0]);
+    decode(media.face[0]);
+
+    fireEvent.error(media.overlay);
+    expect(useRepurposeStore.getState().mediaReadiness).toBe("error");
+
+    act(() =>
+      useRepurposeStore.setState({
+        overlays: [{ ...overlay, src: "/media/overlay-recovered.mp4" }],
+      })
+    );
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      mediaReadiness: "ready",
+      playbackBlockedReason: null,
+    });
+    act(() => useRepurposeStore.getState().play());
+    expect(useRepurposeStore.getState().isPlaying).toBe(true);
+  });
+
   test("synchronizes an active overlay exactly once per playing frame", async () => {
     const { container } = render(
       createElement(PreviewCanvas, { frameScheduler })
@@ -799,6 +960,61 @@ describe("PreviewCanvas transport", () => {
 
     act(() => useRepurposeStore.getState().play());
     await act(async () => Promise.resolve());
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      isPlaying: false,
+      mediaReadiness: "error",
+      playbackBlockedReason:
+        "Chrome could not start this video. Re-import it to create a compatible copy.",
+    });
+  });
+
+  test("fails fast when one required base play rejects while the other is pending", async () => {
+    const facePlay = deferred<void>();
+    playImpl
+      .mockImplementationOnce(function (this: HTMLMediaElement) {
+        playingMedia.add(this);
+        return Promise.reject(new Error("screen codec rejected"));
+      })
+      .mockImplementationOnce(function (this: HTMLMediaElement) {
+        playingMedia.add(this);
+        return facePlay.promise;
+      });
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const media = mediaFor(container);
+    decode(media.screen[0]);
+    decode(media.face[0]);
+
+    act(() => useRepurposeStore.getState().play());
+    await act(async () => Promise.resolve());
+
+    expect(media.screen[0].paused).toBe(true);
+    expect(media.face[0].paused).toBe(true);
+    expect(useRepurposeStore.getState()).toMatchObject({
+      isPlaying: false,
+      mediaReadiness: "error",
+      playbackBlockedReason:
+        "Chrome could not start this video. Re-import it to create a compatible copy.",
+    });
+  });
+
+  test("keeps a base play failure sticky when active media later emits canplay", async () => {
+    playImpl.mockImplementationOnce(() =>
+      Promise.reject(new Error("screen codec rejected"))
+    );
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const media = mediaFor(container);
+    decode(media.screen[0]);
+    decode(media.face[0]);
+
+    act(() => useRepurposeStore.getState().play());
+    await act(async () => Promise.resolve());
+    fireEvent.canPlay(media.screen[0]);
+    fireEvent.canPlay(media.face[0]);
 
     expect(useRepurposeStore.getState()).toMatchObject({
       isPlaying: false,
