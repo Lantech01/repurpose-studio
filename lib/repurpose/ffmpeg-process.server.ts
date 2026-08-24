@@ -165,26 +165,87 @@ export function createFfmpegProcessRunner(options: {
   const adapter = options.adapter ?? nodeProcessAdapter();
   const executable = options.ffmpegPath ?? "ffmpeg";
   const platform = options.platform ?? process.platform;
-  let discovery: Promise<Set<string>> | undefined;
+  let discovered: Set<string> | undefined;
+  let discovery: {
+    process: SpawnedProcess;
+    completion: Promise<Set<string>>;
+    waiters: number;
+    settled: boolean;
+  } | undefined;
 
-  const discover = (): Promise<Set<string>> => {
-    discovery ??= (async () => {
-      let result: ProcessResult;
+  const discover = (signal: AbortSignal): Promise<Set<string>> => {
+    if (signal.aborted) return Promise.reject(cancelled());
+    if (discovered) return Promise.resolve(discovered);
+    if (!discovery) {
+      let process: SpawnedProcess;
       try {
-        result = await adapter.run(executable, ["-hide_banner", "-encoders"]).completion;
+        process = adapter.run(executable, ["-hide_banner", "-encoders"]);
       } catch {
-        throw new FfmpegProcessError("FFMPEG_UNAVAILABLE", "Video conversion is unavailable.");
+        return Promise.reject(new FfmpegProcessError("FFMPEG_UNAVAILABLE", "Video conversion is unavailable."));
       }
-      if (result.code !== 0) throw new FfmpegProcessError("FFMPEG_UNAVAILABLE", "Video conversion is unavailable.");
-      return parseEncoderListing(`${result.stdout}\n${result.stderr}`);
-    })();
-    return discovery;
+      const attempt = {
+        process,
+        completion: Promise.resolve(new Set<string>()),
+        waiters: 0,
+        settled: false,
+      };
+      attempt.completion = process.completion
+        .then((result) => {
+          if (result.code !== 0) {
+            throw new FfmpegProcessError("FFMPEG_UNAVAILABLE", "Video conversion is unavailable.");
+          }
+          const encoders = parseEncoderListing(`${result.stdout}\n${result.stderr}`);
+          if (discovery === attempt) discovered = encoders;
+          return encoders;
+        }, () => {
+          throw new FfmpegProcessError("FFMPEG_UNAVAILABLE", "Video conversion is unavailable.");
+        })
+        .finally(() => {
+          attempt.settled = true;
+          if (discovery === attempt) discovery = undefined;
+        });
+      discovery = attempt;
+    }
+
+    const attempt = discovery;
+    attempt.waiters += 1;
+    return new Promise<Set<string>>((resolve, reject) => {
+      let waiting = true;
+      const finish = () => {
+        if (!waiting) return false;
+        waiting = false;
+        signal.removeEventListener("abort", handleAbort);
+        attempt.waiters -= 1;
+        return true;
+      };
+      const handleAbort = () => {
+        if (!finish()) return;
+        if (!attempt.settled && attempt.waiters === 0 && discovery === attempt) {
+          discovery = undefined;
+          attempt.process.kill();
+        }
+        reject(cancelled());
+      };
+      signal.addEventListener("abort", handleAbort, { once: true });
+      if (signal.aborted) {
+        handleAbort();
+        return;
+      }
+      void attempt.completion.then(
+        (encoders) => {
+          if (finish()) resolve(encoders);
+        },
+        (error: unknown) => {
+          if (finish()) reject(error);
+        },
+      );
+    });
   };
 
   return {
     async encode(request) {
       if (request.signal.aborted) throw cancelled();
-      const candidates = encoderCandidates(platform, await discover());
+      const candidates = encoderCandidates(platform, await discover(request.signal));
       if (request.signal.aborted) throw cancelled();
       if (candidates.length === 0) {
         throw new FfmpegProcessError("FFMPEG_UNAVAILABLE", "No H.264 encoder is available.");

@@ -18,12 +18,15 @@ These constants and policies are decisions, not open implementation questions:
 - Overlay-video drift tolerance: `0.250` seconds.
 - External-seek detection tolerance: `0.250` seconds.
 - End and clip-boundary comparisons: one source frame, derived from fps, with `1 / 30` only as invalid-fps fallback.
-- Compatibility cache: 30-day TTL, 20 GiB cap, oldest-first eviction after TTL eviction.
+- Compatibility cache: 30-day TTL, 20 GiB cap, oldest-first eviction after TTL eviction. Maintenance defers while a live owner blocks safe mutation, so temporary overage is permitted.
 - Preview cache: 30-day TTL, 10 GiB cap, 540-pixel short side, approximately 0.5-second keyframe spacing.
-- One compatibility job exists per source fingerprint. Because this is a single-user local app, cancelling from any observing import cancels that shared job for all observers, kills ffmpeg, removes the partial file, and records `cancelled`. A later POST starts a fresh job.
+- The supported compatibility-cache topology is exactly one authoritative Repurpose Studio Node server process per normalized cache directory. Concurrent server processes sharing a directory, shared/network cache directories, and external writers are unsupported; see [the accepted single-process cache ADR](../decisions/2026-08-24-compatibility-cache-single-process.md).
+- HMR/module reload within that process reuses one process-global cache instance and active-job registry. One compatibility job exists per source fingerprint within that instance. Cancelling from any observing import cancels that shared job for all observers, kills ffmpeg, removes the partial file, and records `cancelled`. A later POST starts a fresh job.
+- A compatibility lock owned by a live PID is never preempted solely because its heartbeat is old. Unsupported concurrent ownership fails or defers with actionable busy/restart guidance; dead-process artifacts are recovered at startup or the next operation.
 - A source fingerprint includes resolved original path, file size, mtime, and a versioned compatibility settings string.
 - Export always reads the full-quality `workingPath`. It never reads `previewPath`.
-- A compatibility result is published only after ffmpeg succeeds and ffprobe confirms H.264, yuv420p, expected geometry/frame rate, sane duration, and AAC when the input carried audio.
+- A compatibility result is atomically published only after ffmpeg succeeds and ffprobe confirms H.264, yuv420p, expected geometry/frame rate, sane duration, and AAC when the input carried audio. Partials and finals are never exposed as Ready without validation, and immutable originals are never modified or deleted.
+- GET, project reopen reconciliation, and export preparation must detect a missing compatibility final. Task 6 rebuilds a missing converted master from its immutable original, and Task 10 verifies reopen and export behavior.
 - H.264 that passes the real Chrome metadata probe is copied and inspected but not transcoded.
 - No leadgenman workflow, Whisper model, OpenAI client, API key, or network service enters the web app in this phase.
 
@@ -548,18 +551,23 @@ export interface CompatibilityState {
 Tests must prove:
 
 - two simultaneous starts for one fingerprint call ffmpeg once.
+- HMR/module reload reuses one process-global cache instance and active-job registry rather than launching a duplicate ffmpeg conversion.
 - progress is parsed from `out_time_ms`/`out_time_us`.
-- successful output is atomically renamed and then reused.
+- successful output is published by atomic hard-link creation and then reused.
 - output is rejected when validation is not H.264/yuv420p or duration differs by more than max(0.25 sec, one frame).
 - output is rejected when width/height differ from the inspected input.
 - output is rejected when frame rate differs by more than 0.01 fps from the inspected valid input.
 - AAC is required only when input inspection contains audio.
 - cancellation kills the exact child, reports `cancelled`, and removes the partial.
-- cancelling a shared job is global for the local single-user process.
+- cancelling a shared job is global for the authoritative process/cache instance.
 - a POST after cancellation starts a new job.
 - failed hardware encode retries the next candidate and ultimately `libx264`.
 - a failed software encode never publishes a final file.
 - TTL and 20 GiB eviction never delete active partials.
+- a live-PID lock remains busy despite an expired heartbeat and produces actionable busy/restart guidance instead of timeout takeover.
+- unsupported concurrent owners fail or defer safely, and maintenance may temporarily exceed policy limits rather than mutate through a live owner.
+- dead-process and malformed artifacts recover at startup or the next operation.
+- missing, partial, or invalid finals are never reported Ready.
 
 Run:
 
@@ -589,14 +597,17 @@ Do not scale or change a valid input frame rate. Software uses `libx264 -preset 
 
 ### Step 3: Implement cache, validation, routes, and cancellation
 
+- Follow the supported topology and safety boundary in [the accepted single-process cache ADR](../decisions/2026-08-24-compatibility-cache-single-process.md). Do not claim linearizable cross-process release, reuse, publication, or eviction.
 - Cache directory: `<tmp>/repurpose-compatible`.
 - Filename: `<fingerprint>-compat-v1.mp4`.
 - Partial: include pid plus random UUID.
-- GET: state only; never expose private cache internals except `workingPath` after ready because the local client must persist it.
+- Normalize the cache-directory identity and store one cache instance plus active-job registry in process-global state so HMR/module reload cannot create competing owners.
+- GET: state only; never expose private cache internals except `workingPath` after Ready because the local client must persist it. Revalidate that the final exists and satisfies the media contract before returning Ready.
 - POST: start/reuse.
 - DELETE: cancel the shared fingerprint job.
-- Validate every completed file through `inspectMedia` before rename.
-- Sweep at most once per 10 minutes.
+- A live-PID owner is not preempted solely because its heartbeat is old. Fail or defer unsupported concurrent ownership with actionable busy/restart guidance; recover dead-process artifacts at startup or the next operation.
+- Validate every completed file through `inspectMedia` before atomic hard-link creation at the final pathname. Never expose a partial or unvalidated final as Ready, and never modify or delete an immutable original.
+- Sweep at most once per 10 minutes. Apply the 30-day/20 GiB policy, but defer maintenance while a live owner prevents safe mutation and allow temporary overage.
 
 Run tests, then manually convert the deterministic HEVC fixture:
 
