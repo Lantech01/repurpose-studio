@@ -173,6 +173,7 @@ describe("overlay ingest compatibility pipeline", () => {
     expect(importVideoFileMock).not.toHaveBeenCalled();
     expect(useRepurposeStore.getState().overlays[0]).toMatchObject({
       kind: "image",
+      src: `/api/repurpose/asset?path=${encodeURIComponent("C:\\media\\still.png")}`,
       sourcePath: "C:\\media\\still.png",
       naturalWidth: 640,
       naturalHeight: 360,

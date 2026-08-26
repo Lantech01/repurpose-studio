@@ -185,6 +185,7 @@ beforeEach(() => {
   vi.mocked(exportShort).mockReset().mockResolvedValue({
     blob: new Blob(),
     url: "",
+    warnings: [],
   });
 });
 
@@ -456,5 +457,57 @@ describe("RepurposeEditor persistence states", () => {
     expect(input.overlays).toHaveLength(1);
     expect(input.overlays?.[0].src).toBe(workingSrc);
     expect(input.overlays?.[0].videoSource?.previewPath).toContain("quality=proxy");
+  });
+
+  test("shows a dismissible accessible warning when audio mixing fails nonfatally", async () => {
+    vi.mocked(exportShort).mockResolvedValueOnce({
+      blob: new Blob(),
+      url: "",
+      warnings: [
+        "The video exported, but audio mixing failed and the downloaded file may be silent.",
+      ],
+    });
+    useRepurposeStore.setState({ duration: 3 });
+    render(<RepurposeEditor projectId="audio-warning-project" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Export MP4" }));
+
+    const warning = await screen.findByRole("status", {
+      name: "Export warning",
+    });
+    expect(warning).toHaveTextContent("audio mixing failed");
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss export warning" }));
+    expect(
+      screen.queryByRole("status", { name: "Export warning" })
+    ).not.toBeInTheDocument();
+  });
+
+  test("cancels an active export without showing a failure or warning", async () => {
+    let receivedSignal: AbortSignal | undefined;
+    vi.mocked(exportShort).mockImplementationOnce((input) => {
+      receivedSignal = (input as typeof input & { abortSignal?: AbortSignal }).abortSignal;
+      return new Promise((_, reject) => {
+        receivedSignal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("Export aborted", "AbortError")),
+          { once: true }
+        );
+      });
+    });
+    useRepurposeStore.setState({ duration: 3 });
+    render(<RepurposeEditor projectId="cancel-export-project" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Export MP4" }));
+    const cancel = await screen.findByRole("button", { name: "Cancel export" });
+
+    expect(receivedSignal).toBeInstanceOf(AbortSignal);
+    fireEvent.click(cancel);
+
+    await waitFor(() => expect(receivedSignal?.aborted).toBe(true));
+    await screen.findByRole("button", { name: "Export MP4" });
+    expect(screen.queryByText("Export failed.")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: "Export warning" })
+    ).not.toBeInTheDocument();
   });
 });

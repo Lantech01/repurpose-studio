@@ -36,7 +36,7 @@
 // Take, FootageMeta).
 // ===========================================================================
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Export, FilmSlate, Warning, Info, CaretDown, GridNine, ArrowLeft } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
@@ -246,6 +246,7 @@ function TopBar({
   onSelectShort,
   durationLabel,
   onExport,
+  onCancelExport,
   exporting,
   exportProgress,
   resolution,
@@ -257,6 +258,7 @@ function TopBar({
   onSelectShort: (id: string) => void;
   durationLabel: string;
   onExport: () => void;
+  onCancelExport: () => void;
   exporting: boolean;
   /** Navigate back to the projects hub (/repurpose-studio). */
   onBackToHub: () => void;
@@ -362,8 +364,8 @@ function TopBar({
 
         <Button
           size="sm"
-          onClick={onExport}
-          disabled={exporting}
+          onClick={exporting ? onCancelExport : onExport}
+          aria-label={exporting ? "Cancel export" : undefined}
           className="relative min-w-[150px] gap-1.5 overflow-hidden"
         >
           {/* Progress fill -- a translucent bar that grows left-to-right behind
@@ -419,12 +421,15 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
   // Last export error message, or null. Surfaced as a dismissible banner so a
   // failed export is visible instead of only hitting the console.
   const [exportError, setExportError] = useState<string | null>(null);
+  const [exportWarning, setExportWarning] = useState<string | null>(null);
   const [overlayImport, setOverlayImport] =
     useState<OverlayImportState | null>(null);
   // Chosen output resolution. Default 1080p (standard Reel delivery); 4K
   // upscales for platforms that keep more of the source.
   const [resolution, setResolution] = useState<ExportResolution>("1080p");
   const duration = useRepurposeStore((s) => s.duration);
+  const projectEpoch = useRepurposeStore((s) => s.projectEpoch);
+  const exportControllerRef = useRef<AbortController | null>(null);
 
   // Per-project disk persistence: loads THIS project (by route id) on mount,
   // debounce-autosaves edits to disk, auto-creates the dated-slug project on the
@@ -485,6 +490,13 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
   // text paste there still runs natively.
   useOverlayPaste(editorEnabled, overlayImportOwner);
 
+  useEffect(() => {
+    return () => {
+      exportControllerRef.current?.abort();
+      exportControllerRef.current = null;
+    };
+  }, [projectId, projectEpoch]);
+
   const durationLabel = useMemo(() => formatDuration(duration), [duration]);
 
   const handleExport = useCallback(async () => {
@@ -498,8 +510,11 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
     const selectedLabel =
       shortOptions.find((o) => o.id === selectedShortId)?.label ?? selectedShortId;
     const exportStem = slugifyName(selectedLabel) || selectedShortId;
+    const controller = new AbortController();
+    exportControllerRef.current = controller;
     setExporting(true);
     setExportError(null);
+    setExportWarning(null);
     setExportProgress({ label: "Preparing", pct: 0 });
     try {
       const result = await exportShort({
@@ -521,8 +536,10 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
         sfxTrack: state.sfxTrack,
         musicTrack: state.musicTrack,
         resolution,
+        abortSignal: controller.signal,
         fileName: `${exportStem}${resolution === "4k" ? "-4k" : ""}.mp4`,
         onProgress: (p) => {
+          if (controller.signal.aborted) return;
           setExportProgress({
             label: EXPORT_STATUS_LABEL[p.status] ?? "Exporting",
             pct: Math.round(p.progress),
@@ -533,17 +550,28 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
       // the click guard above already covers that, so a null here is unexpected.
       if (result === null) {
         setExportError("Export produced no output. Check that footage is loaded.");
+      } else if (result.warnings.length > 0) {
+        setExportWarning(result.warnings.join(" "));
       }
     } catch (err) {
-      console.error("Repurpose export failed:", err);
-      setExportError(
-        err instanceof Error ? err.message : "Export failed. See console for details."
-      );
+      if (!(err instanceof DOMException && err.name === "AbortError")) {
+        console.error("Repurpose export failed:", err);
+        setExportError(
+          err instanceof Error ? err.message : "Export failed. See console for details."
+        );
+      }
     } finally {
+      if (exportControllerRef.current === controller) {
+        exportControllerRef.current = null;
+      }
       setExporting(false);
       setExportProgress(null);
     }
   }, [exporting, selectedShortId, resolution, shortOptions]);
+
+  const cancelExport = useCallback(() => {
+    exportControllerRef.current?.abort();
+  }, []);
 
   if (!ready || loadError || saveConflict) {
     return (
@@ -651,6 +679,7 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
         onSelectShort={setSelectedShortId}
         durationLabel={durationLabel}
         onExport={handleExport}
+        onCancelExport={cancelExport}
         exporting={exporting}
         exportProgress={exportProgress}
         resolution={resolution}
@@ -681,6 +710,28 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
             type="button"
             onClick={() => setExportError(null)}
             className="shrink-0 rounded px-1.5 py-0.5 font-medium text-red-300 hover:bg-red-500/20"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {exportWarning && (
+        <div
+          role="status"
+          aria-label="Export warning"
+          aria-live="polite"
+          className="flex shrink-0 items-start gap-2.5 border-b border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-200"
+        >
+          <Warning size={16} weight="fill" className="mt-px shrink-0 text-amber-400" />
+          <p className="flex-1 leading-relaxed">
+            <span className="font-semibold">Export warning.</span> {exportWarning}
+          </p>
+          <button
+            type="button"
+            aria-label="Dismiss export warning"
+            onClick={() => setExportWarning(null)}
+            className="shrink-0 rounded px-1.5 py-0.5 font-medium text-amber-200 hover:bg-amber-500/20"
           >
             Dismiss
           </button>

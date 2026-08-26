@@ -25,6 +25,8 @@ export interface InitVideoMessage {
     totalFrames: number;
     addWatermark: boolean;
     estimatedBytes: number;
+    /** Restrict worker probing and fallback to H.264 codecs. */
+    forceH264: boolean;
     /** Pre-resolved codec string from main-thread probing. */
     resolvedCodec?: string;
   };

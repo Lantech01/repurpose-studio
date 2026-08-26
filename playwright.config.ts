@@ -37,6 +37,11 @@ export default defineConfig({
       use: {
         ...devices["Desktop Chrome"],
         channel: "chrome",
+        // Keep the compatibility workflow deterministic on Windows machines
+        // that have the optional system HEVC codec installed.
+        launchOptions: {
+          args: ["--disable-features=PlatformHEVCDecoderSupport"],
+        },
       },
     },
   ],

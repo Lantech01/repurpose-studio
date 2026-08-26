@@ -262,6 +262,11 @@ export function overlayUrlForPath(ref: string, kind: "image" | "video"): string 
   // plus the video-path proxy, so reuse it for videos directly.
   if (kind === "video") return footageUrlForPath(ref);
 
+  // A Windows drive prefix looks like a URI scheme, so proxy it before the
+  // generic scheme check below.
+  if (/^[A-Za-z]:[\\/]/.test(ref)) {
+    return `/api/repurpose/asset?path=${encodeURIComponent(ref)}`;
+  }
   // Images: pass loadable URLs through, proxy raw disk paths via the asset route.
   if (/^[a-z][a-z0-9+.-]*:/i.test(ref) || ref.startsWith("//") || ref.startsWith("/api/")) {
     return ref;
