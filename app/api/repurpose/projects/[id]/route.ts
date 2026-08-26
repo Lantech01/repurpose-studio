@@ -48,8 +48,8 @@ export async function DELETE(_req: Request, { params }: Ctx) {
     return NextResponse.json({ error: 'invalid id' }, { status: 400 });
   }
   try {
-    return await withProjectMutationLock(id, () => {
-      if (!deleteProject(id)) {
+    return await withProjectMutationLock(id, async () => {
+      if (!(await deleteProject(id))) {
         return NextResponse.json({ error: 'not found' }, { status: 404 });
       }
       return NextResponse.json({ ok: true });

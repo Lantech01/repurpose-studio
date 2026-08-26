@@ -110,7 +110,14 @@ You describe the feature, the agent writes the code, you approve it. That is the
 
 ## Optional: automatic sound effects engine
 
-The "generate SFX" button expects a small Python sound-effects engine at `scripts/sfx-engine/build_sfx_track.py`, which is not shipped in this repo. Everything else works without it. If you want to add your own, point the app at your engine directory with an environment variable:
+The offline sound-effects engine and its sound library are included under `scripts/sfx-engine/`. Install the pinned `uv` release and synchronize its committed lockfile before using "Generate SFX track":
+
+```bash
+python -m pip install uv==0.11.2
+uv sync --frozen --project scripts/sfx-engine
+```
+
+To use a different compatible engine, point the app at it with an environment variable:
 
 ```bash
 REPURPOSE_SFX_ENGINE_DIR=/path/to/your/sfx-engine npm run dev

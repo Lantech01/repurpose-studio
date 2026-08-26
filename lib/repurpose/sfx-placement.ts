@@ -33,11 +33,12 @@
 
 import type { Clip, Word } from "./types";
 import { sourceToTimelineTime } from "./time-map";
+import type { ApprovedSfxKey } from "./sfx-effects";
 
 /** One placed sound effect: which library key, at what OUTPUT time (ms). */
 export interface SfxEvent {
   /** Library key in build_sfx_track.py's SFX_LIBRARY (e.g. "digital_readout"). */
-  sfx: string;
+  sfx: ApprovedSfxKey;
   /** Placement on the OUTPUT timeline, milliseconds. */
   atMs: number;
 }
@@ -60,7 +61,7 @@ const LONG_VIDEO_SEC = 200; // ~3.3 min
 // first hit. digital_readout is handled SEPARATELY (even-spread, not keyword)
 // so it isn't in this table.
 // ---------------------------------------------------------------------------
-const KEYWORD_RULES: { sfx: string; words: string[] }[] = [
+const KEYWORD_RULES: { sfx: ApprovedSfxKey; words: string[] }[] = [
   { sfx: "mouse_click", words: ["click", "select", "choose", "pick", "tap"] },
   { sfx: "keyboard", words: ["type", "typing", "write", "code", "coding", "command", "prompt", "enter"] },
   { sfx: "ding", words: ["perfect", "done", "success", "correct", "exactly", "boom", "nice", "yes"] },
@@ -69,9 +70,9 @@ const KEYWORD_RULES: { sfx: string; words: string[] }[] = [
   { sfx: "notification", words: ["claude", "gpt", "cursor", "zapier", "notion", "slack", "tool", "app", "alert", "ping"] },
   { sfx: "camera_shutter", words: ["screenshot", "capture", "snap", "look", "watch", "show"] },
   { sfx: "digital_shutter", words: ["screen", "record", "recording", "frame"] },
-  { sfx: "gear_shift", words: ["switch", "mode", "workflow", "handoff", "automate", "automation"] },
-  { sfx: "gun_reload", words: ["ready", "locked", "loading", "load", "set"] },
-  { sfx: "radio_beep", words: ["incoming", "connect", "connected", "live", "signal"] },
+  { sfx: "digital_shutter", words: ["switch", "mode", "workflow", "handoff", "automate", "automation"] },
+  { sfx: "impact", words: ["ready", "locked", "loading", "load", "set"] },
+  { sfx: "notification", words: ["incoming", "connect", "connected", "live", "signal"] },
   { sfx: "air_hit", words: ["go", "start", "first", "now", "action"] },
   { sfx: "double_click", words: ["step", "then", "next", "second", "third", "finally"] },
 ];
@@ -88,9 +89,6 @@ const DR_BIAS_WORDS = new Set([
 function norm(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
-
-/** Whoosh family rotated across cuts so consecutive scene changes vary. */
-const CUT_WHOOSHES = ["whoosh", "slide_whoosh", "blade_whoosh"] as const;
 
 /**
  * A word mapped into output time, carrying its normalized token. Only words that
@@ -126,7 +124,7 @@ export function planSfxEvents(
     const outT = sourceToTimelineTime(clips, w.start);
     if (outT === null) continue;
     const atMs = Math.round(outT * 1000);
-    if (atMs < 0 || atMs > durationMs) continue;
+    if (atMs < 0 || atMs >= durationMs) continue;
     outWords.push({ atMs, token: norm(w.text), raw: w.text });
   }
   outWords.sort((a, b) => a.atMs - b.atMs);
@@ -145,24 +143,21 @@ export function planSfxEvents(
     }
     return true;
   }
-  function commit(sfx: string, atMs: number): void {
+  function commit(sfx: ApprovedSfxKey, atMs: number): void {
     placed.push({ sfx, atMs });
     placedTimes.push(atMs);
   }
 
   // 2. Whoosh on scene-cut boundaries (topic/scene changes). Skip the very first
-  // cut at t=0 (the reel open needs no transition whoosh). Rotate the whoosh
-  // variant so back-to-back cuts don't sound identical.
+  // cut at t=0 (the reel open needs no transition whoosh).
   const cutTimes = clips
     .filter((c) => c.kept && c.timelineStart > 0.05)
     .map((c) => Math.round(c.timelineStart * 1000))
     .sort((a, b) => a - b);
-  let whooshIdx = 0;
   for (const atMs of cutTimes) {
-    if (atMs > durationMs) continue;
+    if (atMs >= durationMs) continue;
     if (!fits(atMs, MIN_GAP_MS)) continue;
-    commit(CUT_WHOOSHES[whooshIdx % CUT_WHOOSHES.length], atMs);
-    whooshIdx++;
+    commit("whoosh", atMs);
   }
 
   // 3. Keyword-driven contextual effects. Walk output words in order; the first
@@ -171,7 +166,7 @@ export function planSfxEvents(
   for (const ow of outWords) {
     if (placed.length >= MAX_TOTAL) break;
     if (!ow.token) continue;
-    let chosen: string | null = null;
+    let chosen: ApprovedSfxKey | null = null;
     for (const rule of KEYWORD_RULES) {
       if (rule.words.includes(ow.token)) {
         chosen = rule.sfx;
@@ -259,7 +254,7 @@ function backfillOpeningHook(
   outWords: readonly OutputWord[],
   placed: SfxEvent[],
   _placedTimes: number[],
-  commit: (sfx: string, atMs: number) => void,
+  commit: (sfx: ApprovedSfxKey, atMs: number) => void,
   fits: (atMs: number, gapMs: number) => boolean
 ): void {
   let added = 0;

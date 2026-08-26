@@ -175,8 +175,10 @@ function FramingHelp() {
 
 function InspectorRail({
   overlayImportOwner,
+  projectId,
 }: {
   overlayImportOwner: OverlayImportOwner;
+  projectId: string;
 }) {
   return (
     <div
@@ -206,7 +208,7 @@ function InspectorRail({
           <MusicPanel />
         </div>
         <div className="mt-6 border-t border-border pt-4">
-          <SfxPanel />
+          <SfxPanel projectId={projectId} />
         </div>
         <div className="mt-6 border-t border-border pt-4">
           <FramingHelp />
@@ -729,7 +731,7 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
         </main>
 
         <aside className="flex w-80 min-h-0 shrink-0 flex-col overflow-hidden">
-          <InspectorRail overlayImportOwner={overlayImportOwner} />
+          <InspectorRail overlayImportOwner={overlayImportOwner} projectId={projectId} />
         </aside>
       </div>
 

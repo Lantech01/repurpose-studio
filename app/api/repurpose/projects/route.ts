@@ -138,7 +138,7 @@ export async function POST(req: NextRequest) {
       },
     });
 
-  const mutateProject = (id: string, existing: ProjectFile | null) => {
+  const mutateProject = async (id: string, existing: ProjectFile | null) => {
       const currentRevision = existing?.saveRevision ?? 0;
       const conflict = (reason: string) =>
         NextResponse.json(
@@ -246,7 +246,7 @@ export async function POST(req: NextRequest) {
           (createRequestId !== null ? writerId : null),
         snapshot,
       };
-      writeProject(file);
+      await writeProject(file);
       return projectResponse(file);
   };
 
@@ -284,7 +284,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    return await withProjectMutationLock(requestedId, () => {
+    return await withProjectMutationLock<Response>(requestedId, () => {
       const existing = readProject(requestedId);
       if (!existing && projectFileExists(requestedId)) {
         return NextResponse.json(

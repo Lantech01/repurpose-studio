@@ -33,6 +33,22 @@ const LOCK_RETRY_MIN_MS = 10;
 const LOCK_RETRY_JITTER_MS = 15;
 const LOCK_WAIT_TIMEOUT_MS = 5_000;
 const LOCK_OWNER_GRACE_MS = 1_000;
+const PROJECT_REFERENCE_RUNTIME_KEY = Symbol.for(
+  'repurpose-studio.project-reference-runtime',
+);
+
+interface ProjectReferenceRuntime {
+  locked: boolean;
+  waiters: Array<() => void>;
+}
+
+const projectReferenceGlobal = globalThis as unknown as Record<
+  symbol,
+  ProjectReferenceRuntime | undefined
+>;
+const projectReferenceRuntime = projectReferenceGlobal[
+  PROJECT_REFERENCE_RUNTIME_KEY
+] ??= { locked: false, waiters: [] };
 
 export function isValidProjectId(id: unknown): id is string {
   return (
@@ -84,6 +100,40 @@ export class ProjectMutationLockTimeoutError extends Error {
     super(`Timed out waiting for the project mutation lock: ${projectId}`);
     this.name = 'ProjectMutationLockTimeoutError';
   }
+}
+
+export class ProjectReferenceSnapshotUnavailableError extends Error {
+  readonly code = 'PROJECT_REFERENCE_SNAPSHOT_UNAVAILABLE';
+
+  constructor() {
+    super('Persisted project references could not be read safely.');
+    this.name = 'ProjectReferenceSnapshotUnavailableError';
+  }
+}
+
+async function withProjectReferenceLock<T>(
+  operation: () => Promise<T> | T,
+): Promise<T> {
+  if (projectReferenceRuntime.locked) {
+    await new Promise<void>((resolve) => {
+      projectReferenceRuntime.waiters.push(resolve);
+    });
+  } else {
+    projectReferenceRuntime.locked = true;
+  }
+  try {
+    return await operation();
+  } finally {
+    const next = projectReferenceRuntime.waiters.shift();
+    if (next) next();
+    else projectReferenceRuntime.locked = false;
+  }
+}
+
+export function withProjectReferenceMutation<T>(
+  mutation: () => Promise<T> | T,
+): Promise<T> {
+  return withProjectReferenceLock(mutation);
 }
 
 function isErrnoCode(error: unknown, code: string): boolean {
@@ -349,24 +399,81 @@ export function readProject(id: string): ProjectFile | null {
   return readFileSafe(filePath(id));
 }
 
-/** Upsert a project through an atomic same-directory rename. */
-export function writeProject(file: ProjectFile): void {
-  ensureDir();
-  const destination = filePath(file.id);
-  const temporary = path.join(
-    PROJECTS_DIR,
-    `.${file.id}.${process.pid}.${randomUUID()}.tmp`,
-  );
+/** Normalize an absolute persisted media path for stable cross-platform comparison. */
+export function normalizeProjectMediaPath(value: unknown): string | null {
+  if (typeof value !== 'string' || !path.isAbsolute(value)) return null;
+  const normalized = path.normalize(path.resolve(value));
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+function readReferencedSfxPaths(): Set<string> {
+  const referenced = new Set<string>();
   try {
-    fs.writeFileSync(temporary, JSON.stringify(file, null, 2) + '\n', 'utf8');
-    fs.renameSync(temporary, destination);
-  } finally {
-    try {
-      fs.unlinkSync(temporary);
-    } catch {
-      // The rename consumed the temporary file; cleanup matters only on failure.
+    ensureDir();
+    const names = fs.readdirSync(PROJECTS_DIR);
+    for (const name of names) {
+      if (!name.endsWith('.json')) continue;
+      const stem = name.slice(0, -'.json'.length);
+      if (!isValidProjectId(stem)) continue;
+      const project = readFileSafe(path.join(PROJECTS_DIR, name));
+      if (!project || project.id !== stem) {
+        throw new ProjectReferenceSnapshotUnavailableError();
+      }
+      const snapshot = project.snapshot as unknown as Record<string, unknown>;
+      const track = snapshot.sfxTrack;
+      if (track === undefined || track === null) continue;
+      if (typeof track !== 'object' || Array.isArray(track)) {
+        throw new ProjectReferenceSnapshotUnavailableError();
+      }
+      const normalized = normalizeProjectMediaPath(
+        (track as Record<string, unknown>).sourcePath,
+      );
+      if (!normalized) throw new ProjectReferenceSnapshotUnavailableError();
+      referenced.add(normalized);
     }
+  } catch (error) {
+    if (error instanceof ProjectReferenceSnapshotUnavailableError) throw error;
+    throw new ProjectReferenceSnapshotUnavailableError();
   }
+  return referenced;
+}
+
+/** Hold a stable fail-closed reference snapshot for the full callback. */
+export function withProjectReferenceSnapshot<T>(
+  operation: (references: ReadonlySet<string>) => Promise<T> | T,
+): Promise<T> {
+  return withProjectReferenceLock(() => operation(readReferencedSfxPaths()));
+}
+
+/** Return every persisted project's referenced SFX final, failing closed. */
+export function listReferencedSfxPaths(): Promise<Set<string>> {
+  return withProjectReferenceSnapshot((references) => new Set(references));
+}
+
+/** Upsert a project through an atomic same-directory rename. */
+export function writeProject(file: ProjectFile): Promise<void> {
+  return withProjectReferenceMutation(async () => {
+    ensureDir();
+    const destination = filePath(file.id);
+    const temporary = path.join(
+      PROJECTS_DIR,
+      `.${file.id}.${process.pid}.${randomUUID()}.tmp`,
+    );
+    try {
+      await fs.promises.writeFile(
+        temporary,
+        JSON.stringify(file, null, 2) + '\n',
+        'utf8',
+      );
+      fs.renameSync(temporary, destination);
+    } finally {
+      try {
+        fs.unlinkSync(temporary);
+      } catch {
+        // The rename consumed the temporary file; cleanup matters only on failure.
+      }
+    }
+  });
 }
 
 /** Whether the requested project path exists, even when its JSON is corrupt. */
@@ -399,17 +506,19 @@ export function findProjectByCreateRequestId(
  * Delete a project file. Returns whether a file was actually removed. No-op
  * (false) if the id is invalid or the file is already absent.
  */
-export function deleteProject(id: string): boolean {
-  if (!isValidProjectId(id)) return false;
-  ensureDir();
-  const fp = filePath(id);
-  if (!fs.existsSync(fp)) return false;
-  try {
-    fs.unlinkSync(fp);
-    return true;
-  } catch {
-    return false;
-  }
+export function deleteProject(id: string): Promise<boolean> {
+  if (!isValidProjectId(id)) return Promise.resolve(false);
+  return withProjectReferenceMutation(() => {
+    ensureDir();
+    const fp = filePath(id);
+    if (!fs.existsSync(fp)) return false;
+    try {
+      fs.unlinkSync(fp);
+      return true;
+    } catch {
+      return false;
+    }
+  });
 }
 
 /**

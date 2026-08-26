@@ -15,59 +15,121 @@
 // gain slider pulls the whole SFX bed up/down under the VO without re-rendering.
 // ===========================================================================
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { MusicNotes, Waveform, ArrowClockwise, Trash, Warning } from "@phosphor-icons/react";
 import { useRepurposeStore } from "@/lib/repurpose/store";
 import { planSfxEvents } from "@/lib/repurpose/sfx-placement";
 
-export function SfxPanel() {
+export function SfxPanel({ projectId }: { projectId: string }) {
   const sfxTrack = useRepurposeStore((s) => s.sfxTrack);
   const sfxGenerating = useRepurposeStore((s) => s.sfxGenerating);
+  const clips = useRepurposeStore((s) => s.clips);
+  const words = useRepurposeStore((s) => s.words);
+  const duration = useRepurposeStore((s) => s.duration);
+  const projectEpoch = useRepurposeStore((s) => s.projectEpoch);
   const setSfxTrack = useRepurposeStore((s) => s.setSfxTrack);
   const setSfxGenerating = useRepurposeStore((s) => s.setSfxGenerating);
   const clearSfxTrack = useRepurposeStore((s) => s.clearSfxTrack);
   const setSfxGain = useRepurposeStore((s) => s.setSfxGain);
 
   const [error, setError] = useState<string | null>(null);
+  const mountedRef = useRef(false);
+  const projectIdRef = useRef(projectId);
+  const generationRef = useRef(0);
+  const controllerRef = useRef<AbortController | null>(null);
+  projectIdRef.current = projectId;
+
+  const cancelGeneration = useCallback(() => {
+    generationRef.current += 1;
+    controllerRef.current?.abort();
+    controllerRef.current = null;
+    const current = useRepurposeStore.getState();
+    if (current.sfxGenerating) current.setSfxGenerating(false);
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      cancelGeneration();
+    };
+  }, [cancelGeneration]);
+
+  useEffect(() => () => {
+    cancelGeneration();
+  }, [cancelGeneration, clips, duration, projectEpoch, projectId, sfxTrack, words]);
 
   const generate = useCallback(async () => {
     const state = useRepurposeStore.getState();
-    const { words, clips, duration } = state;
-    if (duration <= 0 || words.length === 0 || sfxGenerating) return;
+    if (state.duration <= 0 || state.words.length === 0 || state.sfxGenerating) return;
+
+    controllerRef.current?.abort();
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    const generation = generationRef.current + 1;
+    generationRef.current = generation;
+    const operation = {
+      projectId,
+      projectEpoch: state.projectEpoch,
+      clips: state.clips,
+      words: state.words,
+      duration: state.duration,
+      sfxTrack: state.sfxTrack,
+    };
+    const ownsGeneration = () => {
+      const current = useRepurposeStore.getState();
+      return mountedRef.current &&
+        !controller.signal.aborted &&
+        generationRef.current === generation &&
+        projectIdRef.current === operation.projectId &&
+        current.projectEpoch === operation.projectEpoch &&
+        current.clips === operation.clips &&
+        current.words === operation.words &&
+        current.duration === operation.duration &&
+        current.sfxTrack === operation.sfxTrack;
+    };
 
     setError(null);
     setSfxGenerating(true);
     try {
       // 1. Plan placements from the reel's OUTPUT-time transcript (in-browser).
-      const events = planSfxEvents(words, clips, duration);
+      const events = planSfxEvents(operation.words, operation.clips, operation.duration);
       if (events.length === 0) {
-        setError("No sound-effect beats found in this reel.");
+        if (ownsGeneration()) setError("No sound-effect beats found in this reel.");
         return;
       }
       // 2. Render the WAV via the local engine route.
       const res = await fetch("/api/repurpose/sfx", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ events, durationMs: Math.round(duration * 1000) }),
+        body: JSON.stringify({ events, durationMs: Math.round(operation.duration * 1000) }),
+        signal: controller.signal,
       });
       if (!res.ok) {
         const body = (await res.json().catch(() => null)) as { error?: string } | null;
         throw new Error(body?.error ?? `SFX render failed (${res.status})`);
       }
       const data = (await res.json()) as { path: string; url: string };
+      if (!ownsGeneration()) return;
       // 3. Auto-load onto the Audio row (preview + export read this).
+      controllerRef.current = null;
+      setSfxGenerating(false);
       setSfxTrack({
         src: data.url,
         sourcePath: data.path,
-        durationSec: duration,
-        gain: sfxTrack?.gain ?? 1,
+        durationSec: operation.duration,
+        gain: operation.sfxTrack?.gain ?? 1,
       });
     } catch (err) {
+      if (controller.signal.aborted || !ownsGeneration()) return;
       setError(err instanceof Error ? err.message : "SFX generation failed.");
     } finally {
-      setSfxGenerating(false);
+      if (ownsGeneration()) {
+        controllerRef.current = null;
+        setSfxGenerating(false);
+      }
     }
-  }, [sfxGenerating, sfxTrack, setSfxGenerating, setSfxTrack]);
+  }, [projectId, setSfxGenerating, setSfxTrack]);
 
   return (
     <div>
