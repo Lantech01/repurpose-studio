@@ -1,18 +1,24 @@
 import { spawn } from "node:child_process";
 
-interface ProbeStream {
+export interface ProbeStream {
   codec_type?: string;
   codec_name?: string;
+  codec_tag_string?: string;
+  profile?: string;
+  pix_fmt?: string;
   width?: number;
   height?: number;
   avg_frame_rate?: string;
   r_frame_rate?: string;
   duration?: string;
+  sample_rate?: string;
+  channels?: number;
+  channel_layout?: string;
 }
 
 export interface MediaProbe {
   streams: ProbeStream[];
-  format?: { duration?: string };
+  format?: { duration?: string; size?: string; format_name?: string };
 }
 
 export interface AudioMeasurements {

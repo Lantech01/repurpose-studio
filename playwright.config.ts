@@ -1,5 +1,7 @@
 import { defineConfig, devices } from "@playwright/test";
 
+const reuseExistingServer = process.env.REPURPOSE_E2E_REUSE_SERVER === "1";
+
 export default defineConfig({
   testDir: "./tests/e2e",
   timeout: 120_000,
@@ -28,7 +30,7 @@ export default defineConfig({
   webServer: {
     command: "npm run dev -- --port 3001",
     url: "http://127.0.0.1:3001/repurpose-studio",
-    reuseExistingServer: false,
+    reuseExistingServer,
     timeout: 120_000,
   },
   projects: [

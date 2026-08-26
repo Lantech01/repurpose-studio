@@ -774,11 +774,13 @@ export function ClipBlock({
 
       {/* left trim edge */}
       <div
+        data-trim-edge="start"
         className="absolute left-0 top-0 h-full w-2 hover:bg-[#FF6B35]/50 rounded-l-md"
         onPointerDown={handleEdgePointerDown("start")}
       />
       {/* right trim edge */}
       <div
+        data-trim-edge="end"
         className="absolute right-0 top-0 h-full w-2 hover:bg-[#FF6B35]/50 rounded-r-md"
         onPointerDown={handleEdgePointerDown("end")}
       />
