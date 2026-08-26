@@ -40,6 +40,9 @@ function rotationDistance(left: number, right: number): number {
 export function validateCompatibilityOutput(input: MediaInspection, output: MediaInspection): void {
   const frameSec = Number.isFinite(input.video.fps) && input.video.fps > 0 ? 1 / input.video.fps : 1 / 30;
   const durationTolerance = Math.max(0.25, frameSec);
+  // ffprobe may report a timestamp-derived average (for example 59.9666) for
+  // the source and the nominal rate (60) after ffmpeg preserves every frame.
+  const frameRateTolerance = Math.max(0.01, input.video.fps * 0.001);
   const valid = output.video.codec.toLowerCase() === "h264"
     && output.video.pixelFormat.toLowerCase() === "yuv420p"
     && output.video.width === input.video.width
@@ -48,7 +51,7 @@ export function validateCompatibilityOutput(input: MediaInspection, output: Medi
     && Math.abs(output.durationSec - input.durationSec) <= durationTolerance + Number.EPSILON
     && (!(Number.isFinite(input.video.fps) && input.video.fps > 0)
       || (Number.isFinite(output.video.fps) && output.video.fps > 0
-        && Math.abs(output.video.fps - input.video.fps) <= 0.01 + Number.EPSILON))
+        && Math.abs(output.video.fps - input.video.fps) <= frameRateTolerance + Number.EPSILON))
     && (!input.audio || output.audio?.codec.toLowerCase() === "aac");
   if (!valid) {
     throw new CompatibilityError("COMPATIBILITY_VALIDATION_FAILED", "Converted video failed validation.");

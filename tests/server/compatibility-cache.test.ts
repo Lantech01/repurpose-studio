@@ -364,12 +364,24 @@ describe("ffmpeg compatibility process", () => {
 });
 
 describe("compatibility validation", () => {
+  it("accepts ffmpeg normalization of the actual 4K60 source average rate", () => {
+    const actualAverageFps = 358_800 / 5_983;
+    const input = media({
+      video: { ...media().video, width: 3_840, height: 2_160, fps: actualAverageFps },
+    });
+    const output = compatibleOutput(input, {
+      video: { ...input.video, codec: "h264", fps: 60 },
+    });
+
+    expect(() => validateCompatibilityOutput(input, output)).not.toThrow();
+  });
+
   it.each([
     ["codec", compatibleOutput(media(), { video: { ...media().video, codec: "hevc" } })],
     ["pixel format", compatibleOutput(media(), { video: { ...media().video, codec: "h264", pixelFormat: "yuv444p" } })],
     ["width", compatibleOutput(media(), { video: { ...media().video, codec: "h264", width: 318 } })],
     ["height", compatibleOutput(media(), { video: { ...media().video, codec: "h264", height: 178 } })],
-    ["frame rate", compatibleOutput(media(), { video: { ...media().video, codec: "h264", fps: 30.02 } })],
+    ["frame rate", compatibleOutput(media(), { video: { ...media().video, codec: "h264", fps: 30.04 } })],
     ["audio codec", compatibleOutput(media(), { audio: { codec: "mp3", channels: 1, sampleRate: 48_000 } })],
   ])("rejects an invalid %s", (_label, output) => {
     let thrown: unknown;
