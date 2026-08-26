@@ -1,8 +1,9 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { importVideoFileMock } = vi.hoisted(() => ({
+const { importVideoFileMock, ensureVideoProxyMock } = vi.hoisted(() => ({
   importVideoFileMock: vi.fn(),
+  ensureVideoProxyMock: vi.fn(),
 }));
 
 vi.mock("@/lib/repurpose/video-import-client", async (importOriginal) => {
@@ -11,6 +12,9 @@ vi.mock("@/lib/repurpose/video-import-client", async (importOriginal) => {
   >();
   return { ...original, importVideoFile: importVideoFileMock };
 });
+vi.mock("@/lib/repurpose/video-proxy-client", () => ({
+  ensureVideoProxy: ensureVideoProxyMock,
+}));
 
 import { FilesPanel } from "@/app/repurpose-studio/_components/FilesPanel";
 import { useRepurposeStore } from "@/lib/repurpose/store";
@@ -54,6 +58,8 @@ function picker(container: HTMLElement): HTMLInputElement {
 beforeEach(() => {
   useRepurposeStore.setState(useRepurposeStore.getInitialState(), true);
   importVideoFileMock.mockReset();
+  ensureVideoProxyMock.mockReset();
+  ensureVideoProxyMock.mockImplementation(async (videoSource) => videoSource);
 });
 
 afterEach(() => {
@@ -62,6 +68,31 @@ afterEach(() => {
 });
 
 describe("FilesPanel video imports", () => {
+  it("starts a background proxy after compatibility import and updates only nested previewPath", async () => {
+    const ready = { ...source, previewPath: "/preview/library.mp4" };
+    importVideoFileMock.mockResolvedValue(source);
+    ensureVideoProxyMock.mockResolvedValue(ready);
+    const rendered = render(<FilesPanel />);
+
+    fireEvent.change(picker(rendered.container), {
+      target: {
+        files: [new File(["video"], "library.mov", { type: "video/quicktime" })],
+      },
+    });
+
+    await waitFor(() => expect(ensureVideoProxyMock).toHaveBeenCalledWith(
+      source,
+      expect.any(AbortSignal)
+    ));
+    await waitFor(() =>
+      expect(useRepurposeStore.getState().mediaAssets[0].videoSource).toBe(ready)
+    );
+    expect(useRepurposeStore.getState().mediaAssets[0]).toMatchObject({
+      src: `/api/repurpose/video?path=${encodeURIComponent(source.workingPath)}`,
+      sourcePath: source.workingPath,
+    });
+  });
+
   it("registers inspection metadata from the library pipeline and preserves videoSource when placed", async () => {
     importVideoFileMock.mockResolvedValue(source);
     const rendered = render(<FilesPanel />);

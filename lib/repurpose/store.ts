@@ -16,6 +16,7 @@ import type {
   SelectedObject,
   SfxTrack,
   VideoSourceRecord,
+  VideoSourceTarget,
   Word,
 } from "./types";
 import type { EditStats } from "./ingest";
@@ -1241,6 +1242,10 @@ interface RepurposeState {
   /** Raw dual-track source metadata (paths, fps, dims, duration). Null until footage is loaded/imported. */
   footageMeta: FootageMeta | null;
   setFootageMeta: (meta: FootageMeta | null) => void;
+  setVideoSourceRecord: (
+    target: VideoSourceTarget,
+    source: VideoSourceRecord
+  ) => void;
   /** Transient readiness of the two preview media elements. Never persisted or captured in history. */
   mediaReadiness: MediaReadiness;
   /** Short user-facing explanation when playback cannot start. Transient UI state. */
@@ -1702,6 +1707,50 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
         ? { isPlaying: false, playbackRate: 1 }
         : {}),
     });
+  },
+  setVideoSourceRecord: (target, source) => {
+    if (target.kind === "footage") {
+      const footageMeta = get().footageMeta;
+      if (!footageMeta) return;
+      set({
+        footageMeta: {
+          ...footageMeta,
+          [target.role === "face" ? "faceCamSource" : "screenSource"]: source,
+        },
+      });
+      return;
+    }
+    if (target.kind === "asset") {
+      if (
+        !get().mediaAssets.some(
+          (asset) => asset.kind === "video" && asset.id === target.id
+        )
+      ) {
+        return;
+      }
+      set((state) => ({
+        mediaAssets: state.mediaAssets.map((asset) =>
+          asset.kind === "video" && asset.id === target.id
+            ? { ...asset, videoSource: source }
+            : asset
+        ),
+      }));
+      return;
+    }
+    if (
+      !get().overlays.some(
+        (overlay) => overlay.kind === "video" && overlay.id === target.id
+      )
+    ) {
+      return;
+    }
+    set((state) => ({
+      overlays: state.overlays.map((overlay) =>
+        overlay.kind === "video" && overlay.id === target.id
+          ? { ...overlay, videoSource: source }
+          : overlay
+      ),
+    }));
   },
   setMediaReadiness: (mediaReadiness, reason) => {
     const playbackBlockedReason =

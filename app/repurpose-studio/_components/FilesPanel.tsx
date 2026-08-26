@@ -34,6 +34,7 @@ import {
   VideoImportError,
   videoUrlForWorkingSource,
 } from "@/lib/repurpose/video-import-client";
+import { ensureVideoProxy } from "@/lib/repurpose/video-proxy-client";
 import {
   VideoImportProgress,
   type VideoImportProgressState,
@@ -161,6 +162,7 @@ export function FilesPanel() {
 
   const inputRef = useRef<HTMLInputElement | null>(null);
   const importRef = useRef<AbortController | null>(null);
+  const proxyControllersRef = useRef(new Set<AbortController>());
   const mountedRef = useRef(true);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -176,11 +178,14 @@ export function FilesPanel() {
   const [dragging, setDragging] = useState(false);
 
   useEffect(() => {
+    const proxyControllers = proxyControllersRef.current;
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
       importRef.current?.abort();
       importRef.current = null;
+      for (const controller of proxyControllers) controller.abort();
+      proxyControllers.clear();
     };
   }, []);
 
@@ -239,7 +244,7 @@ export function FilesPanel() {
                 cancelled = controller.signal.aborted;
                 break;
               }
-              addMediaAsset({
+              const assetId = addMediaAsset({
                 kind,
                 name: file.name,
                 src: videoUrlForWorkingSource(videoSource),
@@ -252,6 +257,33 @@ export function FilesPanel() {
                     ? videoSource.inspection.durationSec
                     : undefined,
               });
+              const proxyController = new AbortController();
+              proxyControllersRef.current.add(proxyController);
+              const unsubscribe = useRepurposeStore.subscribe((state) => {
+                if (state.projectEpoch !== projectEpoch) proxyController.abort();
+              });
+              void ensureVideoProxy(videoSource, proxyController.signal)
+                .then((nextSource) => {
+                  const state = useRepurposeStore.getState();
+                  const current = state.mediaAssets.find(
+                    (asset) => asset.id === assetId
+                  );
+                  if (
+                    !proxyController.signal.aborted &&
+                    state.projectEpoch === projectEpoch &&
+                    current?.videoSource === videoSource
+                  ) {
+                    state.setVideoSourceRecord(
+                      { kind: "asset", id: assetId },
+                      nextSource
+                    );
+                  }
+                })
+                .catch(() => undefined)
+                .finally(() => {
+                  unsubscribe();
+                  proxyControllersRef.current.delete(proxyController);
+                });
               continue;
             }
 

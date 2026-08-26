@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { importVideoFileMock } = vi.hoisted(() => ({
+const { importVideoFileMock, ensureVideoProxyMock } = vi.hoisted(() => ({
   importVideoFileMock: vi.fn(),
+  ensureVideoProxyMock: vi.fn(),
 }));
 
 vi.mock("@/lib/repurpose/video-import-client", async (importOriginal) => {
@@ -10,6 +11,9 @@ vi.mock("@/lib/repurpose/video-import-client", async (importOriginal) => {
   >();
   return { ...original, importVideoFile: importVideoFileMock };
 });
+vi.mock("@/lib/repurpose/video-proxy-client", () => ({
+  ensureVideoProxy: ensureVideoProxyMock,
+}));
 
 import {
   cancelOverlayImport,
@@ -57,6 +61,8 @@ beforeEach(() => {
   clearOverlayImport();
   useRepurposeStore.setState(useRepurposeStore.getInitialState(), true);
   importVideoFileMock.mockReset();
+  ensureVideoProxyMock.mockReset();
+  ensureVideoProxyMock.mockImplementation(async (videoSource) => videoSource);
 });
 
 afterEach(() => {
@@ -64,6 +70,32 @@ afterEach(() => {
 });
 
 describe("overlay ingest compatibility pipeline", () => {
+  it("starts one background proxy and applies it to overlay and media-bin records only", async () => {
+    const ready = { ...source, previewPath: "/preview/overlay.mp4" };
+    importVideoFileMock.mockResolvedValue(source);
+    ensureVideoProxyMock.mockResolvedValue(ready);
+
+    await ingestOverlayFile(
+      new File(["video"], "clip.mov", { type: "video/quicktime" }),
+      2
+    );
+
+    await vi.waitFor(() =>
+      expect(ensureVideoProxyMock).toHaveBeenCalledWith(
+        source,
+        expect.any(AbortSignal)
+      )
+    );
+    await vi.waitFor(() => {
+      expect(useRepurposeStore.getState().overlays[0].videoSource).toBe(ready);
+      expect(useRepurposeStore.getState().mediaAssets[0].videoSource).toBe(ready);
+    });
+    expect(useRepurposeStore.getState().overlays[0]).toMatchObject({
+      src: `/api/repurpose/video?path=${encodeURIComponent(source.workingPath)}`,
+      sourcePath: source.workingPath,
+    });
+  });
+
   it("imports videos once and persists the authoritative working source on overlay and asset", async () => {
     importVideoFileMock.mockResolvedValue(source);
 

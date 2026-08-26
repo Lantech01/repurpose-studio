@@ -28,6 +28,7 @@ import {
   VideoImportError,
   videoUrlForWorkingSource,
 } from "./video-import-client";
+import { ensureVideoProxy } from "./video-proxy-client";
 
 export interface OverlayImportState {
   phase: VideoImportPhase;
@@ -212,6 +213,40 @@ function assertActiveOverlayImport(operation: OverlayImportOperation): void {
   }
 }
 
+function queueOverlayVideoProxy(
+  source: Parameters<typeof ensureVideoProxy>[0],
+  overlayId: string,
+  assetId: string,
+  projectEpoch: number
+): void {
+  const controller = new AbortController();
+  const unsubscribe = useRepurposeStore.subscribe((state) => {
+    if (state.projectEpoch !== projectEpoch) controller.abort();
+  });
+  void ensureVideoProxy(source, controller.signal)
+    .then((nextSource) => {
+      const state = useRepurposeStore.getState();
+      if (controller.signal.aborted || state.projectEpoch !== projectEpoch) return;
+      if (
+        state.overlays.find((overlay) => overlay.id === overlayId)?.videoSource ===
+        source
+      ) {
+        state.setVideoSourceRecord(
+          { kind: "overlay", id: overlayId },
+          nextSource
+        );
+      }
+      if (
+        state.mediaAssets.find((asset) => asset.id === assetId)?.videoSource ===
+        source
+      ) {
+        state.setVideoSourceRecord({ kind: "asset", id: assetId }, nextSource);
+      }
+    })
+    .catch(() => undefined)
+    .finally(unsubscribe);
+}
+
 /**
  * Resolve an overlay's on-disk (or already-loadable) source reference into a URL
  * an <img>/<video> can actually load. Images are proxied through the still-image
@@ -382,7 +417,7 @@ async function ingestOverlayFileForOperation(
     } as const;
     const id = useRepurposeStore.getState().addOverlay(descriptor);
     assertActiveOverlayImport(operation);
-    useRepurposeStore.getState().addMediaAsset({
+    const assetId = useRepurposeStore.getState().addMediaAsset({
       kind,
       name: file.name || "video",
       src,
@@ -392,6 +427,7 @@ async function ingestOverlayFileForOperation(
       naturalHeight: descriptor.naturalHeight,
       srcDuration: descriptor.srcDuration,
     });
+    queueOverlayVideoProxy(videoSource, id, assetId, operation.projectEpoch);
     return { id, needsReconnect: false };
   }
 

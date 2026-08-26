@@ -2856,6 +2856,78 @@ describe("project media reconciliation", () => {
     expect(proxyPosts).not.toContain(missingAsset.workingPath);
   });
 
+  test("queues valid asset and overlay previews when a missing base keeps autosave unsafe", async () => {
+    const missingFace = source("C:\\missing\\face.mp4");
+    const screen = source("C:\\originals\\screen.mp4");
+    const assetSource = source("C:\\originals\\asset.mp4", undefined, {
+      previewPath: "C:\\preview\\stale-asset.mp4",
+    });
+    const overlaySource = source("C:\\originals\\overlay.mp4", undefined, {
+      previewPath: "C:\\preview\\stale-overlay.mp4",
+    });
+    const proxyStarts: string[] = [];
+    const projectPosts: unknown[] = [];
+    installProjectFetch(
+      snapshot({
+        footageMeta: footage(missingFace, screen),
+        mediaAssets: [videoAsset("asset-valid", assetSource)],
+        overlays: [videoOverlay("overlay-valid", overlaySource)],
+      }),
+      (input, init) => {
+        const url = String(input);
+        if (url === "/api/repurpose/projects" && init?.method === "POST") {
+          projectPosts.push(JSON.parse(String(init.body)));
+          return jsonResponse({ project: { id: "task-6-project" } });
+        }
+        const path = mediaPath(input);
+        if (path === missingFace.workingPath) {
+          return jsonResponse(
+            { error: { code: "MEDIA_PATH_INVALID", message: "missing" } },
+            400
+          );
+        }
+        if (path) return jsonResponse(source(path).inspection);
+        if (url.startsWith("/api/repurpose/proxy?") && !init?.method) {
+          return jsonResponse({ status: "none" });
+        }
+        if (url === "/api/repurpose/proxy" && init?.method === "POST") {
+          proxyStarts.push(JSON.parse(String(init.body)).path);
+          return jsonResponse({ status: "ready" });
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      }
+    );
+
+    const { result } = await loadProject();
+    await waitFor(() => {
+      const state = useRepurposeStore.getState();
+      expect(state.mediaAssets[0].videoSource?.previewPath).toContain(
+        "quality=proxy"
+      );
+      expect(state.overlays[0].videoSource?.previewPath).toContain(
+        "quality=proxy"
+      );
+    });
+
+    expect(result.current).toMatchObject({
+      ready: true,
+      footageNeedsReimport: true,
+    });
+    expect(useRepurposeStore.getState()).toMatchObject({
+      mediaReadiness: "error",
+      isPlaying: false,
+    });
+    expect(new Set(proxyStarts)).toEqual(
+      new Set([
+        screen.workingPath,
+        assetSource.workingPath,
+        overlaySource.workingPath,
+      ])
+    );
+    expect(proxyStarts).not.toContain(missingFace.workingPath);
+    expect(projectPosts).toHaveLength(0);
+  });
+
   test("does not catch-up save a safe hydration when media records are unchanged", async () => {
     const face = source("C:\\originals\\face.mp4");
     const screen = source("C:\\originals\\screen.mp4");
@@ -2933,6 +3005,83 @@ describe("project media reconciliation", () => {
       ).toBe(true)
     );
     expect(useRepurposeStore.getState().mediaReadiness).toBe("loading");
+  });
+
+  test("reconciles validated proxies into footage, media-bin, and overlay records without changing working URLs", async () => {
+    const face = source("C:\\originals\\face.mp4", undefined, {
+      previewPath: "C:\\preview\\stale-face.mp4",
+    });
+    const screen = source("C:\\originals\\screen.mp4", undefined, {
+      previewPath: "C:\\preview\\stale-screen.mp4",
+    });
+    const assetSource = source("C:\\originals\\asset.mp4", undefined, {
+      previewPath: "C:\\preview\\stale-asset.mp4",
+    });
+    const overlaySource = source("C:\\originals\\overlay.mp4", undefined, {
+      previewPath: "C:\\preview\\stale-overlay.mp4",
+    });
+    const proxyStarts: string[] = [];
+    installProjectFetch(
+      snapshot({
+        footageMeta: footage(face, screen),
+        mediaAssets: [videoAsset("asset-video", assetSource)],
+        overlays: [videoOverlay("overlay-video", overlaySource)],
+      }),
+      (input, init) => {
+        const url = String(input);
+        const path = mediaPath(input);
+        if (path) return jsonResponse(source(path).inspection);
+        if (url === "/api/repurpose/proxy" && init?.method === "POST") {
+          proxyStarts.push(JSON.parse(String(init.body)).path);
+          return jsonResponse({ status: "ready" });
+        }
+        if (url.startsWith("/api/repurpose/proxy?")) {
+          return jsonResponse({ status: "ready" });
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      }
+    );
+
+    await loadProject();
+    const expectedPreview = (workingPath: string) =>
+      `${videoUrl(workingPath)}&quality=proxy`;
+    await waitFor(() => {
+      const state = useRepurposeStore.getState();
+      expect(state.footageMeta?.faceCamSource?.previewPath).toBe(
+        expectedPreview(face.workingPath)
+      );
+      expect(state.footageMeta?.screenSource?.previewPath).toBe(
+        expectedPreview(screen.workingPath)
+      );
+      expect(state.mediaAssets[0].videoSource?.previewPath).toBe(
+        expectedPreview(assetSource.workingPath)
+      );
+      expect(state.overlays[0].videoSource?.previewPath).toBe(
+        expectedPreview(overlaySource.workingPath)
+      );
+    });
+
+    const state = useRepurposeStore.getState();
+    expect(new Set(proxyStarts)).toEqual(
+      new Set([
+        face.workingPath,
+        screen.workingPath,
+        assetSource.workingPath,
+        overlaySource.workingPath,
+      ])
+    );
+    expect(state.footageMeta).toMatchObject({
+      faceCamPath: videoUrl(face.workingPath),
+      screenPath: videoUrl(screen.workingPath),
+    });
+    expect(state.mediaAssets[0]).toMatchObject({
+      src: videoUrl(assetSource.workingPath),
+      sourcePath: assetSource.workingPath,
+    });
+    expect(state.overlays[0]).toMatchObject({
+      src: videoUrl(overlaySource.workingPath),
+      sourcePath: overlaySource.workingPath,
+    });
   });
 
   test("becomes ready before optional preview validation settles", async () => {
@@ -3082,6 +3231,67 @@ describe("project media reconciliation", () => {
       mediaReadiness: "idle",
       playbackBlockedReason: null,
     });
+  });
+
+  test("ignores a late proxy completion after the target source is replaced with the same fingerprint", async () => {
+    const face = source("C:\\originals\\face.mp4", undefined, {
+      previewPath: "C:\\preview\\face.mp4",
+    });
+    const screen = source("C:\\originals\\screen.mp4");
+    let releaseProxy!: (response: Response) => void;
+    const proxyBarrier = new Promise<Response>((resolve) => {
+      releaseProxy = resolve;
+    });
+    let proxyStarted!: () => void;
+    const proxyStart = new Promise<void>((resolve) => {
+      proxyStarted = resolve;
+    });
+    installProjectFetch(
+      snapshot({ footageMeta: footage(face, screen) }),
+      (input, init) => {
+        const url = String(input);
+        const path = mediaPath(input);
+        if (path) return jsonResponse(source(path).inspection);
+        if (url.startsWith("/api/repurpose/proxy?") && !init?.method) {
+          return jsonResponse({ status: "ready" });
+        }
+        if (url === "/api/repurpose/proxy" && init?.method === "POST") {
+          const requestedPath = JSON.parse(String(init.body)).path;
+          if (requestedPath === face.workingPath) {
+            proxyStarted();
+            return proxyBarrier;
+          }
+          return jsonResponse({ status: "ready" });
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      }
+    );
+
+    await loadProject();
+    await proxyStart;
+    const current = useRepurposeStore.getState().footageMeta?.faceCamSource;
+    expect(current).toBeDefined();
+    const replacement = {
+      ...current!,
+      originalName: "replacement.mp4",
+      previewPath: undefined,
+    };
+    act(() =>
+      useRepurposeStore.getState().setVideoSourceRecord(
+        { kind: "footage", role: "face" },
+        replacement
+      )
+    );
+
+    await act(async () => {
+      releaseProxy(jsonResponse({ status: "ready" }));
+      await Promise.resolve();
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(
+      useRepurposeStore.getState().footageMeta?.faceCamSource
+    ).toBe(replacement);
   });
 
   test("rebuilds an evicted converted master from the immutable original", async () => {

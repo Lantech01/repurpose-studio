@@ -346,6 +346,9 @@ export async function inspectMedia(
           codec: stringValue(audio.codec_name),
           channels: finiteNumber(audio.channels) || 0,
           sampleRate: finiteNumber(audio.sample_rate) || 0,
+          ...(finiteNumber(audio.duration) > 0
+            ? { durationSec: finiteNumber(audio.duration) }
+            : {}),
         }
       : null,
   };

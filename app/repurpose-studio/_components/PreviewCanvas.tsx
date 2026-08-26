@@ -66,7 +66,7 @@ import { SnapGuides } from "./SnapGuides";
 import { useObjectSelection } from "./useObjectSelection";
 import { useDeselectOnOutsideClick } from "./useDeselectOnOutsideClick";
 import { useSfxPreview, useMusicPreview } from "./useSfxPreview";
-import { useFacecamProxy } from "./useFacecamProxy";
+import { useVideoProxy } from "./useVideoProxy";
 import { SelectionOverlay } from "./SelectionOverlay";
 import { SelectionToolbar } from "./SelectionToolbar";
 
@@ -168,6 +168,67 @@ interface RegionDragState {
   startTransform: { x: number; y: number; scale: number };
 }
 
+function PreviewOverlayVideo({
+  overlay,
+  isPlaying,
+  register,
+  reportFailure,
+}: {
+  overlay: Overlay;
+  isPlaying: boolean;
+  register: (element: HTMLVideoElement | null, previewSrc: string) => void;
+  reportFailure: () => void;
+}) {
+  const proxy = useVideoProxy({
+    target: { kind: "overlay", id: overlay.id },
+    source: overlay.videoSource,
+    fallbackSrc: overlay.src,
+    durationSec: overlay.srcDuration,
+    isPlaying,
+  });
+  const previewSrc = proxy.src ?? overlay.src;
+
+  return (
+    <video
+      data-overlay-id={overlay.id}
+      data-overlay-src={previewSrc}
+      ref={(element) => register(element, previewSrc)}
+      src={previewSrc}
+      muted
+      playsInline
+      preload="auto"
+      className="hidden"
+      onError={() => {
+        if (proxy.usingProxy) proxy.onSrcError();
+        else reportFailure();
+      }}
+      onLoadedMetadata={(event) => {
+        const element = event.currentTarget;
+        if (element.videoWidth <= 0 || element.videoHeight <= 0) return;
+        const current = useRepurposeStore
+          .getState()
+          .overlays.find(
+            (candidate) =>
+              candidate.id === overlay.id && candidate.src === overlay.src
+          );
+        if (current && (current.naturalWidth <= 0 || current.naturalHeight <= 0)) {
+          useRepurposeStore.setState((state) => ({
+            overlays: state.overlays.map((candidate) =>
+              candidate.id === overlay.id
+                ? {
+                    ...candidate,
+                    naturalWidth: element.videoWidth,
+                    naturalHeight: element.videoHeight,
+                  }
+                : candidate
+            ),
+          }));
+        }
+      }}
+    />
+  );
+}
+
 /**
  * Live 1080x1920 split-screen compositor preview. Renders the current frame
  * via the pure `drawFrame` module, and exposes drag-to-pan / scroll-to-zoom /
@@ -252,6 +313,7 @@ export function PreviewCanvas({
   const sourceIdentityRef = useRef("");
   const screenSourceIdentityRef = useRef("");
   const faceSourceIdentityRef = useRef("");
+  const screenWorkingSourceIdentityRef = useRef("");
   const mountedRef = useRef(true);
   const overlayPlaybackSessionRef = useRef(0);
   const overlayPlaybackAttemptRef = useRef(0);
@@ -347,20 +409,26 @@ export function PreviewCanvas({
   const musicTrack = useRepurposeStore((s) => s.musicTrack);
   useMusicPreview(musicTrack);
 
-  // LOW-RES PREVIEW PROXY for the facecam raw. The hook hands back the
-  // src the face <video> slots should use: the original streaming URL until a
-  // one-time ffmpeg proxy is built server-side, then (on the next pause) the
-  // proxy URL -- tiny file, keyframe every 0.5s, so scrubbing and cold-cut
-  // fallback seeks are near-instant. EXPORT still reads footageMeta.faceCamPath
-  // directly and is untouched by this swap.
-  const faceProxy = useFacecamProxy(
-    footageMeta?.faceCamPath,
-    footageMeta?.durationSec,
-    isPlaying
-  );
-  const screenSourceIdentity = footageMeta?.screenPath ?? "";
+  const screenProxy = useVideoProxy({
+    target: { kind: "footage", role: "screen" },
+    source: footageMeta?.screenSource,
+    fallbackSrc: footageMeta?.screenPath || undefined,
+    durationSec: footageMeta?.durationSec,
+    isPlaying,
+  });
+  const faceProxy = useVideoProxy({
+    target: { kind: "footage", role: "face" },
+    source: footageMeta?.faceCamSource,
+    fallbackSrc: footageMeta?.faceCamPath || undefined,
+    durationSec: footageMeta?.durationSec,
+    isPlaying,
+  });
+  const screenSourceIdentity = screenProxy.src ?? "";
   const faceSourceIdentity = faceProxy.src ?? "";
   const baseSourceIdentity = `${screenSourceIdentity}\u0000${faceSourceIdentity}`;
+  const screenWorkingSourceIdentity = footageMeta?.screenSource
+    ? `${footageMeta.screenSource.workingPath}\u0000${footageMeta.screenSource.inspection.fingerprint}`
+    : footageMeta?.screenPath ?? "";
 
   const reconcileMediaReadiness = useCallback(() => {
     const state = useRepurposeStore.getState();
@@ -630,8 +698,11 @@ export function PreviewCanvas({
     const screenChanged =
       screenSourceIdentityRef.current !== screenSourceIdentity;
     const faceChanged = faceSourceIdentityRef.current !== faceSourceIdentity;
+    const screenWorkingChanged =
+      screenWorkingSourceIdentityRef.current !== screenWorkingSourceIdentity;
     screenSourceIdentityRef.current = screenSourceIdentity;
     faceSourceIdentityRef.current = faceSourceIdentity;
+    screenWorkingSourceIdentityRef.current = screenWorkingSourceIdentity;
     sourceIdentityRef.current = baseSourceIdentity;
     baseReadinessRef.current = {
       sourceIdentity: baseSourceIdentity,
@@ -646,20 +717,51 @@ export function PreviewCanvas({
       screenReady: screenChanged ? false : previousCycle.screenReady,
       faceReady: faceChanged ? false : previousCycle.faceReady,
     };
-    if (screenChanged) {
+    if (screenWorkingChanged) {
       slotOrderRef.current = [...SLOT_INDICES];
       faceSeekersRef.current?.forEach((seeker) => seeker.reset());
       screenSeekersRef.current?.forEach((seeker) => seeker.reset());
     } else {
-      faceSeekersRef.current?.forEach((seeker) => seeker.reset());
-      const screenVideo = activeScreen();
-      if (screenVideo) {
-        reportBaseCanPlay(
-          "screen",
-          slotOrderRef.current[0],
-          screenVideo
-        );
+      if (faceChanged) {
+        faceSeekersRef.current?.forEach((seeker) => seeker.reset());
       }
+      if (screenChanged) {
+        screenSeekersRef.current?.forEach((seeker) => seeker.reset());
+      }
+    }
+    if (screenChanged || faceChanged) {
+      const live = liveRef.current;
+      const srcTime = timelineToSourceTime(live.clips, live.playhead);
+      const sourceIdentity = baseSourceIdentity;
+      const seekActive = (
+        role: "screen" | "face",
+        video: HTMLVideoElement | null
+      ) => {
+        if (!video || srcTime === null) return;
+        const apply = () => {
+          const current = role === "screen" ? activeScreen() : activeFace();
+          if (
+            sourceIdentityRef.current === sourceIdentity &&
+            current === video &&
+            Math.abs(video.currentTime - srcTime) > 1 / 60
+          ) {
+            video.currentTime = srcTime;
+          }
+        };
+        if (video.readyState >= 1) apply();
+        else video.addEventListener("loadedmetadata", apply, { once: true });
+      };
+      seekActive("screen", activeScreen());
+      seekActive("face", activeFace());
+      const cuts = nextDiscontinuousCutsAfter(
+        live.clips,
+        live.playhead,
+        STANDBY_DEPTH
+      );
+      cuts.forEach((cut, k) => {
+        faceSeekersRef.current?.[k]?.target(cut.seekSrc);
+        screenSeekersRef.current?.[k]?.target(cut.seekSrc);
+      });
     }
     normalizeBaseMute();
     invalidateOverlayPlayback();
@@ -670,6 +772,8 @@ export function PreviewCanvas({
     baseSourceIdentity,
     faceSourceIdentity,
     screenSourceIdentity,
+    screenWorkingSourceIdentity,
+    activeFace,
     activeScreen,
     invalidateOverlayPlayback,
     invalidatePlaybackAttempt,
@@ -928,38 +1032,6 @@ export function PreviewCanvas({
       screenSeekersRef.current?.forEach((s) => s.reset());
     };
   }, [footageMeta]);
-
-  // --- Re-sync the face slots after a proxy src swap -------------------------
-  // Changing <video>.src resets every face element to t=0. The swap only ever
-  // happens while paused, so: reset the face seekers (their in-flight state
-  // died with the old src), re-seek the active slot to the frame under the
-  // playhead once its metadata is in, and re-issue the standbys' pre-seek
-  // targets directly (the pre-seek effect won't re-run on its own --
-  // clips/playhead/footageMeta are all unchanged by a src swap).
-  useEffect(() => {
-    if (!faceProxy.src) return;
-    normalizeBaseMute();
-    faceSeekersRef.current?.forEach((s) => s.reset());
-    const live = liveRef.current;
-    const srcTime = timelineToSourceTime(live.clips, live.playhead);
-    // Direct-seek ONLY the active slot; each standby belongs to its seeker
-    // (re-targeted below), and two writers issuing currentTime on the same
-    // element would interleave unpredictably.
-    const v = activeFace();
-    if (v && srcTime !== null) {
-      const apply = () => {
-        if (Math.abs(v.currentTime - srcTime) > 1 / 60) v.currentTime = srcTime;
-      };
-      if (v.readyState >= 1) apply();
-      else v.addEventListener("loadedmetadata", apply, { once: true });
-    }
-    const cuts = nextDiscontinuousCutsAfter(
-      live.clips,
-      live.playhead,
-      STANDBY_DEPTH
-    );
-    cuts.forEach((cut, k) => faceSeekersRef.current?.[k]?.target(cut.seekSrc));
-  }, [faceProxy.src, activeFace, normalizeBaseMute]);
 
   // --- Start/stop the source <video>s in lockstep with isPlaying -------------
   // Synchronizing the real play state of two external <video> elements with the
@@ -1894,7 +1966,7 @@ export function PreviewCanvas({
             screenElsRef.current[slot] = el;
             if (el) normalizeBaseMute();
           }}
-          src={footageMeta?.screenPath || undefined}
+          src={screenProxy.src}
           muted
           playsInline
           preload="auto"
@@ -1902,7 +1974,10 @@ export function PreviewCanvas({
           onCanPlay={(event) =>
             reportBaseCanPlay("screen", slot, event.currentTarget)
           }
-          onError={() => reportRequiredBaseError("screen", slot)}
+          onError={() => {
+            if (screenProxy.usingProxy) screenProxy.onSrcError();
+            else reportRequiredBaseError("screen", slot);
+          }}
         />
       ))}
       {/* Face slots read faceProxy.src -- the original streaming URL until the
@@ -1941,40 +2016,19 @@ export function PreviewCanvas({
       {overlays
         .filter((o) => o.kind === "video")
         .map((o) => (
-          <video
+          <PreviewOverlayVideo
             key={`${o.id}\u0000${o.src}`}
-            data-overlay-id={o.id}
-            data-overlay-src={o.src}
-            ref={(el) => {
+            overlay={o}
+            isPlaying={isPlaying}
+            register={(el, previewSrc) => {
               if (el) videoPoolRef.current.set(o.id, el);
               else if (
-                videoPoolRef.current.get(o.id)?.dataset.overlaySrc === o.src
-              )
+                videoPoolRef.current.get(o.id)?.dataset.overlaySrc === previewSrc
+              ) {
                 videoPoolRef.current.delete(o.id);
-            }}
-            src={o.src}
-            muted
-            playsInline
-            preload="auto"
-            className="hidden"
-            onError={() => reportOverlayFailure(o.id, o.src)}
-            onLoadedMetadata={(e) => {
-              const el = e.currentTarget;
-              if (el.videoWidth <= 0 || el.videoHeight <= 0) return;
-              const cur = useRepurposeStore
-                .getState()
-                .overlays.find((ov) => ov.id === o.id && ov.src === o.src);
-              if (cur && (cur.naturalWidth <= 0 || cur.naturalHeight <= 0)) {
-                // Metadata backfill only (bypasses history via setState).
-                useRepurposeStore.setState((s) => ({
-                  overlays: s.overlays.map((ov) =>
-                    ov.id === o.id
-                      ? { ...ov, naturalWidth: el.videoWidth, naturalHeight: el.videoHeight }
-                      : ov
-                  ),
-                }));
               }
             }}
+            reportFailure={() => reportOverlayFailure(o.id, o.src)}
           />
         ))}
       {/* GHOSTED OFF-FRAME OVERFLOW -- a dim, non-interactive copy of
@@ -2029,9 +2083,9 @@ export function PreviewCanvas({
           pass runs in the background. DOM-only (never in the export), gone the
           moment the proxy is ready. Playback keeps using the original file
           until the swap, so this is purely informational. */}
-      {faceProxy.buildProgress !== null && (
+      {(faceProxy.buildProgress !== null || screenProxy.buildProgress !== null) && (
         <div className="pointer-events-none absolute bottom-2 left-2 z-10 rounded-full bg-black/70 px-2.5 py-1 text-[10px] font-medium tracking-wide text-white/75">
-          Preparing fast preview {Math.round(faceProxy.buildProgress * 100)}%
+          Preparing fast preview {Math.round(Math.max(faceProxy.buildProgress ?? 0, screenProxy.buildProgress ?? 0) * 100)}%
         </div>
       )}
 

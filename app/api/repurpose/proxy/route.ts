@@ -26,14 +26,17 @@ export const dynamic = "force-dynamic";
 /** Wire shape: status always, outTimeSec while building. Never proxyPath. */
 type ProxyStateJson = {
   status: ProxyState["status"];
-  outTimeSec?: number;
+  progress?: number;
+  error?: ProxyState["error"];
 };
 
 /** Strip server-private fields (proxyPath) before anything leaves the process. */
 function toJson(state: ProxyState): ProxyStateJson {
-  return state.outTimeSec !== undefined
-    ? { status: state.status, outTimeSec: state.outTimeSec }
-    : { status: state.status };
+  return {
+    status: state.status,
+    ...(state.progress !== undefined ? { progress: state.progress } : {}),
+    ...(state.error ? { error: state.error } : {}),
+  };
 }
 
 /**

@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
@@ -155,6 +155,7 @@ vi.mock("@/app/repurpose-studio/_components/SfxPanel", () => ({
 }));
 
 import { RepurposeEditor } from "@/app/repurpose-studio/_components/RepurposeEditor";
+import { exportShort } from "@/lib/repurpose/export-short";
 import { useRepurposeStore } from "@/lib/repurpose/store";
 
 beforeEach(() => {
@@ -181,6 +182,10 @@ beforeEach(() => {
   registeredOwners.length = 0;
   overlayListeners.clear();
   overlayImportListener.current = null;
+  vi.mocked(exportShort).mockReset().mockResolvedValue({
+    blob: new Blob(),
+    url: "",
+  });
 });
 
 afterEach(cleanup);
@@ -392,5 +397,64 @@ describe("RepurposeEditor persistence states", () => {
     expect(screen.getByRole("status")).toHaveTextContent(
       "Re-select your Screen and Face video files"
     );
+  });
+
+  test("passes the working overlay source to export when a preview proxy is ready", async () => {
+    const workingSrc = "/api/repurpose/video?path=working-overlay.mp4";
+    useRepurposeStore.setState({
+      duration: 2,
+      overlays: [
+        {
+          id: "overlay-video",
+          kind: "video",
+          src: workingSrc,
+          sourcePath: "C:\\media\\working-overlay.mp4",
+          videoSource: {
+            originalPath: "C:\\media\\original-overlay.mov",
+            workingPath: "C:\\media\\working-overlay.mp4",
+            originalName: "original-overlay.mov",
+            inspection: {
+              extension: ".mov",
+              size: 4096,
+              durationSec: 2,
+              container: "mov,mp4",
+              fingerprint: "a".repeat(64),
+              video: {
+                codec: "h264",
+                codecTag: "avc1",
+                profile: "High",
+                pixelFormat: "yuv420p",
+                width: 1920,
+                height: 1080,
+                fps: 30,
+              },
+              audio: { codec: "aac", sampleRate: 48000, channels: 2 },
+            },
+            nativeCompatible: true,
+            compatibilityStatus: "native",
+            previewPath: "/api/repurpose/video?path=working-overlay.mp4&quality=proxy",
+          },
+          naturalWidth: 1920,
+          naturalHeight: 1080,
+          timelineStart: 0,
+          timelineEnd: 2,
+          srcStart: 0,
+          srcDuration: 2,
+          transform: { x: 0.5, y: 0.25, scale: 1, rotation: 0 },
+          zIndex: 0,
+          opacity: 1,
+          muted: true,
+        },
+      ],
+    });
+    render(<RepurposeEditor projectId="export-working-source" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Export MP4" }));
+
+    await waitFor(() => expect(exportShort).toHaveBeenCalledTimes(1));
+    const input = vi.mocked(exportShort).mock.calls[0][0];
+    expect(input.overlays).toHaveLength(1);
+    expect(input.overlays?.[0].src).toBe(workingSrc);
+    expect(input.overlays?.[0].videoSource?.previewPath).toContain("quality=proxy");
   });
 });

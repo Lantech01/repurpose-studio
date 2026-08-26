@@ -51,6 +51,7 @@ import type {
   ProjectSnapshot,
   SfxTrack,
   VideoSourceRecord,
+  VideoSourceTarget,
 } from "@/lib/repurpose/types";
 import type {
   CompatibilityState,
@@ -67,6 +68,7 @@ import {
   reconcileVideoSource,
   videoUrlForWorkingSource,
 } from "@/lib/repurpose/video-import-client";
+import { ensureVideoProxy } from "@/lib/repurpose/video-proxy-client";
 import { probeBrowserVideo } from "@/lib/repurpose/native-media-probe";
 import { datedSlug, deriveShortTitle } from "./naming";
 
@@ -574,39 +576,58 @@ interface SourceAttempt {
   error: VideoImportError | null;
 }
 
+function sourceAtTarget(target: VideoSourceTarget): VideoSourceRecord | undefined {
+  const state = useRepurposeStore.getState();
+  if (target.kind === "footage") {
+    return target.role === "face"
+      ? state.footageMeta?.faceCamSource
+      : state.footageMeta?.screenSource;
+  }
+  if (target.kind === "asset") {
+    return state.mediaAssets.find((asset) => asset.id === target.id)?.videoSource;
+  }
+  return state.overlays.find((overlay) => overlay.id === target.id)?.videoSource;
+}
+
 function queuePreviewReconciliation(
-  sources: Array<VideoSourceRecord | null | undefined>,
+  entries: Array<{
+    target: VideoSourceTarget;
+    source: VideoSourceRecord | null | undefined;
+  }>,
   signal: AbortSignal
 ): void {
-  for (const source of new Set(sources.filter((item) => item != null))) {
+  const projectEpoch = useRepurposeStore.getState().projectEpoch;
+  for (const { target, source } of entries) {
+    if (!source) continue;
+    let ownedSource = source;
     void reconcileVideoPreview(source, signal)
+      .then(async (reconciledSource) => {
+        if (
+          signal.aborted ||
+          useRepurposeStore.getState().projectEpoch !== projectEpoch ||
+          sourceAtTarget(target) !== source
+        ) {
+          return null;
+        }
+        if (reconciledSource !== source) {
+          useRepurposeStore
+            .getState()
+            .setVideoSourceRecord(target, reconciledSource);
+          ownedSource = reconciledSource;
+        }
+        return ensureVideoProxy(reconciledSource, signal);
+      })
       .then((nextSource) => {
-        if (signal.aborted || nextSource === source) return;
-        const current = useRepurposeStore.getState();
-        let changed = false;
-        let footageMeta = current.footageMeta;
-        if (footageMeta?.faceCamSource === source) {
-          footageMeta = { ...footageMeta, faceCamSource: nextSource };
-          changed = true;
+        if (
+          !nextSource ||
+          signal.aborted ||
+          useRepurposeStore.getState().projectEpoch !== projectEpoch
+        ) {
+          return;
         }
-        if (footageMeta?.screenSource === source) {
-          footageMeta = { ...footageMeta, screenSource: nextSource };
-          changed = true;
+        if (sourceAtTarget(target) === ownedSource) {
+          useRepurposeStore.getState().setVideoSourceRecord(target, nextSource);
         }
-        const mediaAssets = current.mediaAssets.map((asset) => {
-          if (asset.kind !== "video" || asset.videoSource !== source) return asset;
-          changed = true;
-          return { ...asset, videoSource: nextSource };
-        });
-        const overlays = current.overlays.map((overlay) => {
-          if (overlay.kind !== "video" || overlay.videoSource !== source) {
-            return overlay;
-          }
-          changed = true;
-          return { ...overlay, videoSource: nextSource };
-        });
-        if (!changed || signal.aborted) return;
-        useRepurposeStore.setState({ footageMeta, mediaAssets, overlays });
       })
       .catch(() => undefined);
   }
@@ -794,17 +815,27 @@ async function reconcileHydratedMedia(signal: AbortSignal): Promise<{
   });
   useRepurposeStore.getState().setFootageMeta(nextMeta);
   const safeToPersist = !deadBaseBlob && !face.error && !screen.error;
-  if (safeToPersist) {
-    queuePreviewReconciliation(
-      [
-        face.source,
-        screen.source,
-        ...assets.map(({ result }) => result.source),
-        ...overlays.map(({ result }) => result.source),
-      ],
-      signal
-    );
-  }
+  queuePreviewReconciliation(
+    [
+      {
+        target: { kind: "footage", role: "face" },
+        source: face.source,
+      },
+      {
+        target: { kind: "footage", role: "screen" },
+        source: screen.source,
+      },
+      ...assets.map(({ asset, result }) => ({
+        target: { kind: "asset", id: asset.id } as const,
+        source: result.source,
+      })),
+      ...overlays.map(({ overlay, result }) => ({
+        target: { kind: "overlay", id: overlay.id } as const,
+        source: result.source,
+      })),
+    ],
+    signal
+  );
   if (baseError) {
     useRepurposeStore.getState().setMediaReadiness("error", baseError);
   }

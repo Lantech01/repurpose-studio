@@ -8,9 +8,15 @@ import {
 import { useRepurposeStore } from "@/lib/repurpose/store";
 import type { Clip, FootageMeta, Overlay } from "@/lib/repurpose/types";
 
-const { drawFrameMock, synchronizeMediaTimeMock, faceProxyMock } = vi.hoisted(() => ({
+const {
+  drawFrameMock,
+  synchronizeMediaTimeMock,
+  screenProxyMock,
+  faceProxyMock,
+} = vi.hoisted(() => ({
   drawFrameMock: vi.fn(),
   synchronizeMediaTimeMock: vi.fn(),
+  screenProxyMock: { src: undefined as string | undefined },
   faceProxyMock: { src: undefined as string | undefined },
 }));
 
@@ -42,13 +48,25 @@ vi.mock("@/app/repurpose-studio/_components/useSfxPreview", () => ({
   useSfxPreview: () => undefined,
   useMusicPreview: () => undefined,
 }));
-vi.mock("@/app/repurpose-studio/_components/useFacecamProxy", () => ({
-  useFacecamProxy: (src: string | undefined) => ({
-    src: faceProxyMock.src ?? src,
-    usingProxy: false,
-    buildProgress: null,
-    onSrcError: () => undefined,
-  }),
+vi.mock("@/app/repurpose-studio/_components/useVideoProxy", () => ({
+  useVideoProxy: ({ target, source, fallbackSrc }: {
+    target: { kind: string; role?: string };
+    source?: { previewPath?: string };
+    fallbackSrc?: string;
+  }) => {
+    const src =
+      target.kind === "footage" && target.role === "face"
+        ? faceProxyMock.src ?? source?.previewPath ?? fallbackSrc
+        : target.kind === "footage" && target.role === "screen"
+          ? screenProxyMock.src ?? source?.previewPath ?? fallbackSrc
+          : source?.previewPath ?? fallbackSrc;
+    return {
+      src,
+      usingProxy: src !== fallbackSrc,
+      buildProgress: null,
+      onSrcError: () => undefined,
+    };
+  },
 }));
 
 const footageMeta: FootageMeta = {
@@ -126,6 +144,32 @@ const overlay: Overlay = {
   band: "screen",
 };
 
+const overlayVideoSource = {
+  originalPath: "C:\\media\\overlay.mov",
+  workingPath: "C:\\media\\overlay.mp4",
+  previewPath: "/media/overlay-proxy.mp4",
+  originalName: "overlay.mov",
+  inspection: {
+    fingerprint: "a".repeat(64),
+    container: "mov,mp4",
+    extension: ".mov",
+    size: 1_024,
+    durationSec: 23,
+    video: {
+      codec: "h264",
+      codecTag: "avc1",
+      profile: "High",
+      pixelFormat: "yuv420p",
+      width: 1280,
+      height: 720,
+      fps: 30,
+    },
+    audio: null,
+  },
+  nativeCompatible: true,
+  compatibilityStatus: "native" as const,
+};
+
 let mediaTimes: WeakMap<HTMLMediaElement, number>;
 let mediaReadyStates: WeakMap<HTMLMediaElement, number>;
 let playingMedia: WeakSet<HTMLMediaElement>;
@@ -184,6 +228,7 @@ function runFrame(timestamp: number) {
 
 beforeEach(() => {
   resetStore();
+  screenProxyMock.src = undefined;
   faceProxyMock.src = undefined;
   mediaTimes = new WeakMap();
   mediaReadyStates = new WeakMap();
@@ -249,6 +294,25 @@ afterEach(() => {
 });
 
 describe("PreviewCanvas transport", () => {
+  test("uses a video overlay previewPath only in preview while preserving its working src", () => {
+    useRepurposeStore.setState({
+      footageMeta,
+      clips,
+      duration: 3,
+      overlays: [{ ...overlay, videoSource: overlayVideoSource }],
+      isPlaying: false,
+    });
+
+    const { container } = render(<PreviewCanvas />);
+    const video = container.querySelector<HTMLVideoElement>(
+      '[data-overlay-id="overlay-video"]'
+    );
+
+    expect(video?.getAttribute("src")).toBe(overlayVideoSource.previewPath);
+    expect(video?.dataset.overlaySrc).toBe(overlayVideoSource.previewPath);
+    expect(useRepurposeStore.getState().overlays[0].src).toBe(overlay.src);
+  });
+
   test("disarms promoted standby seekers across a rapid double cut", async () => {
     useRepurposeStore.getState().setClips(rapidDoubleCutClips);
     useRepurposeStore.setState({ playhead: 0.8, overlays: [overlay] });
@@ -732,6 +796,43 @@ describe("PreviewCanvas transport", () => {
     expect(afterProxy.face[0].muted).toBe(true);
     expect(afterProxy.face[1].muted).toBe(false);
     expect(afterProxy.face[2].muted).toBe(true);
+  });
+
+  test("keeps the promoted pair synchronized after a paused screen proxy swap", async () => {
+    useRepurposeStore.setState({
+      clips: rapidDoubleCutClips,
+      duration: 3,
+      playhead: 0.8,
+    });
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const beforeProxy = mediaFor(container);
+    beforeProxy.screen.forEach((video) => decode(video));
+    beforeProxy.face.forEach((video) => decode(video));
+    fireEvent(beforeProxy.screen[1], new Event("seeked"));
+    fireEvent(beforeProxy.face[1], new Event("seeked"));
+    fireEvent(beforeProxy.screen[2], new Event("seeked"));
+    fireEvent(beforeProxy.face[2], new Event("seeked"));
+
+    act(() => useRepurposeStore.getState().play());
+    await act(async () => Promise.resolve());
+    runFrame(1_000);
+    runFrame(1_200);
+    act(() => useRepurposeStore.getState().pause());
+
+    screenProxyMock.src = "/media/screen-proxy.mp4";
+    act(() => useRepurposeStore.setState({ showGrid: true }));
+    const afterProxy = mediaFor(container);
+    afterProxy.screen.forEach((video) => decode(video));
+    runFrame(1_250);
+
+    const lastDraw = drawFrameMock.mock.calls.at(-1)?.[1];
+    expect(lastDraw.screen.source).toBe(afterProxy.screen[1]);
+    expect(lastDraw.face.source).toBe(beforeProxy.face[1]);
+    expect(afterProxy.screen[1].currentTime).toBeCloseTo(10, 5);
+    expect(afterProxy.screen[2].currentTime).toBeCloseTo(20, 5);
+    expect(beforeProxy.face[1].muted).toBe(false);
   });
 
   test("restores slot zero as the only audible face after a screen-only source reset", async () => {

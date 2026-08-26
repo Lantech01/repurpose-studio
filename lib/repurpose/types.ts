@@ -33,6 +33,11 @@ export interface VideoSourceRecord {
   compatibilityStatus: "native" | "converted";
 }
 
+export type VideoSourceTarget =
+  | { kind: "footage"; role: "face" | "screen" }
+  | { kind: "asset"; id: string }
+  | { kind: "overlay"; id: string };
+
 /** A single transcribed word with its position in the raw source file, in seconds. */
 export interface Word {
   text: string;

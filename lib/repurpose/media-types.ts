@@ -27,6 +27,7 @@ export interface MediaInspection {
     codec: string;
     channels: number;
     sampleRate: number;
+    durationSec?: number;
   };
 }
 
