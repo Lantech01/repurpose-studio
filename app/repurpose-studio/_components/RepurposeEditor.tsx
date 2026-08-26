@@ -36,7 +36,7 @@
 // Take, FootageMeta).
 // ===========================================================================
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Export, FilmSlate, Warning, Info, CaretDown, GridNine, ArrowLeft } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
@@ -62,6 +62,17 @@ import { useProjectPersistence } from "./useProjectPersistence";
 import { useBlockBrowserZoom } from "./useBlockBrowserZoom";
 import { useOverlayPaste } from "./useOverlayPaste";
 import { slugifyName } from "./naming";
+import {
+  cancelOverlayImport,
+  clearOverlayImport,
+  createOverlayImportOwner,
+  registerOverlayImportOwner,
+  releaseOverlayImportOwner,
+  subscribeOverlayImport,
+  type OverlayImportOwner,
+  type OverlayImportState,
+} from "@/lib/repurpose/overlay-ingest";
+import { VideoImportProgress } from "./VideoImportProgress";
 
 // ---------------------------------------------------------------------------
 // Placeholder Shorts list for the top-bar selector. Real data (per-Short
@@ -162,7 +173,11 @@ function FramingHelp() {
 // vertically if content overflows, mirrors the transcript rail's fixed width.
 // ---------------------------------------------------------------------------
 
-function InspectorRail() {
+function InspectorRail({
+  overlayImportOwner,
+}: {
+  overlayImportOwner: OverlayImportOwner;
+}) {
   return (
     <div
       id="inspector-panel"
@@ -179,7 +194,7 @@ function InspectorRail() {
             demo auto-load + caption backfill on mount. */}
         <FilesPanel />
         <div className="mt-6 border-t border-border pt-4">
-          <SourcesPanel />
+          <SourcesPanel overlayImportOwner={overlayImportOwner} />
         </div>
         <div className="mt-6 border-t border-border pt-4">
           <ColorAdjustPanel />
@@ -201,13 +216,20 @@ function InspectorRail() {
   );
 }
 
-function TimelinePanel() {
+function TimelinePanel({
+  overlayImportOwner,
+}: {
+  overlayImportOwner: OverlayImportOwner;
+}) {
   return (
     <div
       id="timeline-panel"
       className="flex h-full flex-col border-t border-border bg-card p-2"
     >
-      <Timeline className="flex-1 min-h-0" />
+      <Timeline
+        className="flex-1 min-h-0"
+        overlayImportOwner={overlayImportOwner}
+      />
     </div>
   );
 }
@@ -379,6 +401,11 @@ const EXPORT_STATUS_LABEL: Record<string, string> = {
 
 export function RepurposeEditor({ projectId }: { projectId: string }) {
   const router = useRouter();
+  const overlayImportLifecycle = useMemo(
+    () => ({ projectId, owner: createOverlayImportOwner() }),
+    [projectId]
+  );
+  const overlayImportOwner = overlayImportLifecycle.owner;
   const [selectedShortId, setSelectedShortId] = useState(SHORT_OPTIONS[0].id);
   const [exporting, setExporting] = useState(false);
   // Live export progress ({label, pct}) or null when idle. Drives the Export
@@ -390,6 +417,8 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
   // Last export error message, or null. Surfaced as a dismissible banner so a
   // failed export is visible instead of only hitting the console.
   const [exportError, setExportError] = useState<string | null>(null);
+  const [overlayImport, setOverlayImport] =
+    useState<OverlayImportState | null>(null);
   // Chosen output resolution. Default 1080p (standard Reel delivery); 4K
   // upscales for platforms that keep more of the source.
   const [resolution, setResolution] = useState<ExportResolution>("1080p");
@@ -412,6 +441,25 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
   } = useProjectPersistence(projectId);
   const editorEnabled = ready && !loadError && !saveConflict;
 
+  useEffect(() => {
+    registerOverlayImportOwner(overlayImportOwner);
+    const unsubscribe = subscribeOverlayImport(
+      setOverlayImport,
+      overlayImportOwner
+    );
+    return () => {
+      unsubscribe();
+      releaseOverlayImportOwner(overlayImportOwner);
+    };
+  }, [overlayImportOwner]);
+
+  useEffect(() => {
+    if (!editorEnabled) {
+      cancelOverlayImport(overlayImportOwner);
+      clearOverlayImport(overlayImportOwner);
+    }
+  }, [editorEnabled, overlayImportOwner]);
+
   // Build the selector options: each Short reads "<Project Title> · Short N".
   // Before a transcript loads there's no title yet, so fall back to the plain
   // "Untitled Short N" placeholder. The base title is shared across all Shorts.
@@ -433,7 +481,7 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
   // Paste an image/video from the clipboard -> overlay at the playhead. Gated
   // off inputs / textareas / contentEditable / the transcript panel so a normal
   // text paste there still runs natively.
-  useOverlayPaste(editorEnabled);
+  useOverlayPaste(editorEnabled, overlayImportOwner);
 
   const durationLabel = useMemo(() => formatDuration(duration), [duration]);
 
@@ -608,6 +656,14 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
         onBackToHub={() => router.push("/repurpose-studio")}
       />
 
+      {overlayImport && (
+        <VideoImportProgress
+          state={overlayImport}
+          onCancel={() => cancelOverlayImport(overlayImportOwner)}
+          className="shrink-0 rounded-none border-x-0 border-t-0 px-4 py-2.5"
+        />
+      )}
+
       {/* Export-error banner -- dismissible. Shown when an export throws or
           produces no output, so a failure is visible instead of console-only. */}
       {exportError && (
@@ -673,14 +729,14 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
         </main>
 
         <aside className="flex w-80 min-h-0 shrink-0 flex-col overflow-hidden">
-          <InspectorRail />
+          <InspectorRail overlayImportOwner={overlayImportOwner} />
         </aside>
       </div>
 
       {/* Timeline docked full-width along the bottom -- always the last thing on
           the page, never pushed below a scroll. */}
       <div className="h-60 min-h-0 shrink-0 overflow-hidden">
-        <TimelinePanel />
+        <TimelinePanel overlayImportOwner={overlayImportOwner} />
       </div>
     </div>
   );

@@ -1126,6 +1126,7 @@ describe("project media reconciliation", () => {
       { initialProps: { projectId: "project-a" } }
     );
     await waitFor(() => expect(rendered.result.current.ready).toBe(true));
+    const projectAEpoch = useRepurposeStore.getState().projectEpoch;
 
     useRepurposeStore.setState({ splitRatio: 0.7 });
     rendered.rerender({ projectId: "project-b" });
@@ -1139,7 +1140,11 @@ describe("project media reconciliation", () => {
       snapshot: { splitRatio: 0.7 },
     });
     expect(beaconBodies[0].snapshot).not.toHaveProperty("saveRevision");
+    expect(beaconBodies[0].snapshot).not.toHaveProperty("projectEpoch");
     expect(beaconBodies[0].snapshot).not.toMatchObject({ splitRatio: 0.2 });
+    expect(useRepurposeStore.getState().projectEpoch).toBeGreaterThan(
+      projectAEpoch
+    );
   });
 
   test.each(["queued-first", "newest-first"] as const)(

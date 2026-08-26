@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
@@ -9,6 +9,15 @@ const {
   pushMock,
   retryLoadMock,
   resolveSaveConflictMock,
+  subscribeOverlayImportMock,
+  cancelOverlayImportMock,
+  clearOverlayImportMock,
+  registerOverlayImportOwnerMock,
+  createOverlayImportOwnerMock,
+  releaseOverlayImportOwnerMock,
+  registeredOwners,
+  overlayListeners,
+  overlayImportListener,
 } = vi.hoisted(() => ({
   persistenceState: {
     footageNeedsReimport: false,
@@ -28,6 +37,24 @@ const {
   pushMock: vi.fn(),
   retryLoadMock: vi.fn(),
   resolveSaveConflictMock: vi.fn().mockResolvedValue(true),
+  subscribeOverlayImportMock: vi.fn(),
+  cancelOverlayImportMock: vi.fn(),
+  clearOverlayImportMock: vi.fn(),
+  registerOverlayImportOwnerMock: vi.fn(),
+  createOverlayImportOwnerMock: vi.fn(),
+  releaseOverlayImportOwnerMock: vi.fn(),
+  registeredOwners: [] as Array<{ id: number }>,
+  overlayListeners: new Map<
+    { id: number },
+    (state: { phase: string; progress: number | null; error?: string } | null) => void
+  >(),
+  overlayImportListener: {
+    current: null as null | ((state: {
+      phase: string;
+      progress: number | null;
+      error?: string;
+    } | null) => void),
+  },
 }));
 
 vi.mock("next/navigation", () => ({
@@ -52,6 +79,33 @@ vi.mock("@/app/repurpose-studio/_components/useOverlayPaste", () => ({
 
 vi.mock("@/lib/repurpose/export-short", () => ({
   exportShort: vi.fn(),
+}));
+
+vi.mock("@/lib/repurpose/overlay-ingest", () => ({
+  subscribeOverlayImport: subscribeOverlayImportMock.mockImplementation(
+    (
+      listener: typeof overlayImportListener.current,
+      owner?: { id: number }
+    ) => {
+      overlayImportListener.current = listener;
+      if (owner && listener) overlayListeners.set(owner, listener);
+      listener?.(null);
+      return vi.fn();
+    }
+  ),
+  cancelOverlayImport: cancelOverlayImportMock,
+  clearOverlayImport: clearOverlayImportMock,
+  createOverlayImportOwner: createOverlayImportOwnerMock.mockImplementation(
+    () => {
+      const owner = { id: registeredOwners.length + 1 };
+      registeredOwners.push(owner);
+      return owner;
+    }
+  ),
+  registerOverlayImportOwner: registerOverlayImportOwnerMock.mockImplementation(
+    (owner: { id: number }) => owner
+  ),
+  releaseOverlayImportOwner: releaseOverlayImportOwnerMock,
 }));
 
 vi.mock("@/components/ui/button", () => ({
@@ -118,6 +172,15 @@ beforeEach(() => {
   overlayPasteMock.mockReset();
   retryLoadMock.mockReset();
   resolveSaveConflictMock.mockReset().mockResolvedValue(true);
+  subscribeOverlayImportMock.mockClear();
+  cancelOverlayImportMock.mockReset();
+  clearOverlayImportMock.mockReset();
+  registerOverlayImportOwnerMock.mockClear();
+  createOverlayImportOwnerMock.mockClear();
+  releaseOverlayImportOwnerMock.mockReset();
+  registeredOwners.length = 0;
+  overlayListeners.clear();
+  overlayImportListener.current = null;
 });
 
 afterEach(cleanup);
@@ -127,18 +190,86 @@ describe("RepurposeEditor persistence states", () => {
     Object.assign(persistenceState, { ready: false, loadError: null });
     const rendered = render(<RepurposeEditor projectId="paste-gating-project" />);
 
-    expect(overlayPasteMock).toHaveBeenLastCalledWith(false);
+    expect(overlayPasteMock).toHaveBeenLastCalledWith(
+      false,
+      registeredOwners[0]
+    );
 
     Object.assign(persistenceState, {
       ready: false,
       loadError: "Não foi possível carregar o projeto. Tente novamente.",
     });
     rendered.rerender(<RepurposeEditor projectId="paste-gating-project" />);
-    expect(overlayPasteMock).toHaveBeenLastCalledWith(false);
+    expect(overlayPasteMock).toHaveBeenLastCalledWith(
+      false,
+      registeredOwners[0]
+    );
 
     Object.assign(persistenceState, { ready: true, loadError: null });
     rendered.rerender(<RepurposeEditor projectId="paste-gating-project" />);
-    expect(overlayPasteMock).toHaveBeenLastCalledWith(true);
+    expect(overlayPasteMock).toHaveBeenLastCalledWith(
+      true,
+      registeredOwners[0]
+    );
+  });
+
+  test("surfaces shared overlay conversion progress and cancellation", () => {
+    render(<RepurposeEditor projectId="overlay-import-project" />);
+
+    act(() => {
+      overlayImportListener.current?.({ phase: "converting", progress: 0.55 });
+    });
+
+    expect(screen.getByText("Convertendo HEVC para H.264 55%")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancelar conversão" }));
+    expect(cancelOverlayImportMock).toHaveBeenCalledWith(registeredOwners[0]);
+  });
+
+  test("a stale editor unmount cannot clear a newer editor owner", () => {
+    const first = render(<RepurposeEditor projectId="overlap-old" />);
+    const oldOwner = registeredOwners[0];
+    const second = render(<RepurposeEditor projectId="overlap-new" />);
+    const newOwner = registeredOwners[1];
+
+    act(() => {
+      overlayListeners.get(newOwner)?.({ phase: "converting", progress: 0.6 });
+    });
+    expect(screen.getByText("Convertendo HEVC para H.264 60%")).toBeInTheDocument();
+
+    first.unmount();
+    expect(releaseOverlayImportOwnerMock).toHaveBeenCalledWith(oldOwner);
+    expect(releaseOverlayImportOwnerMock).not.toHaveBeenCalledWith(newOwner);
+
+    act(() => {
+      overlayListeners.get(newOwner)?.({ phase: "ready", progress: 1 });
+    });
+    expect(screen.getByRole("status")).toHaveTextContent("Pronto");
+    second.unmount();
+  });
+
+  test("shows concise overlay import errors and cancels when editing becomes blocked", () => {
+    const rendered = render(<RepurposeEditor projectId="overlay-error-project" />);
+    act(() => {
+      overlayImportListener.current?.({
+        phase: "error",
+        progress: null,
+        error: "Não foi possível converter o vídeo.",
+      });
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Não foi possível converter o vídeo."
+    );
+
+    persistenceState.saveConflict = {
+      projectId: "overlay-error-project",
+      reason: "BASE_MISMATCH",
+      serverRevision: 3,
+      serverWriterId: "other-window",
+    };
+    rendered.rerender(<RepurposeEditor projectId="overlay-error-project" />);
+    expect(cancelOverlayImportMock).toHaveBeenCalled();
+    expect(clearOverlayImportMock).toHaveBeenCalled();
   });
 
   test("does not mount editing or playback while the project is hydrating", () => {
@@ -191,7 +322,10 @@ describe("RepurposeEditor persistence states", () => {
     );
     expect(screen.getByTestId("editing-surface")).toBeInTheDocument();
     expect(screen.getByTestId("playback-surface")).toBeInTheDocument();
-    expect(overlayPasteMock).toHaveBeenLastCalledWith(true);
+    expect(overlayPasteMock).toHaveBeenLastCalledWith(
+      true,
+      registeredOwners[0]
+    );
     expect(blockBrowserZoomMock).toHaveBeenLastCalledWith(true);
 
     persistenceState.saveConflict = {
@@ -209,7 +343,10 @@ describe("RepurposeEditor persistence states", () => {
     expect(
       screen.getByRole("button", { name: "Salvar uma cópia" })
     ).toBeInTheDocument();
-    expect(overlayPasteMock).toHaveBeenLastCalledWith(false);
+    expect(overlayPasteMock).toHaveBeenLastCalledWith(
+      false,
+      registeredOwners[0]
+    );
     expect(blockBrowserZoomMock).toHaveBeenLastCalledWith(false);
     expect(screen.queryByTestId("editing-surface")).not.toBeInTheDocument();
     expect(screen.queryByTestId("playback-surface")).not.toBeInTheDocument();

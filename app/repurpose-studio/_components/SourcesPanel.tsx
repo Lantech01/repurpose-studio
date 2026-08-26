@@ -24,15 +24,29 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { UploadSimple, Warning, FilmSlate, ImageSquare } from "@phosphor-icons/react";
-import { useRepurposeStore } from "@/lib/repurpose/store";
+import {
+  useRepurposeStore,
+  type MediaReadiness,
+} from "@/lib/repurpose/store";
 import type { FootageMeta } from "@/lib/repurpose/types";
 import {
   buildShortWithStats,
-  makeFootageMeta,
   parseRawWordsFile,
   type RawWordsFile,
 } from "@/lib/repurpose/ingest";
-import { ingestOverlayFiles } from "@/lib/repurpose/overlay-ingest";
+import {
+  ingestOverlayFiles,
+  type OverlayImportOwner,
+} from "@/lib/repurpose/overlay-ingest";
+import {
+  importVideoFile,
+  VideoImportError,
+  videoUrlForWorkingSource,
+} from "@/lib/repurpose/video-import-client";
+import {
+  VideoImportProgress,
+  type VideoImportProgressState,
+} from "./VideoImportProgress";
 
 /** Parse an SRT timestamp "HH:MM:SS,mmm" to seconds. */
 function srtTimeToSec(t: string): number {
@@ -79,19 +93,94 @@ function srtToText(srt: string): string {
     .trim();
 }
 
-export function SourcesPanel() {
+export function SourcesPanel({
+  overlayImportOwner,
+}: {
+  overlayImportOwner?: OverlayImportOwner;
+} = {}) {
   const clips = useRepurposeStore((s) => s.clips);
   const words = useRepurposeStore((s) => s.words);
   const footageMeta = useRepurposeStore((s) => s.footageMeta);
   const hydrating = useRepurposeStore((s) => s.hydrating);
+  const projectEpoch = useRepurposeStore((s) => s.projectEpoch);
   const setClips = useRepurposeStore((s) => s.setClips);
   const setWords = useRepurposeStore((s) => s.setWords);
   const setFootageMeta = useRepurposeStore((s) => s.setFootageMeta);
+  const setMediaReadiness = useRepurposeStore((s) => s.setMediaReadiness);
+  const beginSourceImport = useRepurposeStore((s) => s.beginSourceImport);
+  const endSourceImport = useRepurposeStore((s) => s.endSourceImport);
   const setEditStats = useRepurposeStore((s) => s.setEditStats);
 
   const [ingestError, setIngestError] = useState<string | null>(null);
+  const [videoProgress, setVideoProgress] = useState<
+    Partial<Record<"screen" | "face", VideoImportProgressState>>
+  >({});
   const rawWordsRef = useRef<RawWordsFile | null>(null);
   const finalTranscriptRef = useRef<string>("");
+  const backfilledRef = useRef(false);
+  const autoLoadedRef = useRef(false);
+  const videoImportsRef = useRef<
+    Partial<Record<"screen" | "face", AbortController>>
+  >({});
+  const videoImportGenerationRef = useRef({ screen: 0, face: 0 });
+  const sourceImportTokensRef = useRef<
+    Partial<Record<"screen" | "face", number>>
+  >({});
+  const mountedRef = useRef(true);
+  const videoImportBaselineRef = useRef<{
+    readiness: MediaReadiness;
+    reason: string | null;
+  } | null>(null);
+  const videoImportSucceededRef = useRef(false);
+  const sourceImportEpochRef = useRef(
+    useRepurposeStore.getState().projectEpoch
+  );
+
+  const invalidateSourceImports = useCallback(
+    (releaseOwners: boolean, clearLocalState: boolean) => {
+      videoImportGenerationRef.current.face += 1;
+      videoImportGenerationRef.current.screen += 1;
+      const imports = videoImportsRef.current;
+      const tokens = sourceImportTokensRef.current;
+      videoImportsRef.current = {};
+      sourceImportTokensRef.current = {};
+      videoImportBaselineRef.current = null;
+      videoImportSucceededRef.current = false;
+      imports.face?.abort();
+      imports.screen?.abort();
+      if (releaseOwners) {
+        if (tokens.face !== undefined) {
+          useRepurposeStore.getState().endSourceImport("face", tokens.face);
+        }
+        if (tokens.screen !== undefined) {
+          useRepurposeStore.getState().endSourceImport("screen", tokens.screen);
+        }
+      }
+      if (clearLocalState && mountedRef.current) {
+        setVideoProgress({});
+        setIngestError(null);
+      }
+    },
+    []
+  );
+
+  useEffect(() => {
+    mountedRef.current = true;
+    const unsubscribe = useRepurposeStore.subscribe((state, previous) => {
+      if (state.projectEpoch === previous.projectEpoch) return;
+      sourceImportEpochRef.current = state.projectEpoch;
+      rawWordsRef.current = null;
+      finalTranscriptRef.current = "";
+      backfilledRef.current = false;
+      autoLoadedRef.current = false;
+      invalidateSourceImports(false, true);
+    });
+    return () => {
+      unsubscribe();
+      mountedRef.current = false;
+      invalidateSourceImports(true, false);
+    };
+  }, [invalidateSourceImports]);
 
   // --- Rebuild clips from whatever raw words + final transcript we have -------
   const rebuild = useCallback(() => {
@@ -125,7 +214,6 @@ export function SourcesPanel() {
   // empty". Fetches the raw words matching the restored demo footage and
   // setWords() them (which re-chunks caption blocks). One-shot via
   // backfilledRef, and guarded so a user's own transcript is never clobbered.
-  const backfilledRef = useRef(false);
   useEffect(() => {
     let cancelled = false;
 
@@ -135,12 +223,24 @@ export function SourcesPanel() {
       const projectLoaded = st.clips.length > 0 || !!st.footageMeta;
       if (!projectLoaded || st.words.length > 0) return; // nothing to fix (yet)
       backfilledRef.current = true;
+      const projectEpoch = st.projectEpoch;
       (async () => {
         try {
           const res = await fetch("/repurpose/claude-routines-words.json");
-          if (!res.ok || cancelled) return;
+          if (
+            !res.ok ||
+            cancelled ||
+            useRepurposeStore.getState().projectEpoch !== projectEpoch
+          )
+            return;
           const parsed = parseRawWordsFile(await res.json());
-          if (cancelled || useRepurposeStore.getState().words.length > 0) return;
+          const current = useRepurposeStore.getState();
+          if (
+            cancelled ||
+            current.projectEpoch !== projectEpoch ||
+            current.words.length > 0
+          )
+            return;
           rawWordsRef.current = parsed;
           setWords(parsed.words); // setWords also rebuilds caption blocks
         } catch {
@@ -164,7 +264,6 @@ export function SourcesPanel() {
   // the finished short playing real footage -- no manual file-picking. Guarded
   // so it never clobbers a manually-loaded project or a session-restored one:
   // it only runs when there are no clips AND no footage yet. Runs once.
-  const autoLoadedRef = useRef(false);
   useEffect(() => {
     if (autoLoadedRef.current) return;
     // A saved project is loading from disk (useProjectPersistence set `hydrating`).
@@ -180,6 +279,7 @@ export function SourcesPanel() {
     }
     autoLoadedRef.current = true;
     let cancelled = false;
+    const projectEpoch = useRepurposeStore.getState().projectEpoch;
     (async () => {
       try {
         const [wordsRes, finalRes, manifestRes] = await Promise.all([
@@ -191,7 +291,13 @@ export function SourcesPanel() {
         const rawWords = parseRawWordsFile(await wordsRes.json());
         const finalText = (await finalRes.text()).replace(/\s+/g, " ").trim();
         const manifest = (await manifestRes.json()) as Partial<FootageMeta>;
-        if (cancelled) return;
+        const epochIsCurrent = () =>
+          useRepurposeStore.getState().projectEpoch === projectEpoch;
+        if (
+          cancelled ||
+          !epochIsCurrent()
+        )
+          return;
         // Bail if the user started loading something while we were fetching.
         if (useRepurposeStore.getState().clips.length > 0) return;
 
@@ -203,15 +309,19 @@ export function SourcesPanel() {
           rawWords: rawWords.words,
           finalTranscript: finalText,
         });
+        if (!epochIsCurrent()) return;
         setClips(built);
+        if (!epochIsCurrent()) return;
         setEditStats(stats);
         // Feed the raw words to the store too, so captions can chunk them into
         // on-screen blocks (the manual rebuild path does this; the auto-load
         // path must as well or captions have nothing to draw).
+        if (!epochIsCurrent()) return;
         setWords(rawWords.words);
         // Manifest paths are already streaming URLs (/api/repurpose/video?...),
         // so set footageMeta directly rather than through makeFootageMeta.
         if (manifest.faceCamPath && manifest.screenPath) {
+          if (!epochIsCurrent()) return;
           setFootageMeta({
             faceCamPath: manifest.faceCamPath,
             screenPath: manifest.screenPath,
@@ -233,14 +343,16 @@ export function SourcesPanel() {
     // autoLoadedRef; otherwise a one-shot on mount, guarded internally against
     // re-entry. Other store reads are intentionally omitted.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hydrating]);
+  }, [hydrating, projectEpoch]);
 
   const handleWordsFile = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       if (!file) return;
+      const projectEpoch = useRepurposeStore.getState().projectEpoch;
       try {
         const text = await file.text();
+        if (useRepurposeStore.getState().projectEpoch !== projectEpoch) return;
         // Accept EITHER a pre-parsed words.json OR a raw .srt (what Descript
         // exports). An .srt is parsed into per-word timings in-app so Manthan
         // never has to pre-convert -- he just drops the file Descript gave him.
@@ -256,9 +368,11 @@ export function SourcesPanel() {
         setIngestError(null);
         rebuild();
       } catch (err) {
-        setIngestError(
-          err instanceof Error ? err.message : "Could not read that file"
-        );
+        if (useRepurposeStore.getState().projectEpoch === projectEpoch) {
+          setIngestError(
+            err instanceof Error ? err.message : "Could not read that file"
+          );
+        }
       }
     },
     [rebuild]
@@ -268,7 +382,9 @@ export function SourcesPanel() {
     async (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       if (!file) return;
+      const projectEpoch = useRepurposeStore.getState().projectEpoch;
       const text = await file.text();
+      if (useRepurposeStore.getState().projectEpoch !== projectEpoch) return;
       // Strip SRT block numbers + timestamps to plain narration text; a .txt
       // just collapses whitespace.
       finalTranscriptRef.current = file.name.toLowerCase().endsWith(".srt")
@@ -279,26 +395,133 @@ export function SourcesPanel() {
     [rebuild]
   );
 
-  // --- Point the source videos at picked media (object URLs) -----------------
+  // --- Import source videos through the compatibility pipeline ---------------
   const handleMediaFiles = useCallback(
-    (which: "screen" | "face") => (e: React.ChangeEvent<HTMLInputElement>) => {
+    (which: "screen" | "face") => async (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
+      e.target.value = "";
       if (!file) return;
-      const url = URL.createObjectURL(file);
-      const raw = rawWordsRef.current;
-      const existing = footageMeta;
-      const next = makeFootageMeta({
-        faceCamPath: which === "face" ? url : existing?.faceCamPath ?? "",
-        screenPath: which === "screen" ? url : existing?.screenPath ?? "",
-        rawWords: raw?.words ?? [],
-        fps: existing?.fps,
-        width: existing?.width,
-        height: existing?.height,
-        durationSec: existing?.durationSec,
-      });
-      setFootageMeta(next);
+
+      const stateAtStart = useRepurposeStore.getState();
+      if (sourceImportEpochRef.current !== stateAtStart.projectEpoch) {
+        sourceImportEpochRef.current = stateAtStart.projectEpoch;
+        invalidateSourceImports(false, true);
+      }
+      const previousController = videoImportsRef.current[which];
+      const generation = ++videoImportGenerationRef.current[which];
+      const controller = new AbortController();
+      const projectEpoch = stateAtStart.projectEpoch;
+      const isCurrent = () =>
+        mountedRef.current &&
+        videoImportGenerationRef.current[which] === generation &&
+        videoImportsRef.current[which] === controller &&
+        useRepurposeStore.getState().projectEpoch === projectEpoch;
+      if (!videoImportBaselineRef.current) {
+        videoImportBaselineRef.current = {
+          readiness: stateAtStart.mediaReadiness,
+          reason: stateAtStart.playbackBlockedReason,
+        };
+        videoImportSucceededRef.current = false;
+      }
+      videoImportsRef.current[which] = controller;
+      previousController?.abort();
+      const importToken = beginSourceImport(which);
+      sourceImportTokensRef.current[which] = importToken;
+      setIngestError(null);
+      setMediaReadiness("loading");
+      try {
+        const source = await importVideoFile(file, {
+          role: which,
+          signal: controller.signal,
+          onProgress: (state) => {
+            if (isCurrent()) {
+              setVideoProgress((current) => ({ ...current, [which]: state }));
+            }
+          },
+        });
+        if (controller.signal.aborted || !isCurrent()) {
+          return;
+        }
+
+        const existing = useRepurposeStore.getState().footageMeta;
+        const url = videoUrlForWorkingSource(source);
+        videoImportSucceededRef.current = true;
+        setFootageMeta({
+          faceCamPath: which === "face" ? url : existing?.faceCamPath ?? "",
+          screenPath: which === "screen" ? url : existing?.screenPath ?? "",
+          faceCamSource:
+            which === "face" ? source : existing?.faceCamSource,
+          screenSource:
+            which === "screen" ? source : existing?.screenSource,
+          fps: source.inspection.video.fps,
+          width: source.inspection.video.width,
+          height: source.inspection.video.height,
+          durationSec: source.inspection.durationSec,
+        });
+        if (!isCurrent()) return;
+        setMediaReadiness("loading");
+      } catch (error) {
+        const cancelled =
+          controller.signal.aborted ||
+          (error instanceof VideoImportError &&
+            [
+              "VIDEO_IMPORT_CANCELLED",
+              "COMPATIBILITY_CANCELLED",
+              "MEDIA_PROBE_ABORTED",
+            ].includes(error.code));
+        if (!isCurrent()) {
+          return;
+        }
+        if (!cancelled) {
+          const message =
+            error instanceof VideoImportError
+              ? error.message
+              : "Não foi possível importar o vídeo.";
+          setVideoProgress((current) => ({
+            ...current,
+            [which]: {
+              phase: "error",
+              progress: null,
+              error: message,
+            },
+          }));
+        }
+      } finally {
+        endSourceImport(which, importToken);
+        if (
+          mountedRef.current &&
+          videoImportGenerationRef.current[which] === generation &&
+          videoImportsRef.current[which] === controller
+        ) {
+          delete videoImportsRef.current[which];
+          delete sourceImportTokensRef.current[which];
+          if (Object.keys(videoImportsRef.current).length === 0) {
+            const baseline = videoImportBaselineRef.current;
+            const epochIsCurrent =
+              useRepurposeStore.getState().projectEpoch === projectEpoch;
+            if (epochIsCurrent && videoImportSucceededRef.current) {
+              const meta = useRepurposeStore.getState().footageMeta;
+              setMediaReadiness(
+                meta?.faceCamPath.trim() && meta.screenPath.trim()
+                  ? "loading"
+                  : "idle"
+              );
+            } else if (epochIsCurrent && baseline) {
+              setMediaReadiness(baseline.readiness, baseline.reason ?? undefined);
+            }
+            videoImportBaselineRef.current = null;
+            videoImportSucceededRef.current = false;
+          }
+        }
+      }
     },
-    [footageMeta, setFootageMeta]
+    [
+      beginSourceImport,
+      endSourceImport,
+      invalidateSourceImports,
+      setFootageMeta,
+      setMediaReadiness,
+    ]
   );
 
   // --- Add a free-floating overlay (image/video) at the current playhead ------
@@ -311,10 +534,15 @@ export function SourcesPanel() {
       const atTime = useRepurposeStore.getState().playhead;
       // Reset the input BEFORE the await so re-picking the same file re-fires.
       const input = e.target;
-      await ingestOverlayFiles(files, atTime);
+      await ingestOverlayFiles(
+        files,
+        atTime,
+        undefined,
+        overlayImportOwner
+      ).catch(() => undefined);
       input.value = "";
     },
-    []
+    [overlayImportOwner]
   );
 
   // Footage is "ready" once we have both real footage AND a transcript to edit.
@@ -338,6 +566,15 @@ export function SourcesPanel() {
         <IngestButton compact label="Screen" accept="video/*" onChange={handleMediaFiles("screen")} />
         <IngestButton compact label="Face" accept="video/*" onChange={handleMediaFiles("face")} />
       </div>
+      {(["screen", "face"] as const).map((role) =>
+        videoProgress[role] ? (
+          <VideoImportProgress
+            key={role}
+            state={videoProgress[role]}
+            onCancel={() => videoImportsRef.current[role]?.abort()}
+          />
+        ) : null
+      )}
       {/* Add a free-floating overlay (image/video) at the playhead. Coral so it
           reads as the "add a layer" action, distinct from the source ingests. */}
       <AddMediaButton onChange={handleAddMedia} />

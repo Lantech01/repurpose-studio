@@ -528,6 +528,50 @@ describe("PreviewCanvas transport", () => {
     expect(useRepurposeStore.getState().mediaReadiness).toBe("ready");
   });
 
+  test("records concurrent source canplay events and publishes ready when the final owner settles", () => {
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const media = mediaFor(container);
+    const screenToken = useRepurposeStore.getState().beginSourceImport("screen");
+    const faceToken = useRepurposeStore.getState().beginSourceImport("face");
+    act(() => useRepurposeStore.getState().setMediaReadiness("loading"));
+
+    decode(media.screen[0]);
+    act(() =>
+      useRepurposeStore.getState().endSourceImport("screen", screenToken)
+    );
+    decode(media.face[0]);
+
+    expect(useRepurposeStore.getState().mediaReadiness).toBe("loading");
+    act(() => useRepurposeStore.getState().endSourceImport("face", faceToken));
+    expect(useRepurposeStore.getState().mediaReadiness).toBe("ready");
+  });
+
+  test("records a concurrent source error and publishes it when the final owner settles", () => {
+    const { container } = render(
+      createElement(PreviewCanvas, { frameScheduler })
+    );
+    const media = mediaFor(container);
+    const screenToken = useRepurposeStore.getState().beginSourceImport("screen");
+    const faceToken = useRepurposeStore.getState().beginSourceImport("face");
+    act(() => useRepurposeStore.getState().setMediaReadiness("loading"));
+
+    decode(media.screen[0]);
+    fireEvent.error(media.face[0]);
+    act(() =>
+      useRepurposeStore.getState().endSourceImport("screen", screenToken)
+    );
+    expect(useRepurposeStore.getState().mediaReadiness).toBe("loading");
+
+    act(() => useRepurposeStore.getState().endSourceImport("face", faceToken));
+    expect(useRepurposeStore.getState()).toMatchObject({
+      mediaReadiness: "error",
+      playbackBlockedReason:
+        "Chrome could not load this video. Re-import it to create a compatible copy.",
+    });
+  });
+
   test("keeps an active overlay failure over base source loading and ready events", () => {
     const { container } = render(
       createElement(PreviewCanvas, { frameScheduler })

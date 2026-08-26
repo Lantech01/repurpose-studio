@@ -62,6 +62,7 @@ import {
 const MIN_CLIP_DURATION = 1 / 30; // seconds; never let a trim invert a clip
 
 export type MediaReadiness = "idle" | "loading" | "ready" | "error";
+export type SourceImportRole = "screen" | "face";
 
 const MEDIA_LOADING_REASON = "Media is still loading.";
 const MEDIA_ERROR_REASON = "Media could not be loaded.";
@@ -159,6 +160,8 @@ function nextMarkerId(): string {
   markerIdCounter += 1;
   return `mk-${markerIdCounter}`;
 }
+
+let sourceImportToken = 0;
 
 // Monotonic, process-unique overlay id source. Overlays are a separate top-level
 // concept (never a Clip); like markers they need a stable id independent of
@@ -1193,6 +1196,8 @@ interface RepurposeState {
    */
   hydrating: boolean;
   setHydrating: (hydrating: boolean) => void;
+  /** Monotonic transient identity for the in-memory project lifecycle. */
+  projectEpoch: number;
 
   /**
    * Reset the ENTIRE editor to the empty-project baseline: no clips/words/footage,
@@ -1244,6 +1249,10 @@ interface RepurposeState {
     state: MediaReadiness,
     reason?: string | null
   ) => void;
+  /** Active source import tokens. Transient coordination for preview readiness. */
+  sourceImportOwners: Record<SourceImportRole, number | null>;
+  beginSourceImport: (role: SourceImportRole) => number;
+  endSourceImport: (role: SourceImportRole, token: number) => void;
 
 
   /**
@@ -1572,6 +1581,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
 
   hydrating: false,
   setHydrating: (hydrating) => set({ hydrating }),
+  projectEpoch: 0,
 
   // Wipe the whole editor back to the initial-state baseline (mirrors the literal
   // above, field for field, for everything the project snapshot touches + undo
@@ -1617,6 +1627,8 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
       footageMeta: null,
       mediaReadiness: "idle",
       playbackBlockedReason: null,
+      sourceImportOwners: { screen: null, face: null },
+      projectEpoch: get().projectEpoch + 1,
       editStats: null,
     });
   },
@@ -1666,6 +1678,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   footageMeta: null,
   mediaReadiness: "idle",
   playbackBlockedReason: null,
+  sourceImportOwners: { screen: null, face: null },
   setFootageMeta: (meta) => {
     const normalizedMeta = meta
       ? {
@@ -1717,6 +1730,26 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
       playbackBlockedReason,
       isPlaying: nextPlaying,
       playbackRate: nextRate,
+    });
+  },
+  beginSourceImport: (role) => {
+    const token = ++sourceImportToken;
+    set({
+      sourceImportOwners: {
+        ...get().sourceImportOwners,
+        [role]: token,
+      },
+    });
+    return token;
+  },
+  endSourceImport: (role, token) => {
+    const owners = get().sourceImportOwners;
+    if (owners[role] !== token) return;
+    set({
+      sourceImportOwners: {
+        ...owners,
+        [role]: null,
+      },
     });
   },
 

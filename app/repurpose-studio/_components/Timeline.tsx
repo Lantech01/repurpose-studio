@@ -19,7 +19,10 @@ import {
 import { useRepurposeStore } from "@/lib/repurpose/store";
 import { sourceToTimelineTime, timelineToSourceTime } from "@/lib/repurpose/time-map";
 import type { Clip, Overlay } from "@/lib/repurpose/types";
-import { ingestOverlayFiles } from "@/lib/repurpose/overlay-ingest";
+import {
+  ingestOverlayFiles,
+  type OverlayImportOwner,
+} from "@/lib/repurpose/overlay-ingest";
 import { ClipBlock } from "./ClipBlock";
 import { OverlayBlock, useOverlayThumbnails } from "./OverlayBlock";
 import { TransportBar } from "./TransportBar";
@@ -125,7 +128,10 @@ const TRACK_LABELS: { key: "clip"; label: string; icon: typeof MonitorPlay }[] =
  * trimClip takes an ABSOLUTE source target so a live drag recomputing from a
  * frozen anchor can never compound.
  */
-export function Timeline({ className }: TimelineProps) {
+export function Timeline({
+  className,
+  overlayImportOwner,
+}: TimelineProps & { overlayImportOwner?: OverlayImportOwner }) {
   const clips = useRepurposeStore((s) => s.clips);
   const playhead = useRepurposeStore((s) => s.playhead);
   const duration = useRepurposeStore((s) => s.duration);
@@ -409,9 +415,14 @@ export function Timeline({ className }: TimelineProps) {
       const files = e.dataTransfer.files;
       if (!files || files.length === 0) return;
       const atTime = snappedDropTime(e.clientX);
-      void ingestOverlayFiles(files, atTime);
+      void ingestOverlayFiles(
+        files,
+        atTime,
+        undefined,
+        overlayImportOwner
+      ).catch(() => undefined);
     },
-    [dragCarriesFiles, snappedDropTime]
+    [dragCarriesFiles, overlayImportOwner, snappedDropTime]
   );
 
   // ---- zoom -----------------------------------------------------------------
