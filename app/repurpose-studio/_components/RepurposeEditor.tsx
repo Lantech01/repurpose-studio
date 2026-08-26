@@ -109,16 +109,25 @@ function PreviewPanel() {
       // stage. The canvas itself stays pure black (the real reel fill).
       className="flex h-full min-h-0 flex-col items-center justify-center bg-[#1F0608] p-6"
     >
-      {/* The 9:16 preview is HEIGHT-constrained so it never overflows the
-          column (which is what pushed the FACE half past the timeline before).
-          The wrapper is h-full with a 9:16 aspect-ratio, so the browser derives
-          its WIDTH from the available height -- capped at 340px on tall
-          viewports. PreviewCanvas (w-full + its own ratio) then fills it.
+      {/* The 9:16 preview is constrained so it never overflows the column
+          (which is what pushed the FACE half past the timeline before).
+          Container units select the tightest of the available width, height,
+          and 340px cap without setting both dimensions (which would distort
+          the aspect ratio). PreviewCanvas then fills that wrapper.
           min-h-0 lets the flex child actually shrink to the column height.
           The framing "how it works" copy lives in the Inspector (an ⓘ fold) so
           it never eats the center canvas -- see FramingHelp below. */}
-      <div className="flex min-h-0 w-full flex-1 items-center justify-center">
-        <div className="relative h-full max-w-[340px] shrink" style={{ aspectRatio: "9 / 16" }}>
+      <div
+        className="flex min-h-0 w-full flex-1 items-center justify-center"
+        style={{ containerType: "size" }}
+      >
+        <div
+          className="relative shrink-0"
+          style={{
+            aspectRatio: "9 / 16",
+            width: "min(340px, 100cqw, calc(100cqh * 9 / 16))",
+          }}
+        >
           <PreviewCanvas className="!h-full" />
         </div>
       </div>

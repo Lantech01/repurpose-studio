@@ -26,6 +26,9 @@ test("HEVC project converts once and reopens with playable working masters", asy
       "Convertendo HEVC para H.264"
     );
     expect(browserErrors.pageErrors, "page errors after HEVC import").toEqual([]);
+    const previewBox = await page.locator("#preview-panel canvas").first().boundingBox();
+    expect(previewBox).not.toBeNull();
+    expect(previewBox!.width / previewBox!.height).toBeCloseTo(9 / 16, 2);
     await expect(page.locator("#preview-panel canvas").first()).toHaveScreenshot("hevc-ready.png", {
       animations: "disabled",
       maxDiffPixelRatio: 0.03,
