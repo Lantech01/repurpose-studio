@@ -400,7 +400,17 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
   // first real content and router.replaces the URL to it. Returns the resolved
   // project name (derived from the transcript, then frozen) and
   // `footageNeedsReimport` (true when restored footage used dead blob: URLs).
-  const { footageNeedsReimport, projectName } = useProjectPersistence(projectId);
+  const {
+    footageNeedsReimport,
+    projectName,
+    ready,
+    loadError,
+    saveError,
+    retryLoad,
+    saveConflict,
+    resolveSaveConflict,
+  } = useProjectPersistence(projectId);
+  const editorEnabled = ready && !loadError && !saveConflict;
 
   // Build the selector options: each Short reads "<Project Title> · Short N".
   // Before a transcript loads there's no title yet, so fall back to the plain
@@ -418,12 +428,12 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
   // the studio is open -- zooming the timeline must never also zoom the app.
   // React's root wheel listener is passive, so this needs the native
   // non-passive document listener inside the hook.
-  useBlockBrowserZoom();
+  useBlockBrowserZoom(editorEnabled);
 
   // Paste an image/video from the clipboard -> overlay at the playhead. Gated
   // off inputs / textareas / contentEditable / the transcript panel so a normal
   // text paste there still runs natively.
-  useOverlayPaste();
+  useOverlayPaste(editorEnabled);
 
   const durationLabel = useMemo(() => formatDuration(duration), [duration]);
 
@@ -485,6 +495,98 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
     }
   }, [exporting, selectedShortId, resolution, shortOptions]);
 
+  if (!ready || loadError || saveConflict) {
+    return (
+      <div className="fixed inset-0 flex items-center justify-center bg-background p-6 text-foreground dark">
+        {saveConflict ? (
+          <div
+            role="alert"
+            className="w-full max-w-2xl rounded-lg border border-amber-500/40 bg-card p-5 shadow-2xl"
+          >
+            <div className="flex items-start gap-3">
+              <Warning
+                size={20}
+                weight="fill"
+                className="mt-0.5 shrink-0 text-amber-400"
+              />
+              <div className="min-w-0 flex-1">
+                <p className="text-sm leading-relaxed text-amber-100">
+                  {saveConflict.reason === "PROJECT_FILE_CORRUPT" ? (
+                    <>
+                      <span className="font-semibold">
+                        O arquivo do projeto está corrompido.
+                      </span>{" "}
+                      Salve uma cópia para preservar suas alterações ou recarregue
+                      para tentar recuperar o arquivo original.
+                    </>
+                  ) : (
+                    <>
+                      <span className="font-semibold">Conflito ao salvar.</span> O
+                      projeto foi alterado em outra janela. Recarregue a versão mais
+                      recente ou preserve suas alterações em uma cópia.
+                    </>
+                  )}
+                </p>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void resolveSaveConflict("reload")}
+                    className="rounded-md border border-amber-400/40 px-3 py-2 text-xs font-semibold text-amber-100 transition-colors hover:bg-amber-400/10"
+                  >
+                    Recarregar projeto
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void resolveSaveConflict("save-copy")}
+                    className="rounded-md bg-amber-400 px-3 py-2 text-xs font-semibold text-amber-950 transition-opacity hover:opacity-90"
+                  >
+                    Salvar uma cópia
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : loadError ? (
+          <div
+            role="alert"
+            className="w-full max-w-md rounded-lg border border-red-500/40 bg-card p-5 shadow-2xl"
+          >
+            <div className="flex items-start gap-3">
+              <Warning
+                size={20}
+                weight="fill"
+                className="mt-0.5 shrink-0 text-red-500"
+              />
+              <div className="min-w-0 flex-1">
+                <h1 className="text-sm font-semibold text-foreground">
+                  Não foi possível carregar o projeto
+                </h1>
+                <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                  {loadError}
+                </p>
+                <button
+                  type="button"
+                  onClick={retryLoad}
+                  className="mt-4 rounded-md bg-primary px-3 py-2 text-xs font-semibold text-primary-foreground transition-opacity hover:opacity-90"
+                >
+                  Tentar novamente
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div
+            role="status"
+            aria-live="polite"
+            className="rounded-lg border border-border bg-card px-5 py-4 text-sm text-muted-foreground shadow-xl"
+          >
+            Carregando projeto...
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
     // FIXED SHELL: position:fixed + inset-0 takes the editor out of document
     // flow entirely, so the body has no scrollable height -- the page can never
@@ -524,6 +626,16 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
           >
             Dismiss
           </button>
+        </div>
+      )}
+
+      {saveError && (
+        <div
+          role="alert"
+          className="flex shrink-0 items-center gap-2.5 border-b border-red-500/40 bg-red-500/10 px-4 py-2.5 text-xs text-red-200"
+        >
+          <Warning size={16} weight="fill" className="shrink-0 text-red-400" />
+          <p className="leading-relaxed">{saveError}</p>
         </div>
       )}
 

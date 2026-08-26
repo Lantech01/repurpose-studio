@@ -13,7 +13,13 @@
 // by a Node script; the TranscriptPanel wires its output into the store.
 // ===========================================================================
 
-import type { Clip, ClipTransition, FootageMeta, Word } from "./types";
+import type {
+  Clip,
+  ClipTransition,
+  FootageMeta,
+  VideoSourceRecord,
+  Word,
+} from "./types";
 import {
   matchTakes,
   detectSilences,
@@ -326,6 +332,11 @@ export function buildShortWithStats(input: IngestInput): {
  */
 export function footageUrlForPath(ref: string): string {
   if (ref === "") return ref;
+  // A Windows drive prefix (`C:`) superficially looks like a URI scheme. Handle
+  // drive-letter paths before the generic scheme check so they are streamed.
+  if (/^[A-Za-z]:[\\/]/.test(ref)) {
+    return `/api/repurpose/video?path=${encodeURIComponent(ref)}`;
+  }
   // blob:, data:, http:, https:, file: ... anything with a scheme, plus
   // protocol-relative (//host) and already-app-relative (/...) URLs.
   if (/^[a-z][a-z0-9+.-]*:/i.test(ref) || ref.startsWith("//") || ref.startsWith("/api/")) {
@@ -351,6 +362,29 @@ export function footageUrlForPath(ref: string): string {
   return ref;
 }
 
+/** Recover a raw local path from a persisted video endpoint URL or OS path. */
+export function footagePathFromUrl(ref: string | undefined): string | null {
+  if (!ref || ref.startsWith("blob:")) return null;
+  if (ref.startsWith("/api/repurpose/video?")) {
+    try {
+      return new URL(ref, "http://localhost").searchParams.get("path");
+    } catch {
+      return null;
+    }
+  }
+  if (
+    /^[A-Za-z]:[\\/]/.test(ref) ||
+    ref.startsWith("/Users/") ||
+    ref.startsWith("/home/") ||
+    ref.startsWith("/var/") ||
+    ref.startsWith("/tmp/") ||
+    ref.startsWith("/private/")
+  ) {
+    return ref;
+  }
+  return null;
+}
+
 /**
  * Derive a FootageMeta from user-picked media plus the raw words. `durationSec`
  * defaults to the last word's end when a real media duration isn't known yet
@@ -365,6 +399,8 @@ export function footageUrlForPath(ref: string): string {
 export function makeFootageMeta(params: {
   faceCamPath: string;
   screenPath: string;
+  faceCamSource?: VideoSourceRecord;
+  screenSource?: VideoSourceRecord;
   rawWords: Word[];
   fps?: number;
   width?: number;
@@ -374,8 +410,18 @@ export function makeFootageMeta(params: {
   const { faceCamPath, screenPath, rawWords } = params;
   const lastEnd = rawWords.length > 0 ? rawWords[rawWords.length - 1].end : 0;
   return {
-    faceCamPath: footageUrlForPath(faceCamPath),
-    screenPath: footageUrlForPath(screenPath),
+    faceCamPath: footageUrlForPath(
+      params.faceCamSource?.workingPath ?? faceCamPath
+    ),
+    screenPath: footageUrlForPath(
+      params.screenSource?.workingPath ?? screenPath
+    ),
+    ...(params.faceCamSource
+      ? { faceCamSource: params.faceCamSource }
+      : {}),
+    ...(params.screenSource
+      ? { screenSource: params.screenSource }
+      : {}),
     fps: params.fps ?? 30,
     width: params.width ?? 1920,
     height: params.height ?? 1080,

@@ -28,8 +28,10 @@
 
 import { useEffect } from "react";
 
-export function useBlockBrowserZoom(): void {
+export function useBlockBrowserZoom(enabled: boolean): void {
   useEffect(() => {
+    if (!enabled) return;
+
     const onWheel = (e: WheelEvent) => {
       // Plain scroll must stay native (timeline pan, panel scrolling); only
       // the zoom chord is intercepted.
@@ -62,5 +64,5 @@ export function useBlockBrowserZoom(): void {
       document.removeEventListener("gesturechange", onGesture);
       document.removeEventListener("gestureend", onGesture);
     };
-  }, []);
+  }, [enabled]);
 }

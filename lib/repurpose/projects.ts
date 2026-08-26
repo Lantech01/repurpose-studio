@@ -13,6 +13,7 @@ import 'server-only';
 // ===========================================================================
 
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -27,6 +28,11 @@ export const PROJECTS_DIR = path.join(
 // Single path segment: lowercase alnum start, then alnum/hyphen, 1..100 chars.
 // Forbids `/ \ . ..` and traversal because none of those characters match.
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,99}$/;
+const LOCK_OWNER_FILE = 'owner.json';
+const LOCK_RETRY_MIN_MS = 10;
+const LOCK_RETRY_JITTER_MS = 15;
+const LOCK_WAIT_TIMEOUT_MS = 5_000;
+const LOCK_OWNER_GRACE_MS = 1_000;
 
 export function isValidProjectId(id: unknown): id is string {
   return (
@@ -40,6 +46,11 @@ export interface ProjectFile {
   createdAt: string;
   updatedAt: string;
   durationSec: number;
+  saveRevision: number;
+  saveWriterId: string | null;
+  saveWriterBaseRevision: number;
+  createRequestId: string | null;
+  createWriterId: string | null;
   snapshot: ProjectSnapshot;
 }
 
@@ -54,6 +65,176 @@ function ensureDir(): void {
 
 function filePath(id: string): string {
   return path.join(PROJECTS_DIR, `${id}.json`);
+}
+
+function lockPath(id: string): string {
+  return path.join(PROJECTS_DIR, `.${id}.lock`);
+}
+
+interface ProjectLockOwner {
+  pid: number;
+  token: string;
+  acquiredAt: string;
+}
+
+export class ProjectMutationLockTimeoutError extends Error {
+  readonly code = 'PROJECT_MUTATION_LOCK_TIMEOUT';
+
+  constructor(readonly projectId: string) {
+    super(`Timed out waiting for the project mutation lock: ${projectId}`);
+    this.name = 'ProjectMutationLockTimeoutError';
+  }
+}
+
+function isErrnoCode(error: unknown, code: string): boolean {
+  return (
+    error instanceof Error &&
+    'code' in error &&
+    (error as NodeJS.ErrnoException).code === code
+  );
+}
+
+function readLockOwner(projectLockPath: string): ProjectLockOwner | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(
+      fs.readFileSync(path.join(projectLockPath, LOCK_OWNER_FILE), 'utf8'),
+    );
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const owner = parsed as Record<string, unknown>;
+  if (
+    typeof owner.pid !== 'number' ||
+    !Number.isSafeInteger(owner.pid) ||
+    owner.pid <= 0 ||
+    typeof owner.token !== 'string' ||
+    owner.token.length < 8 ||
+    typeof owner.acquiredAt !== 'string' ||
+    !Number.isFinite(Date.parse(owner.acquiredAt))
+  ) {
+    return null;
+  }
+  return owner as unknown as ProjectLockOwner;
+}
+
+function ownerProcessIsDefinitelyDead(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    // EPERM means the process exists but cannot be signalled. Anything other
+    // than ESRCH is likewise insufficient evidence to steal its lock.
+    return isErrnoCode(error, 'ESRCH');
+  }
+}
+
+function recoverDeadLock(projectLockPath: string): boolean {
+  const owner = readLockOwner(projectLockPath);
+  if (owner) {
+    if (!ownerProcessIsDefinitelyDead(owner.pid)) return false;
+  } else {
+    // mkdir happens before owner.json is published. A contender must allow
+    // that short publication window, but an old ownerless/malformed directory
+    // is a crash artifact and would otherwise block every save forever.
+    let ageMs: number;
+    try {
+      ageMs = Date.now() - fs.statSync(projectLockPath).mtimeMs;
+    } catch (error) {
+      return isErrnoCode(error, 'ENOENT');
+    }
+    if (ageMs < LOCK_OWNER_GRACE_MS) return false;
+  }
+
+  // Rename first so two recovery contenders cannot delete a newly acquired
+  // lock at the original path. Directory rename is atomic on the same volume
+  // and works on Windows without relying on POSIX advisory locking.
+  const quarantinePath = `${projectLockPath}.dead.${process.pid}.${randomUUID()}`;
+  try {
+    fs.renameSync(projectLockPath, quarantinePath);
+  } catch (error) {
+    return isErrnoCode(error, 'ENOENT');
+  }
+  fs.rmSync(quarantinePath, {
+    recursive: true,
+    force: true,
+    maxRetries: 3,
+    retryDelay: 10,
+  });
+  return true;
+}
+
+function releaseProjectLock(
+  projectLockPath: string,
+  ownerToken: string,
+): void {
+  const owner = readLockOwner(projectLockPath);
+  if (owner?.token !== ownerToken) return;
+  fs.rmSync(projectLockPath, {
+    recursive: true,
+    force: true,
+    maxRetries: 3,
+    retryDelay: 10,
+  });
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Serialize one project's read/validate/write mutation across module reloads
+ * and server processes. A lock owned by a live PID is never stolen based on
+ * age alone; only an owner that the OS reports as absent is recovered.
+ */
+export async function withProjectMutationLock<T>(
+  projectId: string,
+  mutation: () => Promise<T> | T,
+): Promise<T> {
+  if (!isValidProjectId(projectId)) {
+    throw new TypeError('valid project id required for mutation lock');
+  }
+  ensureDir();
+  const projectLockPath = lockPath(projectId);
+  const owner: ProjectLockOwner = {
+    pid: process.pid,
+    token: randomUUID(),
+    acquiredAt: new Date().toISOString(),
+  };
+  const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS;
+
+  while (true) {
+    try {
+      fs.mkdirSync(projectLockPath);
+      try {
+        fs.writeFileSync(
+          path.join(projectLockPath, LOCK_OWNER_FILE),
+          JSON.stringify(owner),
+          { encoding: 'utf8', flag: 'wx' },
+        );
+      } catch (error) {
+        fs.rmSync(projectLockPath, { recursive: true, force: true });
+        throw error;
+      }
+      break;
+    } catch (error) {
+      if (!isErrnoCode(error, 'EEXIST')) throw error;
+      if (recoverDeadLock(projectLockPath)) continue;
+      if (Date.now() >= deadline) {
+        throw new ProjectMutationLockTimeoutError(projectId);
+      }
+      await delay(
+        LOCK_RETRY_MIN_MS + Math.floor(Math.random() * LOCK_RETRY_JITTER_MS),
+      );
+    }
+  }
+
+  try {
+    return await mutation();
+  } finally {
+    releaseProjectLock(projectLockPath, owner.token);
+  }
 }
 
 /**
@@ -82,12 +263,48 @@ function readFileSafe(fp: string): ProjectFile | null {
   if (typeof p.updatedAt !== 'string') return null;
   if (typeof p.durationSec !== 'number') return null;
   if (!p.snapshot || typeof p.snapshot !== 'object') return null;
+  const saveRevisionValue = p.saveRevision ?? p.revision;
+  const saveRevision =
+    typeof saveRevisionValue === 'number' &&
+    Number.isSafeInteger(saveRevisionValue) &&
+    saveRevisionValue >= 0
+      ? saveRevisionValue
+      : 0;
+  const saveWriterId =
+    typeof p.saveWriterId === 'string' &&
+    /^[A-Za-z0-9_-]{8,128}$/.test(p.saveWriterId)
+      ? p.saveWriterId
+      : null;
+  const saveWriterBaseRevision =
+    saveWriterId !== null &&
+    typeof p.saveWriterBaseRevision === 'number' &&
+    Number.isSafeInteger(p.saveWriterBaseRevision) &&
+    p.saveWriterBaseRevision >= 0 &&
+    p.saveWriterBaseRevision <= saveRevision
+      ? p.saveWriterBaseRevision
+      : saveRevision;
+  const createWriterId =
+    typeof p.createWriterId === 'string' &&
+    /^[A-Za-z0-9_-]{8,128}$/.test(p.createWriterId)
+      ? p.createWriterId
+      : null;
+  const createRequestId =
+    createWriterId !== null &&
+    typeof p.createRequestId === 'string' &&
+    /^[A-Za-z0-9_-]{16,128}$/.test(p.createRequestId)
+      ? p.createRequestId
+      : null;
   return {
     id: p.id,
     name: p.name,
     createdAt: p.createdAt,
     updatedAt: p.updatedAt,
     durationSec: p.durationSec,
+    saveRevision,
+    saveWriterId,
+    saveWriterBaseRevision,
+    createRequestId,
+    createWriterId: createRequestId ? createWriterId : null,
     snapshot: p.snapshot as ProjectSnapshot,
   };
 }
@@ -132,14 +349,50 @@ export function readProject(id: string): ProjectFile | null {
   return readFileSafe(filePath(id));
 }
 
-/** Upsert a project file, last-write-wins. */
+/** Upsert a project through an atomic same-directory rename. */
 export function writeProject(file: ProjectFile): void {
   ensureDir();
-  fs.writeFileSync(
-    filePath(file.id),
-    JSON.stringify(file, null, 2) + '\n',
-    'utf8',
+  const destination = filePath(file.id);
+  const temporary = path.join(
+    PROJECTS_DIR,
+    `.${file.id}.${process.pid}.${randomUUID()}.tmp`,
   );
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(file, null, 2) + '\n', 'utf8');
+    fs.renameSync(temporary, destination);
+  } finally {
+    try {
+      fs.unlinkSync(temporary);
+    } catch {
+      // The rename consumed the temporary file; cleanup matters only on failure.
+    }
+  }
+}
+
+/** Whether the requested project path exists, even when its JSON is corrupt. */
+export function projectFileExists(id: string): boolean {
+  if (!isValidProjectId(id)) return false;
+  ensureDir();
+  return fs.existsSync(filePath(id));
+}
+
+/** Resolve a keyed create retry to the project already committed for that key. */
+export function findProjectByCreateRequestId(
+  createRequestId: string,
+): ProjectFile | null {
+  ensureDir();
+  let names: string[];
+  try {
+    names = fs.readdirSync(PROJECTS_DIR).sort();
+  } catch {
+    return null;
+  }
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    const project = readFileSafe(path.join(PROJECTS_DIR, name));
+    if (project?.createRequestId === createRequestId) return project;
+  }
+  return null;
 }
 
 /**
@@ -169,8 +422,10 @@ export function uniqueId(base: string): string {
   ensureDir();
   if (!fs.existsSync(filePath(base))) return base;
   for (let n = 2; n <= 10000; n++) {
-    const candidate = `${base}-${n}`;
+    const suffix = `-${n}`;
+    const candidate = `${base.slice(0, 100 - suffix.length)}${suffix}`;
     if (!fs.existsSync(filePath(candidate))) return candidate;
   }
-  return `${base}-${Date.now()}`;
+  const suffix = `-${Date.now()}`;
+  return `${base.slice(0, 100 - suffix.length)}${suffix}`;
 }

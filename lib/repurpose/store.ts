@@ -15,10 +15,11 @@ import type {
   OverlayTransform,
   SelectedObject,
   SfxTrack,
+  VideoSourceRecord,
   Word,
 } from "./types";
 import type { EditStats } from "./ingest";
-import { DEFAULT_SMART_TRANSITION } from "./ingest";
+import { DEFAULT_SMART_TRANSITION, footageUrlForPath } from "./ingest";
 import type {
   SnapGuide,
   PreviewRect,
@@ -1388,6 +1389,7 @@ interface RepurposeState {
     kind: "image" | "video";
     src: string;
     sourcePath?: string;
+    videoSource?: VideoSourceRecord;
     naturalWidth: number;
     naturalHeight: number;
     /** Playhead / drop time -> timelineStart (clamped to [0, duration]). */
@@ -1665,11 +1667,22 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   mediaReadiness: "idle",
   playbackBlockedReason: null,
   setFootageMeta: (meta) => {
+    const normalizedMeta = meta
+      ? {
+          ...meta,
+          faceCamPath: meta.faceCamSource
+            ? footageUrlForPath(meta.faceCamSource.workingPath)
+            : meta.faceCamPath,
+          screenPath: meta.screenSource
+            ? footageUrlForPath(meta.screenSource.workingPath)
+            : meta.screenPath,
+        }
+      : null;
     const hasBothPaths = Boolean(
-      meta?.faceCamPath.trim() && meta.screenPath.trim()
+      normalizedMeta?.faceCamPath.trim() && normalizedMeta.screenPath.trim()
     );
     set({
-      footageMeta: meta,
+      footageMeta: normalizedMeta,
       mediaReadiness: hasBothPaths ? "loading" : "idle",
       playbackBlockedReason: hasBothPaths ? MEDIA_LOADING_REASON : null,
       ...(hasBothPaths
@@ -2045,18 +2058,28 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
 
   // --- media bin (Files panel) actions --------------------------------------
   addMediaAsset: (asset) => {
+    const normalizedAsset =
+      asset.kind === "video" && asset.videoSource
+        ? {
+            ...asset,
+            src: footageUrlForPath(asset.videoSource.workingPath),
+            sourcePath: asset.videoSource.workingPath,
+          }
+        : asset;
     // Dedupe on the on-disk path: re-importing the same file (or auto-registering
     // an already-registered overlay/music source) must not add a duplicate row.
     // Falls back to matching on `src` when no sourcePath is known (blob fallback).
     const existing = get().mediaAssets.find((a) =>
-      asset.sourcePath
-        ? a.sourcePath === asset.sourcePath
-        : a.src === asset.src
+      normalizedAsset.sourcePath
+        ? a.sourcePath === normalizedAsset.sourcePath
+        : a.src === normalizedAsset.src
     );
     if (existing) return existing.id;
     const id = nextMediaAssetId();
     // Not part of undo history -- an inventory list, like sfxTrack/musicTrack.
-    set((s) => ({ mediaAssets: [...s.mediaAssets, { ...asset, id }] }));
+    set((s) => ({
+      mediaAssets: [...s.mediaAssets, { ...normalizedAsset, id }],
+    }));
     return id;
   },
   removeMediaAsset: (id) => {
@@ -2170,8 +2193,17 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     const overlay: Overlay = {
       id,
       kind: descriptor.kind,
-      src: descriptor.src,
-      sourcePath: descriptor.sourcePath,
+      src:
+        isVideo && descriptor.videoSource
+          ? footageUrlForPath(descriptor.videoSource.workingPath)
+          : descriptor.src,
+      sourcePath:
+        isVideo && descriptor.videoSource
+          ? descriptor.videoSource.workingPath
+          : descriptor.sourcePath,
+      ...(isVideo && descriptor.videoSource
+        ? { videoSource: descriptor.videoSource }
+        : {}),
       naturalWidth: descriptor.naturalWidth,
       naturalHeight: descriptor.naturalHeight,
       timelineStart,

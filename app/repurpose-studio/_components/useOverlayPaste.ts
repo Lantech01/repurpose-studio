@@ -35,8 +35,10 @@ function isEditableTarget(target: EventTarget | null): boolean {
  * at the current playhead (copy-to-disk, then addOverlay). Text pastes and pastes
  * into editable fields / the transcript panel are left to the browser.
  */
-export function useOverlayPaste(): void {
+export function useOverlayPaste(enabled: boolean): void {
   useEffect(() => {
+    if (!enabled) return;
+
     const onPaste = (e: ClipboardEvent) => {
       // Don't steal a real text paste into an input / the transcript.
       if (isEditableTarget(e.target)) return;
@@ -68,5 +70,5 @@ export function useOverlayPaste(): void {
 
     window.addEventListener("paste", onPaste);
     return () => window.removeEventListener("paste", onPaste);
-  }, []);
+  }, [enabled]);
 }

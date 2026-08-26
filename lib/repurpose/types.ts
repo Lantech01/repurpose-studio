@@ -11,6 +11,27 @@
 // type-only imports (erased at build), so the captions.ts <-> types.ts cycle they
 // create is harmless.
 import type { CaptionStyle, CaptionBlock } from "./captions";
+import type { MediaInspection } from "./media-types";
+
+export type VideoImportPhase =
+  | "copying"
+  | "inspecting"
+  | "checking-browser"
+  | "converting"
+  | "building-proxy"
+  | "ready"
+  | "cancelled"
+  | "error";
+
+export interface VideoSourceRecord {
+  originalPath: string;
+  workingPath: string;
+  previewPath?: string;
+  originalName: string;
+  inspection: MediaInspection;
+  nativeCompatible: boolean;
+  compatibilityStatus: "native" | "converted";
+}
 
 /** A single transcribed word with its position in the raw source file, in seconds. */
 export interface Word {
@@ -36,6 +57,8 @@ export interface Take {
 export interface FootageMeta {
   faceCamPath: string;
   screenPath: string;
+  faceCamSource?: VideoSourceRecord;
+  screenSource?: VideoSourceRecord;
   fps: number;
   width: number;
   height: number;
@@ -307,6 +330,8 @@ export interface Overlay {
    * Absent when the overlay is still on a transient blob: fallback.
    */
   sourcePath?: string;
+  /** Persisted original/working/preview identities for video overlays. */
+  videoSource?: VideoSourceRecord;
   /** Intrinsic media pixel width (for aspect + hit-test). */
   naturalWidth: number;
   /** Intrinsic media pixel height (for aspect + hit-test). */
@@ -496,6 +521,8 @@ export interface MediaAsset {
    * disk copy failed and the entry is on a transient blob: fallback.
    */
   sourcePath?: string;
+  /** Persisted original/working/preview identities for video assets. */
+  videoSource?: VideoSourceRecord;
   /** Intrinsic pixel width (image/video only) -- carried so a placed overlay keeps aspect. */
   naturalWidth?: number;
   /** Intrinsic pixel height (image/video only). */
