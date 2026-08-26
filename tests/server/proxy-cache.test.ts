@@ -271,6 +271,8 @@ describe("proxy encoder and cache lifecycle", () => {
     const cacheDir = await tempRoot();
     const release = Promise.withResolvers<void>();
     const encode = vi.fn(async ({ outputPath }: { outputPath: string }) => {
+      // Encoder invocation and creation of its output are separate async events.
+      await new Promise((resolve) => setTimeout(resolve, 25));
       await writeFile(outputPath, "partial");
       await release.promise;
       await writeFile(outputPath, "validated");
@@ -286,10 +288,15 @@ describe("proxy encoder and cache lifecycle", () => {
     const input = { filePath: "C:\\media\\clip.mov", mtimeMs: 12, size: 34 };
 
     await Promise.all([cache.start(input), cache.start(input), cache.start(input)]);
-    await eventually(() => expect(encode).toHaveBeenCalledTimes(1));
-    expect(await readdir(cacheDir)).toEqual([
-      expect.stringMatching(/\.partial\.mp4$/),
-    ]);
+    const finalName = path.basename(
+      proxyCachePath(input.filePath, input.mtimeMs, input.size, cacheDir)
+    );
+    await eventually(async () => {
+      expect(encode).toHaveBeenCalledTimes(1);
+      const names = await readdir(cacheDir);
+      expect(names).not.toContain(finalName);
+      expect(names).toEqual([expect.stringMatching(/\.partial\.mp4$/)]);
+    });
     expect(cache.get(input)).toMatchObject({ status: "building" });
 
     release.resolve();
