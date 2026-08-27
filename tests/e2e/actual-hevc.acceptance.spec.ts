@@ -25,6 +25,14 @@ const SCREENSHOTS_DIR = path.join(REPORT_DIR, "screenshots");
 type ImportEvent = { label: string; iso: string; elapsedMs: number };
 
 type Snapshot = {
+  clips?: Array<{
+    id: string;
+    srcStart: number;
+    srcEnd: number;
+    timelineStart: number;
+    timelineEnd: number;
+    kept: boolean;
+  }>;
   overlays?: Array<{
     id: string;
     kind: string;
@@ -39,6 +47,7 @@ type Snapshot = {
   footageMeta?: {
     faceCamPath: string;
     screenPath: string;
+    fps: number;
     faceCamSource?: VideoSource;
     screenSource?: VideoSource;
   };
@@ -165,23 +174,93 @@ async function importEvents(page: Page): Promise<ImportEvent[]> {
   });
 }
 
-async function playPause(page: Page): Promise<{ before: number; after: number }> {
+async function previewMediaState(page: Page): Promise<{
+  videoTime: number;
+  videoPaused: boolean;
+  sourceUrl: string;
+  canvasSignature: number;
+}> {
+  return page.locator("#preview-panel").evaluate((panel) => {
+    const activeFace = Array.from(
+      panel.querySelectorAll<HTMLVideoElement>('video[data-source-role="face"][data-slot-index]')
+    ).find((video) => !video.muted);
+    const source = panel.querySelector<HTMLCanvasElement>("canvas");
+    if (!activeFace || !source) throw new Error("Active face video or preview canvas is unavailable");
+    const sample = document.createElement("canvas");
+    sample.width = 48;
+    sample.height = 48;
+    const context = sample.getContext("2d", { willReadFrequently: true });
+    if (!context) throw new Error("2D canvas is unavailable");
+    context.drawImage(source, 0, 0, sample.width, sample.height);
+    const pixels = context.getImageData(0, 0, sample.width, sample.height).data;
+    let canvasSignature = 2166136261;
+    for (let index = 0; index < pixels.length; index += 4) {
+      canvasSignature ^= pixels[index];
+      canvasSignature = Math.imul(canvasSignature, 16777619);
+      canvasSignature ^= pixels[index + 1];
+      canvasSignature = Math.imul(canvasSignature, 16777619);
+      canvasSignature ^= pixels[index + 2];
+      canvasSignature = Math.imul(canvasSignature, 16777619);
+    }
+    return {
+      videoTime: activeFace.currentTime,
+      videoPaused: activeFace.paused,
+      sourceUrl: activeFace.currentSrc,
+      canvasSignature: canvasSignature >>> 0,
+    };
+  });
+}
+
+async function playPause(page: Page): Promise<{
+  before: number;
+  after: number;
+  videoBefore: number;
+  videoAfter: number;
+  sourceUrl: string;
+  canvasChanged: boolean;
+}> {
   const playhead = page.getByRole("slider", { name: "Playhead" });
   const before = Number(await playhead.getAttribute("aria-valuenow"));
+  const mediaBefore = await previewMediaState(page);
   await page.getByRole("button", { name: "Play", exact: true }).click();
+  let mediaDuring = mediaBefore;
   await expect
-    .poll(async () => Number(await playhead.getAttribute("aria-valuenow")), {
+    .poll(async () => {
+      mediaDuring = await previewMediaState(page);
+      return (
+        Number(await playhead.getAttribute("aria-valuenow")) > before + 0.05 &&
+        mediaDuring.videoTime > mediaBefore.videoTime + 0.05 &&
+        !mediaDuring.videoPaused &&
+        mediaDuring.canvasSignature !== mediaBefore.canvasSignature
+      );
+    }, {
       timeout: 10_000,
       intervals: [50, 100],
     })
-    .toBeGreaterThan(before + 0.05);
+    .toBe(true);
   await page.getByRole("button", { name: "Pause", exact: true }).click();
+  await expect
+    .poll(async () => (await previewMediaState(page)).videoPaused, {
+      timeout: 5_000,
+      intervals: [20, 50],
+    })
+    .toBe(true);
   const after = Number(await playhead.getAttribute("aria-valuenow"));
   await page.waitForTimeout(120);
   expect(
-    Number(await playhead.getAttribute("aria-valuenow")) - after
+    Math.abs(Number(await playhead.getAttribute("aria-valuenow")) - after)
   ).toBeLessThanOrEqual(0.03);
-  return { before, after };
+  const mediaAfter = await previewMediaState(page);
+  expect(mediaAfter.videoPaused).toBe(true);
+  expect(mediaAfter.sourceUrl).toBe(mediaBefore.sourceUrl);
+  return {
+    before,
+    after,
+    videoBefore: mediaBefore.videoTime,
+    videoAfter: mediaAfter.videoTime,
+    sourceUrl: mediaAfter.sourceUrl,
+    canvasChanged: mediaDuring.canvasSignature !== mediaBefore.canvasSignature,
+  };
 }
 
 async function goToFrame(page: Page, frame: number): Promise<void> {
@@ -210,7 +289,7 @@ test("accepts the actual HEVC MOV through UI, proxy, reopen, and full-quality ex
   const sourceBefore = await stat(sourcePath);
   const sourceHashBefore = await sha256(sourcePath);
   const browserErrors = collectBrowserErrors(page);
-  const transportCycles: Array<{ before: number; after: number }> = [];
+  const transportCycles: Array<Awaited<ReturnType<typeof playPause>>> = [];
   const evidence: Record<string, unknown> = {
     startedAt: new Date().toISOString(),
     sourcePath,
@@ -397,6 +476,7 @@ test("accepts the actual HEVC MOV through UI, proxy, reopen, and full-quality ex
       transportCycles.push(await playPause(page));
       browserErrors.assertEmpty();
     }
+    expect(new Set(transportCycles.map((cycle) => cycle.sourceUrl)).size).toBe(1);
     evidence.transportCycles = transportCycles;
 
     await page.keyboard.press("Home");
@@ -421,10 +501,11 @@ test("accepts the actual HEVC MOV through UI, proxy, reopen, and full-quality ex
     evidence.layeredSnapshot = snapshot;
     browserErrors.assertEmpty();
 
+    const previewFps = snapshot.footageMeta?.fps ?? 60;
     const previewFrames = [
-      { frame: 30, timestamp: 0.5, name: "07-preview-0.5s.png" },
-      { frame: 90, timestamp: 1.5, name: "08-preview-1.5s.png" },
-      { frame: 150, timestamp: 2.5, name: "09-preview-2.5s.png" },
+      { frame: 30, timestamp: 30 / previewFps, name: "07-preview-0.5s.png" },
+      { frame: 90, timestamp: 90 / previewFps, name: "08-preview-1.5s.png" },
+      { frame: 150, timestamp: 150 / previewFps, name: "09-preview-2.5s.png" },
     ];
     for (const frame of previewFrames) {
       await goToFrame(page, frame.frame);
@@ -497,18 +578,23 @@ test("accepts the actual HEVC MOV through UI, proxy, reopen, and full-quality ex
       fullPage: true,
     });
 
-    const authoritativeRequests = exportRequests.filter((rawUrl) => {
+    const exportRequestDetails = exportRequests.map((rawUrl) => {
       const url = new URL(rawUrl);
-      return (
-        url.searchParams.get("path") === faceSource!.workingPath &&
-        url.searchParams.get("quality") !== "proxy"
-      );
+      return {
+        path: url.searchParams.get("path"),
+        quality: url.searchParams.get("quality"),
+      };
     });
-    expect(authoritativeRequests.length).toBeGreaterThan(0);
-    const proxyRequestsDuringExport = exportRequests.filter(
-      (rawUrl) => new URL(rawUrl).searchParams.get("quality") === "proxy"
-    );
-    expect(proxyRequestsDuringExport).toEqual([]);
+    const expectedAuthoritativePaths = [
+      screenSource!.workingPath,
+      faceSource!.workingPath,
+      actualAsset!.videoSource!.workingPath,
+    ].filter((sourcePath, index, paths) => paths.indexOf(sourcePath) === index);
+    expect(exportRequestDetails.length).toBeGreaterThan(0);
+    expect(exportRequestDetails.every((request) => request.quality === null)).toBe(true);
+    expect(
+      [...new Set(exportRequestDetails.map((request) => request.path))].sort()
+    ).toEqual([...expectedAuthoritativePaths].sort());
 
     const exportProbe = await probeMedia(exportPath);
     const exportVideo = exportProbe.streams.find((stream) => stream.codec_type === "video");
@@ -560,25 +646,101 @@ test("accepts the actual HEVC MOV through UI, proxy, reopen, and full-quality ex
     });
     await player.close();
 
-    const sourceAfter = await stat(sourcePath);
-    const sourceHashAfter = await sha256(sourcePath);
-    expect(sourceAfter.size).toBe(sourceBefore.size);
-    expect(sourceAfter.mtimeMs).toBe(sourceBefore.mtimeMs);
-    expect(sourceHashAfter).toBe(sourceHashBefore);
-    evidence.sourceAfter = {
-      size: sourceAfter.size,
-      mtimeMs: sourceAfter.mtimeMs,
-      sha256: sourceHashAfter,
+    snapshot = await readSnapshot(page, projectId);
+    const fps = snapshot.footageMeta?.fps ?? 60;
+    const originalKeptCount = snapshot.clips?.filter((clip) => clip.kept).length ?? 0;
+    await goToFrame(page, Math.round(2 * fps));
+    await page.getByRole("button", { name: "Split clip at playhead", exact: true }).click();
+    await waitForSnapshot(
+      page,
+      projectId,
+      (candidate) =>
+        (candidate.clips?.filter((clip) => clip.kept).length ?? 0) === originalKeptCount + 1
+    );
+    await goToFrame(page, Math.round(fps));
+    await page.getByRole("button", { name: "Split clip at playhead", exact: true }).click();
+    snapshot = await waitForSnapshot(
+      page,
+      projectId,
+      (candidate) =>
+        (candidate.clips?.filter((clip) => clip.kept).length ?? 0) === originalKeptCount + 2
+    );
+    const middleClip = [...(snapshot.clips ?? [])]
+      .filter((clip) => clip.kept)
+      .sort((left, right) => left.srcStart - right.srcStart)[1];
+    expect(middleClip).toBeDefined();
+    await page
+      .locator(`[data-clip-id="${middleClip.id}"]`)
+      .getByTitle("Delete clip")
+      .click();
+    snapshot = await waitForSnapshot(
+      page,
+      projectId,
+      (candidate) => candidate.clips?.find((clip) => clip.id === middleClip.id)?.kept === false
+    );
+    const keptClips = [...(snapshot.clips ?? [])]
+      .filter((clip) => clip.kept)
+      .sort((left, right) => left.timelineStart - right.timelineStart);
+    expect(keptClips).toHaveLength(2);
+    const [outgoing, incoming] = keptClips;
+    expect(outgoing.timelineEnd).toBeCloseTo(incoming.timelineStart, 6);
+    expect(incoming.srcStart - outgoing.srcEnd).toBeGreaterThan(0.5);
+    const boundaryFrame = Math.round(incoming.timelineStart * fps);
+    await goToFrame(page, boundaryFrame - 1);
+    const beforeBoundaryTime = (boundaryFrame - 1) / fps;
+    const expectedOutgoingTime =
+      outgoing.srcStart + (beforeBoundaryTime - outgoing.timelineStart);
+    await expect
+      .poll(async () => Math.abs((await previewMediaState(page)).videoTime - expectedOutgoingTime))
+      .toBeLessThanOrEqual(Math.max(2 / fps, 0.04));
+    await goToFrame(page, boundaryFrame);
+    await expect
+      .poll(async () => Math.abs((await previewMediaState(page)).videoTime - incoming.srcStart))
+      .toBeLessThanOrEqual(Math.max(2 / fps, 0.04));
+    evidence.boundaryMapping = {
+      fps,
+      boundaryFrame,
+      boundaryTime: incoming.timelineStart,
+      sourceDiscontinuitySec: incoming.srcStart - outgoing.srcEnd,
+      outgoing,
+      incoming,
     };
+
     evidence.export = {
       path: exportPath,
       probe: exportProbe,
       decodedInChrome: decoded,
       audioSignal: { fullRms: exportAudioSignal.fullRms },
-      authoritativeWorkingPath: faceSource!.workingPath,
-      authoritativeRequests,
-      proxyRequestsDuringExport,
+      expectedAuthoritativePaths,
+      requests: exportRequestDetails,
     };
+    browserErrors.assertEmpty();
+  } finally {
+    let cleanupError: string | undefined;
+    try {
+      projectId ??= currentDurableProjectId(page);
+      if (projectId && !page.isClosed()) await cleanupProject(page, projectId);
+    } catch (error) {
+      cleanupError = error instanceof Error ? error.message : String(error);
+      expect.soft(cleanupError, "acceptance project cleanup").toBeUndefined();
+    }
+    if (cleanupError) evidence.cleanupError = cleanupError;
+    try {
+      const sourceAfter = await stat(sourcePath);
+      const sourceHashAfter = await sha256(sourcePath);
+      evidence.sourceAfter = {
+        size: sourceAfter.size,
+        mtimeMs: sourceAfter.mtimeMs,
+        sha256: sourceHashAfter,
+      };
+      expect.soft(sourceAfter.size, "protected source size").toBe(sourceBefore.size);
+      expect.soft(sourceAfter.mtimeMs, "protected source mtime").toBe(sourceBefore.mtimeMs);
+      expect.soft(sourceHashAfter, "protected source SHA-256").toBe(sourceHashBefore);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      evidence.sourceIntegrityError = message;
+      expect.soft(message, "protected source remains readable").toBeUndefined();
+    }
     evidence.browserErrors = {
       consoleErrors: browserErrors.consoleErrors,
       pageErrors: browserErrors.pageErrors,
@@ -591,9 +753,5 @@ test("accepts the actual HEVC MOV through UI, proxy, reopen, and full-quality ex
       `${JSON.stringify(evidence, null, 2)}\n`,
       "utf8"
     );
-    browserErrors.assertEmpty();
-  } finally {
-    projectId ??= currentDurableProjectId(page);
-    if (projectId && !page.isClosed()) await cleanupProject(page, projectId);
   }
 });

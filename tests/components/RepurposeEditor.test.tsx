@@ -136,10 +136,10 @@ vi.mock("@/app/repurpose-studio/_components/TranscriptPanel", () => ({
   TranscriptPanel: () => <div />,
 }));
 vi.mock("@/app/repurpose-studio/_components/FilesPanel", () => ({
-  FilesPanel: () => <div />,
+  FilesPanel: () => <div data-testid="files-panel" />,
 }));
 vi.mock("@/app/repurpose-studio/_components/SourcesPanel", () => ({
-  SourcesPanel: () => <div />,
+  SourcesPanel: () => <div data-testid="sources-panel" />,
 }));
 vi.mock("@/app/repurpose-studio/_components/ColorAdjustPanel", () => ({
   ColorAdjustPanel: () => <div />,
@@ -192,6 +192,16 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("RepurposeEditor persistence states", () => {
+  test("puts timeline sources before the optional media library", () => {
+    render(<RepurposeEditor projectId="new-onboarding-project" />);
+
+    const sources = screen.getByTestId("sources-panel");
+    const files = screen.getByTestId("files-panel");
+    expect(
+      sources.compareDocumentPosition(files) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
+  });
+
   test("keeps overlay paste mounted but disabled until project load succeeds", () => {
     Object.assign(persistenceState, { ready: false, loadError: null });
     const rendered = render(<RepurposeEditor projectId="paste-gating-project" />);

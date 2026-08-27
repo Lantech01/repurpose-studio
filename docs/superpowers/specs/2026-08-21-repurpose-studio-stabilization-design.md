@@ -2,7 +2,7 @@
 
 Date: 2026-08-21
 Branch: `fix/stabilize-editor`
-Status: Approved in conversation and written-spec review; implementation pending
+Status: Implemented and verified on Windows (2026-08-26)
 
 ## Context
 
@@ -19,6 +19,8 @@ Make the existing local editor reliable end to end, without external AI APIs:
 - Keep overlays, captions, music, and SFX synchronized.
 - Save and reopen projects.
 - Export a playable MP4 with the expected picture and audio layers.
+- Bundle the caption faces used by preview/export so the editor never silently falls back after an HTTP 404.
+- Make the transcript-first setup sequence explicit before optional media-library actions.
 - Provide actionable progress and error states instead of generic decoder failures.
 - Add repeatable unit, integration, and browser regression tests.
 
@@ -164,6 +166,8 @@ Required regression coverage:
 - SFX CLI consumes event JSON and produces a non-empty duration-matched WAV;
 - SFX API rejects malformed events and returns a playable result for valid input;
 - export produces a browser-playable MP4 with expected duration and audio streams.
+- every caption font offered by the Inspector is available to both preview and export;
+- an empty project identifies raw transcript, Screen, and Face as the prerequisites for Play.
 
 Browser QA runs the complete workflow twice, first with H.264 and then with HEVC, and checks console errors after every interaction. Before/after screenshots and a structured QA report are stored under `.gstack/qa-reports/`.
 

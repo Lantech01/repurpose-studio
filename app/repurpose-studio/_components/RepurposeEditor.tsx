@@ -200,12 +200,11 @@ function InspectorRail({
         </h2>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto p-4">
-        {/* Footage / transcript ingest -- prominent while footage is missing,
-            collapses to a "Re-import footage" fold once it's loaded. Owns the
-            demo auto-load + caption backfill on mount. */}
-        <FilesPanel />
+        {/* Timeline-defining sources come first; the generic media library is
+            optional and must not look like the empty project's starting point. */}
+        <SourcesPanel overlayImportOwner={overlayImportOwner} />
         <div className="mt-6 border-t border-border pt-4">
-          <SourcesPanel overlayImportOwner={overlayImportOwner} />
+          <FilesPanel />
         </div>
         <div className="mt-6 border-t border-border pt-4">
           <ColorAdjustPanel />

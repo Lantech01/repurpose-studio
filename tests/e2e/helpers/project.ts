@@ -48,12 +48,11 @@ export function collectBrowserErrors(page: Page): BrowserErrorCollector {
     const expectedOptional404 =
       response.status() === 404 &&
       response.request().method() === "GET" &&
-      (url.pathname.startsWith("/fonts/") ||
-        [
-          "/repurpose/claude-routines-words.json",
-          "/repurpose/final-transcript.txt",
-          "/repurpose/footage-manifest.json",
-        ].includes(url.pathname));
+      [
+        "/repurpose/claude-routines-words.json",
+        "/repurpose/final-transcript.txt",
+        "/repurpose/footage-manifest.json",
+      ].includes(url.pathname);
     const expectedSaveRace =
       response.status() === 409 &&
       response.request().method() === "POST" &&
@@ -86,7 +85,6 @@ export function collectBrowserErrors(page: Page): BrowserErrorCollector {
         if (!location) return true;
         const url = new URL(location);
         return !(
-          url.pathname.startsWith("/fonts/") ||
           [
             "/repurpose/claude-routines-words.json",
             "/repurpose/final-transcript.txt",
@@ -100,7 +98,6 @@ export function collectBrowserErrors(page: Page): BrowserErrorCollector {
           if (errorText !== "net::ERR_ABORTED") return true;
           const url = new URL(rawUrl);
           const knownLifecycleAbort =
-            (method === "GET" && url.pathname.startsWith("/fonts/")) ||
             (method === "GET" &&
               [
                 "/api/repurpose/video",
@@ -190,6 +187,7 @@ export async function createProjectWithFootage(
   videoFixture: string
 ): Promise<string> {
   await page.goto("/repurpose-studio");
+  await expect(page.locator(".animate-pulse")).toHaveCount(0, { timeout: 30_000 });
   await page.getByRole("button", { name: "New Project", exact: true }).first().click();
   await expect(page).toHaveURL(/\/repurpose-studio\/new-/);
   await expect(page.getByText("Sources", { exact: true })).toBeVisible();

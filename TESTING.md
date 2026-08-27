@@ -44,6 +44,21 @@ Within one application process, identical content hashes share one render, each 
 - `npm run build` creates the production build.
 - `npm run verify` runs typecheck, Vitest, Playwright, and the production build in sequence.
 
+## Actual HEVC acceptance on Windows
+
+The protected local-file acceptance is opt-in and is skipped during ordinary CI and `npm run verify`. Generate fixtures first, close any unrelated server on port 3001, and point the test at the source file:
+
+```powershell
+npm run fixtures:media
+$env:REPURPOSE_ACTUAL_HEVC_PATH='C:\path\to\protected-hevc.mov'
+npm run test:e2e -- tests/e2e/actual-hevc.acceptance.spec.ts --workers=1 --reporter=line
+Remove-Item Env:REPURPOSE_ACTUAL_HEVC_PATH
+```
+
+The test only reads/uploads the selected source. It records size, last-write time, and SHA-256 before the flow and again from `finally` after project cleanup, then fails if any change is detected. It exercises the actual file through Files, compatibility conversion, a 540p proxy, real decoded-video/canvas transport, a persisted split boundary, reload/reopen, and a bounded authoritative-source export. Evidence is written under `.gstack/qa-reports/repurpose-studio-stabilization-2026-08-21/`; machine-specific JSON and source-derived MP4 files are intentionally gitignored.
+
+Set `REPURPOSE_E2E_REUSE_SERVER=1` only when intentionally testing against a server already listening on port 3001. Otherwise Playwright starts and owns the development server. On the verified Windows machine, ffmpeg selected Intel Quick Sync (`h264_qsv`) for the actual 4K60 conversion; the compatibility pipeline may use its software fallback on other hardware.
+
 Vitest defaults to jsdom. Every server test under `tests/server/` and every other Node-only integration test must opt in at the top of its file with:
 
 ```ts

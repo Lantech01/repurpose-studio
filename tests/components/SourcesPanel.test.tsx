@@ -83,6 +83,73 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("SourcesPanel onboarding", () => {
+  it("explains the transcript-first path in an empty project", () => {
+    render(<SourcesPanel />);
+
+    expect(screen.getByRole("heading", { name: "Sources" })).toBeVisible();
+    expect(
+      screen.getByText(
+        "Start here: load the raw transcript to build the timeline. The final transcript is optional. Then choose both Screen and Face videos to enable Play."
+      )
+    ).toBeVisible();
+  });
+
+  it("stays expanded until the transcript and both source videos are present", () => {
+    useRepurposeStore.getState().setWords(wordsPayload("project").words);
+    useRepurposeStore.getState().setFootageMeta({
+      faceCamPath: "",
+      screenPath: "/api/screen",
+      fps: 30,
+      width: 1920,
+      height: 1080,
+      durationSec: 3,
+    });
+
+    render(<SourcesPanel />);
+
+    expect(screen.getByRole("heading", { name: "Sources" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Face" })).toBeVisible();
+    expect(screen.queryByText("Re-import footage", { exact: true })).toBeNull();
+  });
+
+  it("stays expanded when restored source videos need reconnection", () => {
+    useRepurposeStore.getState().setWords(wordsPayload("project").words);
+    useRepurposeStore.getState().setFootageMeta({
+      faceCamPath: "reconnect:",
+      screenPath: "reconnect:",
+      fps: 30,
+      width: 1920,
+      height: 1080,
+      durationSec: 3,
+    });
+
+    render(<SourcesPanel />);
+
+    expect(screen.getByRole("heading", { name: "Sources" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Screen" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Face" })).toBeVisible();
+    expect(screen.queryByText("Re-import footage", { exact: true })).toBeNull();
+  });
+
+  it("keeps overlay media available after source setup collapses", () => {
+    useRepurposeStore.getState().setWords(wordsPayload("project").words);
+    useRepurposeStore.getState().setFootageMeta({
+      faceCamPath: "/api/face",
+      screenPath: "/api/screen",
+      fps: 30,
+      width: 1920,
+      height: 1080,
+      durationSec: 3,
+    });
+
+    render(<SourcesPanel />);
+
+    expect(screen.getByText("Re-import footage", { exact: true })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Add media (image / video)" })).toBeVisible();
+  });
+});
+
 describe("SourcesPanel video imports", () => {
   it("does not rebuild Project B from Project A raw words after reset", async () => {
     render(<SourcesPanel />);

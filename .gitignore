@@ -44,3 +44,8 @@ next-env.d.ts
 /tests/fixtures/generated/
 /test-results/
 /.gstack/qa-reports/playwright-html/
+# Local protected-media evidence. Keep reports/screenshots reviewable without
+# committing source-derived videos or machine-specific paths.
+/.gstack/qa-reports/**/actual-hevc*.json
+/.gstack/qa-reports/**/actual-hevc*.mp4
+/.gstack/qa-reports/repurpose-studio-stabilization-2026-08-21/screenshots/

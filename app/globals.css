@@ -1,3 +1,9 @@
+@import "@fontsource-variable/tiktok-sans";
+@import "@fontsource-variable/dm-sans";
+@import "@fontsource-variable/fraunces";
+@import "@fontsource-variable/outfit";
+@import "@fontsource-variable/inter";
+@import "@fontsource/anton/400.css";
 @import "tailwindcss";
 @import "tw-animate-css";
 

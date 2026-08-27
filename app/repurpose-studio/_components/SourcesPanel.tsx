@@ -17,9 +17,9 @@
 //
 // LAYOUT: while footage is missing (no footageMeta OR no words) the four
 // ingest buttons show PROMINENTLY under a "Sources" header -- that's the first
-// thing to do on an empty editor. Once footage is loaded (footageMeta set AND
-// words present) it collapses to a single "Re-import footage" fold so the
-// grading controls below get the room.
+// thing to do on an empty editor. Once words and both source videos are loaded,
+// it collapses to a single "Re-import footage" fold so the grading controls
+// below get the room.
 // ===========================================================================
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -545,8 +545,14 @@ export function SourcesPanel({
     [overlayImportOwner]
   );
 
-  // Footage is "ready" once we have both real footage AND a transcript to edit.
-  const footageReady = footageMeta != null && words.length > 0;
+  // Keep onboarding open until every prerequisite for playback is present.
+  const footageReady = Boolean(
+    words.length > 0 &&
+      footageMeta?.screenPath &&
+      footageMeta.screenPath !== "reconnect:" &&
+      footageMeta.faceCamPath &&
+      footageMeta.faceCamPath !== "reconnect:"
+  );
 
   // The four ingest controls -- shared between the prominent open state and the
   // collapsed "Re-import footage" fold.
@@ -575,9 +581,6 @@ export function SourcesPanel({
           />
         ) : null
       )}
-      {/* Add a free-floating overlay (image/video) at the playhead. Coral so it
-          reads as the "add a layer" action, distinct from the source ingests. */}
-      <AddMediaButton onChange={handleAddMedia} />
       {ingestError && (
         <div className="flex items-start gap-1.5 rounded-md border border-[#FF6B35]/40 bg-[#FF6B35]/10 px-2 py-1.5 text-[11px] text-[#FF8F6B]">
           <Warning size={13} weight="fill" className="mt-px shrink-0" />
@@ -591,13 +594,16 @@ export function SourcesPanel({
   // give the grading controls below the room.
   if (footageReady) {
     return (
-      <details className="group">
-        <summary className="flex cursor-pointer list-none items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground transition-colors hover:text-foreground/80">
-          <FilmSlate size={13} weight="bold" className="shrink-0" />
-          Re-import footage
-        </summary>
-        <div className="mt-3">{buttons}</div>
-      </details>
+      <div className="flex flex-col gap-2.5">
+        <details className="group">
+          <summary className="flex cursor-pointer list-none items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground transition-colors hover:text-foreground/80">
+            <FilmSlate size={13} weight="bold" className="shrink-0" />
+            Re-import footage
+          </summary>
+          <div className="mt-3">{buttons}</div>
+        </details>
+        <AddMediaButton onChange={handleAddMedia} />
+      </div>
     );
   }
 
@@ -608,7 +614,12 @@ export function SourcesPanel({
         <FilmSlate size={13} weight="bold" className="shrink-0" />
         Sources
       </h3>
+      <p className="text-[11px] leading-4 text-muted-foreground">
+        Start here: load the raw transcript to build the timeline. The final transcript is
+        optional. Then choose both Screen and Face videos to enable Play.
+      </p>
       {buttons}
+      <AddMediaButton onChange={handleAddMedia} />
     </div>
   );
 }

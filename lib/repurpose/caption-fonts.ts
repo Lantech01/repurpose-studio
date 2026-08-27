@@ -9,16 +9,14 @@
 //   1. FONT_FAMILIES -- the picker registry. Each entry maps a stable id (stored
 //      in CaptionStyle.font) to the CSS family name used in `ctx.font` and the
 //      weights we ship. `cssFamily` is what actually goes into the font string.
-//   2. loadCaptionFonts() -- registers every self-hosted @font-face via the CSS
-//      Font Loading API (new FontFace(...).load()) and adds it to
-//      document.fonts, then resolves once all faces are ready. Canvas text drawn
-//      before this resolves silently falls back to a system font, so the preview
-//      calls it once on mount and the export awaits it before the frame walk.
+//   2. loadCaptionFonts() -- warms the @fontsource faces imported by globals.css
+//      and resolves once they are ready. Canvas text drawn before this resolves
+//      silently falls back to a system font, so the preview calls it once on
+//      mount and the export awaits it before the frame walk.
 //
-// The TikTok faces are self-hosted from /public/fonts/tiktok (Manthan's own
-// files). Anton is pulled the same way if present; DM Sans / Fraunces are the
-// app's existing families and assumed already loadable, but we still register
-// document.fonts.load() calls for them so a caption draw never races their load.
+// All faces are bundled from OFL-licensed @fontsource packages. The persisted
+// TikTok Display/Text ids resolve to TikTok Sans because those legacy projects
+// and templates predate the switch away from missing /public font assets.
 // ===========================================================================
 
 /** Stable id persisted in CaptionStyle.font. */
@@ -28,7 +26,9 @@ export type CaptionFontId =
   | "tiktokText"
   | "anton"
   | "dmSans"
-  | "fraunces";
+  | "fraunces"
+  | "outfit"
+  | "inter";
 
 /** One selectable caption font. */
 export interface CaptionFont {
@@ -43,16 +43,6 @@ export interface CaptionFont {
   fallback: string;
 }
 
-/** Self-hosted @font-face descriptors we register at runtime for canvas use. */
-interface FaceSpec {
-  family: string;
-  weight: number;
-  /** Path under /public. */
-  url: string;
-  /** Font format hint for the loader. */
-  style?: "normal" | "italic";
-}
-
 // ---------------------------------------------------------------------------
 // Registry -- what the caption panel offers.
 // ---------------------------------------------------------------------------
@@ -60,21 +50,21 @@ export const CAPTION_FONTS: CaptionFont[] = [
   {
     id: "tiktokDisplay",
     label: "TikTok Display",
-    cssFamily: "TikTok Display",
+    cssFamily: "TikTok Sans Variable",
     weights: [400, 500, 700],
     fallback: "system-ui, sans-serif",
   },
   {
     id: "tiktokSans",
     label: "TikTok Sans",
-    cssFamily: "TikTok Sans",
+    cssFamily: "TikTok Sans Variable",
     weights: [400],
     fallback: "system-ui, sans-serif",
   },
   {
     id: "tiktokText",
     label: "TikTok Text",
-    cssFamily: "TikTok Text",
+    cssFamily: "TikTok Sans Variable",
     weights: [400, 500, 700],
     fallback: "system-ui, sans-serif",
   },
@@ -88,16 +78,30 @@ export const CAPTION_FONTS: CaptionFont[] = [
   {
     id: "dmSans",
     label: "DM Sans",
-    cssFamily: "DM Sans",
+    cssFamily: "DM Sans Variable",
     weights: [400, 500, 700, 800],
     fallback: "system-ui, sans-serif",
   },
   {
     id: "fraunces",
     label: "Fraunces",
-    cssFamily: "Fraunces",
+    cssFamily: "Fraunces Variable",
     weights: [400, 500, 700],
     fallback: "Georgia, serif",
+  },
+  {
+    id: "outfit",
+    label: "Outfit",
+    cssFamily: "Outfit Variable",
+    weights: [400, 500, 700, 800],
+    fallback: "system-ui, sans-serif",
+  },
+  {
+    id: "inter",
+    label: "Inter",
+    cssFamily: "Inter Variable",
+    weights: [400, 500, 700, 800],
+    fallback: "system-ui, sans-serif",
   },
 ];
 
@@ -139,81 +143,45 @@ export function captionFontString(
 }
 
 // ---------------------------------------------------------------------------
-// Self-hosted faces -- registered into document.fonts at runtime.
+// Bundled faces -- warmed through the CSS Font Loading API for canvas use.
 // ---------------------------------------------------------------------------
-const SELF_HOSTED_FACES: FaceSpec[] = [
-  { family: "TikTok Display", weight: 400, url: "/fonts/tiktok/TikTokDisplayRegular.otf" },
-  { family: "TikTok Display", weight: 500, url: "/fonts/tiktok/TikTokDisplayMedium.otf" },
-  { family: "TikTok Display", weight: 700, url: "/fonts/tiktok/TikTokDisplayBold.otf" },
-  { family: "TikTok Text", weight: 400, url: "/fonts/tiktok/TikTokTextRegular.otf" },
-  { family: "TikTok Text", weight: 500, url: "/fonts/tiktok/TikTokTextMedium.otf" },
-  { family: "TikTok Text", weight: 700, url: "/fonts/tiktok/TikTokTextBold.otf" },
-  { family: "TikTok Sans", weight: 400, url: "/fonts/tiktok/TikTokSansClassic.ttf" },
-  { family: "Anton", weight: 400, url: "/fonts/tiktok/Anton.ttf" },
-  // DM Sans is a variable font (one file, weight range 100-1000). Register it
-  // once at the weights the captions offer; the browser interpolates each.
-  { family: "DM Sans", weight: 400, url: "/fonts/dmsans-variable.ttf" },
-  { family: "DM Sans", weight: 500, url: "/fonts/dmsans-variable.ttf" },
-  { family: "DM Sans", weight: 700, url: "/fonts/dmsans-variable.ttf" },
-  { family: "DM Sans", weight: 800, url: "/fonts/dmsans-variable.ttf" },
-  { family: "Fraunces", weight: 400, url: "/fonts/fraunces-regular.ttf" },
-  { family: "Fraunces", weight: 700, url: "/fonts/fraunces-bold.ttf" },
+const BUNDLED_FONT_SPECS = [
+  ...new Set(
+    CAPTION_FONTS.flatMap((font) =>
+      font.weights.map((weight) => `${weight} 48px "${font.cssFamily}"`)
+    )
+  ),
 ];
 
 let loadPromise: Promise<void> | null = null;
 
 /**
- * Register + load every self-hosted caption face into document.fonts, and warm
- * the app fonts (DM Sans / Fraunces / Anton) that may be provided via next/font
- * or Google. Idempotent: repeated calls share one promise. Resolves when all
- * faces that CAN load have loaded; individual failures are swallowed so a
- * missing file never blocks the whole caption system (that font just falls back).
+ * Warm every bundled caption face through document.fonts. Idempotent: repeated
+ * calls share one promise. A missing face rejects instead of silently rendering
+ * a fallback; failed attempts are not cached, so a later call can retry.
  *
- * Safe to call in the browser only (guards on document/FontFace).
+ * Safe to call in the browser only (guards on document.fonts).
  */
 export function loadCaptionFonts(): Promise<void> {
   if (loadPromise) return loadPromise;
-  if (typeof document === "undefined" || typeof FontFace === "undefined") {
+  if (typeof document === "undefined" || !document.fonts?.load) {
     return Promise.resolve();
   }
 
-  loadPromise = (async () => {
-    const jobs: Promise<unknown>[] = [];
-
-    // 1. Self-hosted faces: construct, load, and add to the document registry.
-    for (const face of SELF_HOSTED_FACES) {
-      const job = (async () => {
-        try {
-          const ff = new FontFace(face.family, `url(${face.url})`, {
-            weight: String(face.weight),
-            style: face.style ?? "normal",
-            display: "swap",
-          });
-          const loaded = await ff.load();
-          document.fonts.add(loaded);
-        } catch {
-          // Missing/failed face -> the caption falls back to a system font.
-        }
-      })();
-      jobs.push(job);
-    }
-
-    // 2. Warm app-provided families so a caption draw never races their load.
-    //    These may come from next/font or Google Fonts; document.fonts.load
-    //    resolves immediately if they're already available, or once they arrive.
-    const warm = ['700 48px "DM Sans"', '700 48px "Fraunces"', '400 48px "Anton"'];
-    for (const spec of warm) {
-      jobs.push(document.fonts.load(spec).catch(() => {}));
-    }
-
-    await Promise.all(jobs);
+  const pending = (async () => {
+    await Promise.all(BUNDLED_FONT_SPECS.map(async (spec) => {
+      const faces = await document.fonts.load(spec);
+      if (faces.length === 0) {
+        throw new Error(`Bundled caption font unavailable: ${spec}`);
+      }
+    }));
     // A final readiness gate so measureText is accurate for everything above.
-    try {
-      await document.fonts.ready;
-    } catch {
-      /* ignore */
-    }
+    await document.fonts.ready;
   })();
+  loadPromise = pending.catch((error) => {
+    loadPromise = null;
+    throw error;
+  });
 
   return loadPromise;
 }
