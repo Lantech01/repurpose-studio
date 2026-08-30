@@ -25,12 +25,32 @@ import {
   subscribeOverlayImport,
   surfaceOverlayImportError,
 } from "@/lib/repurpose/overlay-ingest";
+import { overlayAABBNorm } from "@/lib/repurpose/overlay-geometry";
 import { useRepurposeStore } from "@/lib/repurpose/store";
 import {
   VideoImportError,
   type ImportVideoOptions,
 } from "@/lib/repurpose/video-import-client";
-import type { VideoSourceRecord } from "@/lib/repurpose/types";
+import type { Clip, VideoSourceRecord } from "@/lib/repurpose/types";
+
+const canonicalRect = { left: 0, top: 0, width: 1080, height: 1920 };
+
+function splitClip(id: string, timelineStart: number, splitRatio: number): Clip {
+  return {
+    id,
+    kind: "take",
+    label: id,
+    srcStart: timelineStart,
+    srcEnd: timelineStart + 1,
+    timelineStart,
+    timelineEnd: timelineStart + 1,
+    kept: true,
+    isKeeperTake: true,
+    occurrences: [{ start: timelineStart, end: timelineStart + 1 }],
+    keeperIndex: 0,
+    splitRatio,
+  };
+}
 
 const source: VideoSourceRecord = {
   originalPath: "C:\\media\\clip.mov",
@@ -70,6 +90,134 @@ afterEach(() => {
 });
 
 describe("overlay ingest compatibility pipeline", () => {
+  it("publishes against the eased split inside the current transition", async () => {
+    importVideoFileMock.mockResolvedValue(source);
+    const sceneClips = [
+      splitClip("face", 0, 0),
+      {
+        ...splitClip("screen", 1, 1),
+        transitionIn: {
+          type: "zoom-settle" as const,
+          durationSec: 0.8,
+          amount: 0.025,
+          easing: "natural" as const,
+        },
+      },
+    ];
+    useRepurposeStore.setState({
+      clips: sceneClips,
+      duration: 2,
+      playhead: 1.4,
+      splitRatio: 1,
+    });
+
+    await ingestOverlayFile(
+      new File(["video"], "transition.mov", { type: "video/quicktime" }),
+      0
+    );
+
+    const added = useRepurposeStore.getState().overlays[0];
+    const box = overlayAABBNorm(
+      added.transform,
+      added.naturalWidth,
+      added.naturalHeight,
+      canonicalRect
+    );
+    expect(box.maxY).toBeCloseTo(0.5, 10);
+  });
+
+  it("publishes a late video against the current opposing scene endpoint", async () => {
+    let resolveVideo!: (value: VideoSourceRecord) => void;
+    importVideoFileMock.mockImplementation(
+      () =>
+        new Promise<VideoSourceRecord>((resolve) => {
+          resolveVideo = resolve;
+        })
+    );
+    const sceneClips = [splitClip("screen", 0, 1), splitClip("face", 1, 0)];
+    useRepurposeStore.setState({
+      clips: sceneClips,
+      duration: 2,
+      playhead: 0.25,
+      splitRatio: 1,
+    });
+    const importing = ingestOverlayFile(
+      new File(["video"], "late.mov", { type: "video/quicktime" }),
+      0
+    );
+    await vi.waitFor(() => expect(resolveVideo).toBeDefined());
+
+    useRepurposeStore.setState({ playhead: 1.5 });
+    resolveVideo(source);
+    await importing;
+
+    const added = useRepurposeStore.getState().overlays[0];
+    const box = overlayAABBNorm(
+      added.transform,
+      added.naturalWidth,
+      added.naturalHeight,
+      canonicalRect
+    );
+    expect(added.band).toBe("screen");
+    expect(box.maxY).toBeCloseTo(0, 10);
+  });
+
+  it("publishes a late image against the current opposing scene endpoint", async () => {
+    class LoadedImage {
+      naturalWidth = 640;
+      naturalHeight = 360;
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      set src(_value: string) {
+        queueMicrotask(() => this.onload?.());
+      }
+    }
+    vi.stubGlobal("Image", LoadedImage);
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: vi.fn(() => "blob:late-image"),
+      revokeObjectURL: vi.fn(),
+    });
+    let resolveUpload!: (response: Response) => void;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveUpload = resolve;
+          })
+      )
+    );
+    const sceneClips = [splitClip("screen", 0, 1), splitClip("face", 1, 0)];
+    useRepurposeStore.setState({
+      clips: sceneClips,
+      duration: 2,
+      playhead: 0.25,
+      splitRatio: 1,
+    });
+    const importing = ingestOverlayFile(
+      new File(["image"], "late.png", { type: "image/png" }),
+      0
+    );
+    await vi.waitFor(() => expect(resolveUpload).toBeDefined());
+
+    useRepurposeStore.setState({ playhead: 1.5 });
+    resolveUpload(
+      new Response(JSON.stringify({ ok: true, path: "C:\\media\\late.png" }))
+    );
+    await importing;
+
+    const added = useRepurposeStore.getState().overlays[0];
+    const box = overlayAABBNorm(
+      added.transform,
+      added.naturalWidth,
+      added.naturalHeight,
+      canonicalRect
+    );
+    expect(added.band).toBe("screen");
+    expect(box.maxY).toBeCloseTo(0, 10);
+  });
+
   it("starts one background proxy and applies it to overlay and media-bin records only", async () => {
     const ready = { ...source, previewPath: "/preview/overlay.mp4" };
     importVideoFileMock.mockResolvedValue(source);

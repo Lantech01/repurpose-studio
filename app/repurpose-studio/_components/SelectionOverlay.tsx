@@ -23,13 +23,23 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useRepurposeStore } from "@/lib/repurpose/store";
-import type { HandleId, PreviewRect } from "@/lib/repurpose/overlay-geometry";
+import type { OverlayFrameSnapshot } from "@/lib/repurpose/overlay-effects";
+import {
+  resolveEffectivePrimaryOverlay,
+  type HandleId,
+  type PreviewRect,
+} from "@/lib/repurpose/overlay-geometry";
 import type { OverlayTransform } from "@/lib/repurpose/types";
 
 const CORAL = "#FF6B35";
 
 /** The 8 resize handles laid out around the box, plus the rotate grip above N. */
-const RESIZE_HANDLES: ReadonlyArray<{ id: HandleId; cx: number; cy: number; cursor: string }> = [
+const RESIZE_HANDLES: ReadonlyArray<{
+  id: Exclude<HandleId, "rotate">;
+  cx: number;
+  cy: number;
+  cursor: string;
+}> = [
   { id: "nw", cx: 0, cy: 0, cursor: "nwse-resize" },
   { id: "n", cx: 0.5, cy: 0, cursor: "ns-resize" },
   { id: "ne", cx: 1, cy: 0, cursor: "nesw-resize" },
@@ -39,12 +49,26 @@ const RESIZE_HANDLES: ReadonlyArray<{ id: HandleId; cx: number; cy: number; curs
   { id: "sw", cx: 0, cy: 1, cursor: "nesw-resize" },
   { id: "w", cx: 0, cy: 0.5, cursor: "ew-resize" },
 ];
+const HANDLE_LABELS: Record<Exclude<HandleId, "rotate">, string> = {
+  nw: "northwest",
+  n: "north",
+  ne: "northeast",
+  e: "east",
+  se: "southeast",
+  s: "south",
+  sw: "southwest",
+  w: "west",
+};
 
 export interface SelectionOverlayProps {
   /** Reads the preview canvas's current on-screen rect (CSS px). Null if unmounted. */
   getRect: () => PreviewRect | null;
   /** Start a resize/rotate gesture (from useObjectSelection). */
   beginHandleGesture: (handle: HandleId, e: React.PointerEvent) => void;
+  /** Apply one keyboard step to a focused resize/rotate handle. */
+  adjustHandleByKeyboard: (handle: HandleId, key: string, shift: boolean) => void;
+  /** Reads the exact overlay sample used by the latest compositor frame. */
+  getFrameSnapshot: () => OverlayFrameSnapshot | null;
 }
 
 /** The box geometry resolved for THIS frame, in rect-local CSS px. */
@@ -85,12 +109,17 @@ function resolveBox(
   };
 }
 
-export function SelectionOverlay({ getRect, beginHandleGesture }: SelectionOverlayProps) {
+export function SelectionOverlay({
+  getRect,
+  beginHandleGesture,
+  adjustHandleByKeyboard,
+  getFrameSnapshot,
+}: SelectionOverlayProps) {
   // A rAF loop mirrors the selected overlay's live transform into local state so
   // the chrome follows the media as a gesture updates the store. We keep the
   // resolved box in state (re-render on change only) to avoid a per-frame churn.
-  const [box, setBox] = useState<BoxFrame | null>(null);
-  const boxRef = useRef<BoxFrame | null>(null);
+  const [box, setBox] = useState<({ id: string } & BoxFrame) | null>(null);
+  const boxRef = useRef<({ id: string } & BoxFrame) | null>(null);
   const rafRef = useRef<number | null>(null);
 
   // Boxes for the NON-primary members of a multi-selection (lighter outline, no
@@ -110,18 +139,34 @@ export function SelectionOverlay({ getRect, beginHandleGesture }: SelectionOverl
       const rect = getRect();
       const { overlays, selectedOverlayId, selectedOverlayIds } =
         useRepurposeStore.getState();
-      const ov = selectedOverlayId
-        ? overlays.find((o) => o.id === selectedOverlayId)
-        : null;
-      let next: BoxFrame | null = null;
-      if (rect && ov && ov.naturalWidth > 0 && ov.naturalHeight > 0) {
-        next = resolveBox(ov.transform, ov.naturalWidth, ov.naturalHeight, rect);
+      const frame = getFrameSnapshot();
+      const splitRatio = frame?.splitRatio ?? 0.5;
+      const appearances = frame?.appearances;
+      const primary = resolveEffectivePrimaryOverlay(
+        overlays.filter((overlay) => appearances?.get(overlay.id)?.interactive),
+        selectedOverlayIds,
+        selectedOverlayId,
+        splitRatio
+      );
+      let next: ({ id: string } & BoxFrame) | null = null;
+      if (rect && primary) {
+        const appearance = appearances!.get(primary.id)!;
+        next = {
+          id: primary.id,
+          ...resolveBox(
+            appearance.transform,
+            primary.naturalWidth,
+            primary.naturalHeight,
+            rect
+          ),
+        };
       }
       const prev = boxRef.current;
       const changed =
         (!!prev !== !!next) ||
         (prev && next &&
-          (Math.abs(prev.cx - next.cx) > 0.25 ||
+          (prev.id !== next.id ||
+            Math.abs(prev.cx - next.cx) > 0.25 ||
             Math.abs(prev.cy - next.cy) > 0.25 ||
             Math.abs(prev.w - next.w) > 0.25 ||
             Math.abs(prev.h - next.h) > 0.25 ||
@@ -137,10 +182,23 @@ export function SelectionOverlay({ getRect, beginHandleGesture }: SelectionOverl
       if (rect && selectedOverlayIds.length > 1) {
         const boxes: Array<{ id: string } & BoxFrame> = [];
         for (const id of selectedOverlayIds) {
-          if (id === selectedOverlayId) continue; // primary drawn separately
+          if (id === primary?.id) continue; // primary drawn separately
           const o = overlays.find((ov2) => ov2.id === id);
-          if (!o || o.naturalWidth <= 0 || o.naturalHeight <= 0) continue;
-          boxes.push({ id, ...resolveBox(o.transform, o.naturalWidth, o.naturalHeight, rect) });
+          if (
+            !o ||
+            !appearances?.get(o.id)?.interactive ||
+            o.naturalWidth <= 0 ||
+            o.naturalHeight <= 0
+          ) continue;
+          boxes.push({
+            id,
+            ...resolveBox(
+              appearances.get(o.id)!.transform,
+              o.naturalWidth,
+              o.naturalHeight,
+              rect
+            ),
+          });
         }
         nextMulti = boxes.length > 0 ? boxes : null;
       }
@@ -170,7 +228,7 @@ export function SelectionOverlay({ getRect, beginHandleGesture }: SelectionOverl
     return () => {
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     };
-  }, [getRect]);
+  }, [getRect, getFrameSnapshot]);
 
   const onHandleDown = useCallback(
     (handle: HandleId) => (e: React.PointerEvent) => {
@@ -179,6 +237,17 @@ export function SelectionOverlay({ getRect, beginHandleGesture }: SelectionOverl
       beginHandleGesture(handle, e);
     },
     [beginHandleGesture]
+  );
+  const onHandleKeyDown = useCallback(
+    (handle: HandleId) => (e: React.KeyboardEvent) => {
+      if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) {
+        return;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      adjustHandleByKeyboard(handle, e.key, e.shiftKey);
+    },
+    [adjustHandleByKeyboard]
   );
 
   // Nothing selected at all -> render nothing. (When >1 is selected the primary
@@ -219,10 +288,13 @@ export function SelectionOverlay({ getRect, beginHandleGesture }: SelectionOverl
       {/* Primary selection: full chrome (box + handles + rotate grip). */}
       {box && (
     <div
+      data-overlay-id={box.id}
       // The rotated, positioned box. pointer-events:none on the frame itself so a
       // body drag falls through to the preview router; only the handles opt in.
       className="pointer-events-none absolute left-0 top-0 z-20"
       style={{
+        zIndex: 20,
+        pointerEvents: "none",
         width: box.w,
         height: box.h,
         transform: `translate(${box.cx - box.w / 2}px, ${box.cy - box.h / 2}px) rotate(${box.rotation}deg)`,
@@ -259,11 +331,15 @@ export function SelectionOverlay({ getRect, beginHandleGesture }: SelectionOverl
           background: CORAL,
         }}
       />
-      <div
+      <button
+        type="button"
+        aria-label="Rotate overlay"
         onPointerDown={onHandleDown("rotate")}
+        onKeyDown={onHandleKeyDown("rotate")}
         title="Rotate (hold Shift to snap 15 degrees)"
         className="pointer-events-auto absolute"
         style={{
+          pointerEvents: "auto",
           left: "50%",
           top: -rotateOffset - handleSize / 2,
           width: handleSize,
@@ -280,11 +356,15 @@ export function SelectionOverlay({ getRect, beginHandleGesture }: SelectionOverl
       {/* 8 resize handles. Each is a small square pinned at its corner/edge and
           counter-rotated back upright so it stays axis-aligned to the viewer. */}
       {RESIZE_HANDLES.map((h) => (
-        <div
+        <button
+          type="button"
+          aria-label={`Resize overlay ${HANDLE_LABELS[h.id]}`}
           key={h.id}
           onPointerDown={onHandleDown(h.id)}
+          onKeyDown={onHandleKeyDown(h.id)}
           className="pointer-events-auto absolute"
           style={{
+            pointerEvents: "auto",
             left: `${h.cx * 100}%`,
             top: `${h.cy * 100}%`,
             width: handleSize,

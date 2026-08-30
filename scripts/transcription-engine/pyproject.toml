@@ -1,0 +1,5 @@
+[project]
+name = "repurpose-transcription-engine"
+version = "1.0.0"
+requires-python = ">=3.10"
+dependencies = ["faster-whisper==1.2.1"]

@@ -13,7 +13,15 @@
 // same-day same-name collision.
 // ===========================================================================
 
-import type { Word } from "@/lib/repurpose/types";
+import {
+  type Clip,
+  type FootageMeta,
+  type Word,
+} from "@/lib/repurpose/types";
+import {
+  effectiveVideoTimelineDuration,
+  isUntouchedVideoTimeline,
+} from "@/lib/repurpose/transcript-application";
 
 // Filler / function words that carry no topical signal. Kept lean but covers the
 // words that dominate spoken-English frequency counts.
@@ -69,6 +77,47 @@ export function deriveShortTitle(words: readonly Word[]): string | null {
 
   const title = top.join(" ").trim();
   return title.length > 0 ? title : null;
+}
+
+function titleFromOriginalName(originalName: string | undefined): string | null {
+  if (!originalName) return null;
+  const withoutExtension = originalName.replace(/\.[^./\\]+$/, "");
+  const sanitized = withoutExtension
+    .replace(/[<>:"/\\|?*\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return sanitized.length > 0 ? sanitized : null;
+}
+
+function hasPlayableVideoBootstrap(
+  clips: readonly Clip[],
+  footageMeta: FootageMeta | null,
+  words: readonly Word[]
+): boolean {
+  return (
+    clips.length > 0 &&
+    Boolean(footageMeta?.screenSource && footageMeta.faceCamSource) &&
+    isUntouchedVideoTimeline({
+      clips,
+      words,
+      effectiveDuration: effectiveVideoTimelineDuration(footageMeta),
+    })
+  );
+}
+
+/** Resolve a provisional project's stable title without naming it after one source too early. */
+export function deriveProjectTitle(
+  words: readonly Word[],
+  footageMeta: FootageMeta | null,
+  clips: readonly Clip[]
+): string | null {
+  return (
+    deriveShortTitle(words) ??
+    (hasPlayableVideoBootstrap(clips, footageMeta, words)
+      ? titleFromOriginalName(footageMeta?.screenSource?.originalName) ??
+        titleFromOriginalName(footageMeta?.faceCamSource?.originalName)
+      : null)
+  );
 }
 
 export function titleCaseWord(w: string): string {

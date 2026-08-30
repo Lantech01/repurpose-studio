@@ -50,6 +50,9 @@ import {
   PLAYBACK_RATES,
   useRepurposeStore,
 } from "@/lib/repurpose/store";
+import { effectiveSplitRatio } from "@/lib/repurpose/split-ratio";
+import { splitRatioAt } from "@/lib/repurpose/time-map";
+import { resolveEffectivePrimaryOverlay } from "@/lib/repurpose/overlay-geometry";
 import type { ClipTransition } from "@/lib/repurpose/types";
 
 export interface TransportBarProps {
@@ -58,6 +61,12 @@ export interface TransportBarProps {
 }
 
 const FALLBACK_FPS = 30;
+const PASTE_PREVIEW_RECT = {
+  left: 0,
+  top: 0,
+  width: 1080,
+  height: 1920,
+};
 
 /**
  * Global transition presets for the "restyle every cut" picker. Mirror the
@@ -358,7 +367,21 @@ export function TransportBar({ className }: TransportBarProps) {
           if (!mod || e.shiftKey || e.altKey) break;
           const sel = window.getSelection();
           if (sel && sel.type === "Range") break;
-          if (store.copySelectedAttributes()) e.preventDefault();
+          let overlayId: string | undefined;
+          if (store.selectedOverlayId || store.selectedOverlayIds.length > 0) {
+            const primary = resolveEffectivePrimaryOverlay(
+              store.overlays,
+              store.selectedOverlayIds,
+              store.selectedOverlayId,
+              effectiveSplitRatio(
+                splitRatioAt(store.clips, store.playhead, store.splitRatio),
+                PASTE_PREVIEW_RECT.height
+              )
+            );
+            if (!primary) break;
+            overlayId = primary.id;
+          }
+          if (store.copySelectedAttributes(overlayId)) e.preventDefault();
           break;
         }
         case "KeyV":
@@ -366,7 +389,15 @@ export function TransportBar({ className }: TransportBarProps) {
           // same-kind selection (Descript's Paste Attributes chord). Plain
           // Cmd/Ctrl+V stays the media-blob paste (useOverlayPaste).
           if (!mod || !e.shiftKey || e.altKey) break;
-          if (store.pasteAttributesToSelection()) e.preventDefault();
+          if (
+            store.pasteAttributesToSelection(
+              PASTE_PREVIEW_RECT,
+              effectiveSplitRatio(
+                splitRatioAt(store.clips, store.playhead, store.splitRatio),
+                PASTE_PREVIEW_RECT.height
+              )
+            )
+          ) e.preventDefault();
           break;
         case "KeyM":
           // Add a marker at the playhead. Plain M only.

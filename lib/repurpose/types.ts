@@ -13,6 +13,8 @@
 import type { CaptionStyle, CaptionBlock } from "./captions";
 import type { MediaInspection } from "./media-types";
 
+export const VIDEO_TIMELINE_CLIP_ID = "video-full-span";
+
 export type VideoImportPhase =
   | "copying"
   | "inspecting"
@@ -198,9 +200,10 @@ export interface Clip {
    * absent = "use the global `splitRatio`", so a scene only carries a value once
    * Manthan drags the coral handle while it is the active clip. Lets each scene
    * frame its face-cam/screen split independently (one scene tucks the face up,
-   * the next gives it more room) instead of one split for the whole reel. At a
+   * the next gives it more room) instead of one split for the whole reel. `0`
+   * makes Face full-frame; `1` makes Screen full-frame. At a
    * cut the Smart transition eases from the outgoing clip's resolved split to
-   * this one's (see `splitRatioAt` in ./time-map.ts). Clamped 0.4-0.6 like the
+   * this one's (see `splitRatioAt` in ./time-map.ts). Clamped to [0, 1] like the
    * global. Render-time only -- never ripples the timeline or remaps keyframes.
    * Survives ripple/persistence/undo for free (plain optional data on the clip,
    * exactly like `transitionIn`).
@@ -289,6 +292,16 @@ export interface OverlayTransform {
   rotation: number;
 }
 
+export type OverlayEffectType = "none" | "zoom" | "slide" | "pop" | "fade";
+
+export type OverlaySlideDirection = "left" | "right" | "up" | "down";
+
+export interface OverlayEffect {
+  type: OverlayEffectType;
+  durationSec: number;
+  direction?: OverlaySlideDirection;
+}
+
 /**
  * Payload for the attribute clipboard ("copy position" Cmd/Ctrl+C -> "paste
  * attributes" Cmd/Ctrl+Shift+V, Descript's chord). Same-kind paste only, like
@@ -305,7 +318,14 @@ export type AttributeClipboard =
       screenFraming?: FaceFraming;
       splitRatio: number;
     }
-  | { kind: "overlay"; transform: OverlayTransform; opacity: number };
+  | {
+      kind: "overlay";
+      transform: OverlayTransform;
+      opacity: number;
+      entranceEffect: OverlayEffect;
+      exitEffect: OverlayEffect;
+      cornerRadius: number;
+    };
 
 /**
  * A free-floating external media layer composited ON TOP of the two base
@@ -374,6 +394,12 @@ export interface Overlay {
    * it never tweens at a cut).
    */
   opacity: number;
+  /** Optional entrance animation; absent legacy values normalize to no effect. */
+  entranceEffect?: OverlayEffect;
+  /** Optional exit animation; absent legacy values normalize to no effect. */
+  exitEffect?: OverlayEffect;
+  /** Uniform corner radius, normalized to 0..0.5 of the shorter rendered side. */
+  cornerRadius?: number;
   /**
    * Video overlays are ALWAYS muted -- true for kind:"video", absent for images.
    * A permanent rule, never a deferral: an overlay contributes no audio, ever.

@@ -12,8 +12,8 @@
 //   - A DPR-correct <canvas> that calls the pure `drawFrame` (lib/repurpose/
 //     compositor.ts) every rAF / store change to composite screen (top) +
 //     face (bottom) per the current splitRatio and pan/zoom keyframes.
-//   - A draggable split-handle overlay (drag to change splitRatio, clamped
-//     0.4-0.6 by the store's setSplitRatio).
+//   - A draggable split-handle overlay (drag to change splitRatio across its
+//     full range, with endpoint snapping).
 //   - Per-region drag-to-pan and scroll-to-zoom, which write a new pan/zoom
 //     keyframe at the current playhead for that track.
 //
@@ -51,7 +51,13 @@ import {
   punchScaleAt,
 } from "@/lib/repurpose/time-map";
 import { gradeFilter } from "@/lib/repurpose/color-grade";
-import { drawCaptions } from "@/lib/repurpose/captions";
+import {
+  activeCaptionBlockAt,
+  drawCaptions,
+  type CaptionBlock,
+  type CaptionLayout,
+  type CaptionStyle,
+} from "@/lib/repurpose/captions";
 import { loadCaptionFonts } from "@/lib/repurpose/caption-fonts";
 import type { Clip, Overlay } from "@/lib/repurpose/types";
 import {
@@ -60,7 +66,19 @@ import {
   StandbySeeker,
 } from "@/lib/repurpose/preview-preseek";
 import type { PreviewRect } from "@/lib/repurpose/overlay-geometry";
-import { clampOverlayToTopHalf } from "@/lib/repurpose/overlay-geometry";
+import {
+  isOverlayBandVisible,
+  resolveEffectivePrimaryOverlay,
+} from "@/lib/repurpose/overlay-geometry";
+import {
+  resolveOverlayAppearanceAt,
+  type OverlayFrameSnapshot,
+} from "@/lib/repurpose/overlay-effects";
+import {
+  clampSplitRatio,
+  effectiveSplitRatio,
+  snapPointerSplitRatio,
+} from "@/lib/repurpose/split-ratio";
 import { GhostOverflowLayer } from "./GhostOverflowLayer";
 import { SnapGuides } from "./SnapGuides";
 import { useObjectSelection } from "./useObjectSelection";
@@ -100,8 +118,6 @@ const BROWSER_FRAME_SCHEDULER: PreviewFrameScheduler = {
   now: () => performance.now(),
 };
 
-const MIN_SPLIT = 0.4;
-const MAX_SPLIT = 0.6;
 const ZOOM_MIN = 1;
 const ZOOM_MAX = 6;
 const BASE_MEDIA_LOAD_ERROR =
@@ -166,6 +182,66 @@ interface RegionDragState {
   startClientX: number;
   startClientY: number;
   startTransform: { x: number; y: number; scale: number };
+}
+
+interface SplitDividerGesture {
+  pointerId: number;
+  token: string;
+  element: HTMLDivElement;
+  onMove: (event: PointerEvent) => void;
+  onUp: (event: PointerEvent) => void;
+  onCancel: (event: PointerEvent) => void;
+}
+
+interface CaptionPointerGesture {
+  pointerId: number;
+  token: string;
+  element: HTMLDivElement;
+  blockId: string;
+  sourceFrame: number;
+  startClientY: number;
+  cssHeight: number;
+  startAnchorY: number;
+  finalAnchorY: number;
+  anchorRange: { min: number; max: number };
+  settledSplit: number;
+  attachedTargetAnchorY: number | null;
+  activated: boolean;
+  snapped: boolean;
+  onMove: (event: PointerEvent) => void;
+  onUp: (event: PointerEvent) => void;
+  onCancel: (event: PointerEvent) => void;
+}
+
+interface CaptionFrameLayout {
+  layout: CaptionLayout;
+  outputTime: number;
+  sourceTime: number;
+  renderedSplit: number;
+  settledSplit: number;
+  projectEpoch: number;
+  captionStyle: CaptionStyle;
+  captionBlocks: CaptionBlock[];
+  clips: Clip[];
+  keyboardPlacement: {
+    attached: boolean;
+    requestedPositionYPct: number;
+  } | null;
+}
+
+function updateCaptionSliderValue(
+  target: HTMLDivElement,
+  requestedPositionYPct: number,
+  attached: boolean
+): void {
+  const value = Math.round(
+    Math.max(0, Math.min(1, requestedPositionYPct)) * 100
+  );
+  target.setAttribute("aria-valuenow", String(value));
+  target.setAttribute(
+    "aria-valuetext",
+    `${attached ? "Attached to split" : "Detached"} at ${value}%`
+  );
 }
 
 function PreviewOverlayVideo({
@@ -342,15 +418,77 @@ export function PreviewCanvas({
   // The last output time written by the transport. A larger mismatch means an
   // external timeline/transcript seek, which re-anchors before the next sample.
   const expectedPlayheadRef = useRef<number | null>(null);
-  // The split ratio ACTUALLY composited this frame -- per-clip, eased across
-  // cuts (splitRatioAt). The rAF loop writes it here every frame so the split
-  // handle overlay + the pan/zoom region divider can sit on the real seam the
-  // video is drawn at, not the raw global default. A ref (read by the DOM handle
-  // position) + a throttled state mirror (to re-render the handle) so we don't
-  // setState 60x/sec. Seeded to the default split (0.5) for the very first paint;
-  // the loop overwrites it on frame 1 with the real per-scene value.
+  // The settled per-frame split, excluding direct divider manipulation. Mutation
+  // paths read only this ref; visual paths may layer transientSplitRef over it.
   const liveSplitRef = useRef<number>(0.5);
+  const transientSplitRef = useRef<number | null>(null);
+  const splitGestureRef = useRef<SplitDividerGesture | null>(null);
+  const splitGestureStoreUpdateRef = useRef(false);
+  const captionLayoutRef = useRef<CaptionLayout | null>(null);
+  const captionFrameRef = useRef<CaptionFrameLayout | null>(null);
+  const captionHitTargetRef = useRef<HTMLDivElement>(null);
+  const captionSnapGuideRef = useRef<HTMLDivElement>(null);
+  const captionTransientPositionRef = useRef<{
+    blockId: string;
+    positionYPct: number;
+  } | null>(null);
+  const captionGestureRef = useRef<CaptionPointerGesture | null>(null);
   const [handleSplit, setHandleSplit] = useState<number>(0.5);
+  const handleSplitRef = useRef<number>(0.5);
+  const getEffectiveSplitRatio = useCallback(
+    () =>
+      effectiveSplitRatio(
+        transientSplitRef.current ?? liveSplitRef.current,
+        height
+      ),
+    [height]
+  );
+  const getSettledSplitRatio = useCallback(() => liveSplitRef.current, []);
+  const overlayFrameSnapshotRef = useRef<OverlayFrameSnapshot | null>(null);
+  const getOverlayFrameSnapshot = useCallback(
+    () => overlayFrameSnapshotRef.current,
+    []
+  );
+  const publishCaptionLayout = useCallback(
+    (layout: CaptionLayout | null) => {
+      captionLayoutRef.current = layout;
+      const target = captionHitTargetRef.current;
+      const container = containerRef.current;
+      if (!target || !container || !layout) {
+        if (target) {
+          target.hidden = true;
+          target.style.pointerEvents = "none";
+          target.style.cursor = "";
+        }
+        return;
+      }
+      const rect = container.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) {
+        target.hidden = true;
+        target.style.pointerEvents = "none";
+        target.style.cursor = "";
+        return;
+      }
+      const bounds = layout.visualBounds;
+      target.style.left = `${(bounds.left / width) * rect.width}px`;
+      target.style.top = `${(bounds.top / height) * rect.height}px`;
+      target.style.width = `${((bounds.right - bounds.left) / width) * rect.width}px`;
+      target.style.height = `${((bounds.bottom - bounds.top) / height) * rect.height}px`;
+      target.style.pointerEvents = "auto";
+      target.style.cursor = "ns-resize";
+      updateCaptionSliderValue(
+        target,
+        layout.requestedAnchorY / height,
+        layout.style.pinToSplit
+      );
+      target.hidden = false;
+    },
+    [height, width]
+  );
+  const hideCaptionSnapGuide = useCallback(() => {
+    const guide = captionSnapGuideRef.current;
+    if (guide) guide.hidden = true;
+  }, []);
   // Alignment grid (rule-of-thirds + center crosshair) to eyeball-center an
   // overlay. Toggled from the top bar (store-owned so the navbar button and this
   // preview share one source of truth). DOM-only -- it is a sibling above the
@@ -374,8 +512,6 @@ export function PreviewCanvas({
   }, []);
 
   const splitRatio = useRepurposeStore((s) => s.splitRatio);
-  const setSplitRatio = useRepurposeStore((s) => s.setSplitRatio);
-  const setClipSplitRatio = useRepurposeStore((s) => s.setClipSplitRatio);
   const setClipFaceFraming = useRepurposeStore((s) => s.setClipFaceFraming);
   const setClipScreenFraming = useRepurposeStore((s) => s.setClipScreenFraming);
   const playhead = useRepurposeStore((s) => s.playhead);
@@ -882,6 +1018,11 @@ export function PreviewCanvas({
   // like the two base videos. A video overlay is ALWAYS muted (an overlay never
   // emits audio); the pooled <video> below sets `muted`.
   const imgPoolRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const overlayPreviewSrcRef = useRef<Map<string, string>>(new Map());
+  const getOverlayPreviewSrc = useCallback(
+    (overlayId: string) => overlayPreviewSrcRef.current.get(overlayId),
+    []
+  );
 
   // --- Register the caption faces for canvas text (once on mount) -------------
   // Captions are drawn via ctx.fillText, so the browser must have loaded + added
@@ -1179,7 +1320,11 @@ export function PreviewCanvas({
 
       // 1) CLOCK -- output time comes only from the monotonic transport anchor.
       // Base and overlay media follow the mapped source time within drift limits.
-      if (live.isPlaying && transportConfirmedRef.current) {
+      if (
+        live.isPlaying &&
+        transportConfirmedRef.current &&
+        captionGestureRef.current === null
+      ) {
         const regionStart = live.inPoint ?? 0;
         const regionEnd = live.outPoint ?? live.duration;
         const rate = live.playbackRate > 0 ? live.playbackRate : 1;
@@ -1329,14 +1474,21 @@ export function PreviewCanvas({
         const t = sampledOutput ?? storedPlayhead;
         const playing = requestedPlaying && transportConfirmedRef.current;
 
-        // PER-SCENE split, eased across cuts (splitRatioAt). This is the split
-        // actually composited this frame -- a scene Manthan tucked the face up on
-        // keeps its own value, and the seam glides at the cut into it. Publish it
-        // so the DOM handle overlay + region dividers sit on the real seam; mirror
-        // to state only when it changes enough to matter (avoid a 60fps setState).
-        const liveSplit = splitRatioAt(liveClips, t, globalSplit);
-        if (Math.abs(liveSplit - liveSplitRef.current) > 1e-4) {
-          liveSplitRef.current = liveSplit;
+        // Resolve the settled per-scene split first, then layer a direct divider
+        // gesture over visual consumers only. Persisted mutations keep reading
+        // liveSplitRef while the compositor, captions, hit tests, and DOM chrome
+        // use liveSplit. Mirror visual changes to state only when needed.
+        const settledSplit = effectiveSplitRatio(
+          splitRatioAt(liveClips, t, globalSplit),
+          height
+        );
+        liveSplitRef.current = settledSplit;
+        const liveSplit =
+          transientSplitRef.current === null
+            ? settledSplit
+            : effectiveSplitRatio(transientSplitRef.current, height);
+        if (Math.abs(liveSplit - handleSplitRef.current) > 1e-4) {
+          handleSplitRef.current = liveSplit;
           setHandleSplit(liveSplit);
         }
 
@@ -1415,7 +1567,20 @@ export function PreviewCanvas({
           .filter((o) => t >= o.timelineStart && t < o.timelineEnd)
           .sort((a, b) => a.zIndex - b.zIndex);
         const overlayDraws: OverlayDraw[] = [];
+        const outputRect = { left: 0, top: 0, width, height };
+        const appearances = new Map(
+          liveOverlays.map((overlay) => [
+            overlay.id,
+            resolveOverlayAppearanceAt(overlay, t, outputRect, liveSplit),
+          ] as const)
+        );
+        overlayFrameSnapshotRef.current = {
+          outputTime: t,
+          splitRatio: liveSplit,
+          appearances,
+        };
         for (const o of active) {
+          const appearance = appearances.get(o.id)!;
           if (o.kind === "image") {
             const img = imgPoolRef.current.get(o.id) ?? null;
             const ready = !!img && img.naturalWidth > 0 && img.naturalHeight > 0;
@@ -1424,7 +1589,11 @@ export function PreviewCanvas({
               source: img,
               naturalWidth: img.naturalWidth,
               naturalHeight: img.naturalHeight,
-              transform: { ...o.transform, opacity: o.opacity },
+              transform: {
+                ...appearance.transform,
+                opacity: o.opacity * appearance.opacityMultiplier,
+              },
+              cornerRadius: appearance.cornerRadius,
               band: o.band,
             });
           } else {
@@ -1447,7 +1616,11 @@ export function PreviewCanvas({
               source: v,
               naturalWidth: v.videoWidth,
               naturalHeight: v.videoHeight,
-              transform: { ...o.transform, opacity: o.opacity },
+              transform: {
+                ...appearance.transform,
+                opacity: o.opacity * appearance.opacityMultiplier,
+              },
+              cornerRadius: appearance.cornerRadius,
               band: o.band,
             });
           }
@@ -1504,7 +1677,8 @@ export function PreviewCanvas({
         // SOURCE seconds, so map the current playhead t -> source time first.
         if (capsOn) {
           const srcT = timelineToSourceTime(liveClips, t);
-          drawCaptions(ctx, {
+          const transientPosition = captionTransientPositionRef.current;
+          const captionLayout = drawCaptions(ctx, {
             style: capStyle,
             blocks: capBlocks,
             srcT,
@@ -1513,7 +1687,27 @@ export function PreviewCanvas({
             // Pin captions to the split seam so dragging the split (face-cam up/
             // down) carries the captions with it -- see CaptionStyle.pinToSplit.
             splitRatio: liveSplit,
+            ...(transientPosition ? { transientPosition } : {}),
           });
+          captionFrameRef.current =
+            captionLayout && srcT !== null
+              ? {
+                  layout: captionLayout,
+                  outputTime: t,
+                  sourceTime: srcT,
+                  renderedSplit: liveSplit,
+                  settledSplit,
+                  projectEpoch: useRepurposeStore.getState().projectEpoch,
+                  captionStyle: capStyle,
+                  captionBlocks: capBlocks,
+                  clips: liveClips,
+                  keyboardPlacement: null,
+                }
+              : null;
+          publishCaptionLayout(captionLayout);
+        } else {
+          captionFrameRef.current = null;
+          publishCaptionLayout(null);
         }
       }
       if (rafRef.current === null) {
@@ -1541,46 +1735,454 @@ export function PreviewCanvas({
     normalizeBaseMute,
     playActiveOverlay,
     playRequiredBaseMedia,
+    publishCaptionLayout,
   ]);
 
+  const finishCaptionGesture = useCallback(
+    (
+      gesture: CaptionPointerGesture,
+      mode: "end" | "cancel" | "store-cancel"
+    ) => {
+      if (captionGestureRef.current !== gesture) return;
+      captionGestureRef.current = null;
+      window.removeEventListener("pointermove", gesture.onMove);
+      window.removeEventListener("pointerup", gesture.onUp);
+      window.removeEventListener("pointercancel", gesture.onCancel);
+      try {
+        gesture.element.releasePointerCapture(gesture.pointerId);
+      } catch {
+        // Capture may already be gone after browser cancellation or node removal.
+      }
+      captionTransientPositionRef.current = null;
+      hideCaptionSnapGuide();
+      if (mode === "store-cancel") return;
+      const store = useRepurposeStore.getState();
+      if (mode === "end" && gesture.activated) {
+        store.completeCaptionGesture(
+          gesture.token,
+          gesture.snapped
+            ? { kind: "attach" }
+            : {
+                kind: "detach",
+                positionYPct: gesture.finalAnchorY / height,
+              }
+        );
+      } else {
+        store.cancelCaptionGesture(gesture.token);
+      }
+    },
+    [height, hideCaptionSnapGuide]
+  );
+
+  useEffect(() => {
+    const unsubscribeCancellation = useRepurposeStore
+      .getState()
+      .subscribeCaptionGestureCancellation(() => {
+        const gesture = captionGestureRef.current;
+        if (gesture) finishCaptionGesture(gesture, "store-cancel");
+      });
+    const unsubscribeStore = useRepurposeStore.subscribe((state, previous) => {
+      const gesture = captionGestureRef.current;
+      if (!gesture) return;
+      if (
+        state.projectEpoch !== previous.projectEpoch ||
+        state.captionBlocks !== previous.captionBlocks ||
+        !state.captionsEnabled ||
+        !state.captionBlocks.some((block) => block.id === gesture.blockId)
+      ) {
+        finishCaptionGesture(gesture, "cancel");
+      }
+    });
+    return () => {
+      unsubscribeCancellation();
+      unsubscribeStore();
+      const gesture = captionGestureRef.current;
+      if (gesture) finishCaptionGesture(gesture, "cancel");
+    };
+  }, [finishCaptionGesture]);
+
+  const currentCaptionFrame = useCallback((): CaptionFrameLayout | null => {
+    const frame = captionFrameRef.current;
+    if (!frame) return null;
+    const store = useRepurposeStore.getState();
+    const sourceTime = timelineToSourceTime(store.clips, store.playhead);
+    const activeBlock =
+      sourceTime === null
+        ? null
+        : activeCaptionBlockAt(store.captionBlocks, sourceTime);
+    if (
+      !store.captionsEnabled ||
+      store.projectEpoch !== frame.projectEpoch ||
+      store.playhead !== frame.outputTime ||
+      sourceTime !== frame.sourceTime ||
+      store.captionStyle !== frame.captionStyle ||
+      store.captionBlocks !== frame.captionBlocks ||
+      store.clips !== frame.clips ||
+      activeBlock?.id !== frame.layout.activeBlock.id ||
+      frame.layout.activeBlockId !== frame.layout.activeBlock.id
+    ) {
+      captionFrameRef.current = null;
+      publishCaptionLayout(null);
+      return null;
+    }
+    return frame;
+  }, [publishCaptionLayout]);
+
+  const settledCaptionAnchorY = useCallback(
+    (frame: CaptionFrameLayout): number | null =>
+      frame.renderedSplit === frame.settledSplit
+        ? frame.layout.attachedTargetAnchorY
+        : Math.min(
+            frame.layout.anchorRange.max,
+            Math.max(
+              frame.layout.anchorRange.min,
+              (frame.settledSplit + frame.layout.style.splitOffsetPct) * height
+            )
+          ),
+    [height]
+  );
+
+  const handleCaptionPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const frame = currentCaptionFrame();
+      const layout = frame?.layout ?? null;
+      const container = containerRef.current;
+      if (!frame || !layout || !container) return;
+      const rect = container.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      const outputX = ((event.clientX - rect.left) / rect.width) * width;
+      const outputY = ((event.clientY - rect.top) / rect.height) * height;
+      const bounds = layout.visualBounds;
+      if (
+        outputX < bounds.left ||
+        outputX > bounds.right ||
+        outputY < bounds.top ||
+        outputY > bounds.bottom
+      ) {
+        return;
+      }
+      const store = useRepurposeStore.getState();
+      const previous = captionGestureRef.current;
+      if (previous) finishCaptionGesture(previous, "cancel");
+      pause();
+      store.selectCaptionBlock(layout.activeBlockId);
+      const token = store.beginCaptionGesture(layout.activeBlockId);
+      if (token === null) return;
+      const pointerId = event.pointerId;
+      const element = event.currentTarget;
+      try {
+        element.setPointerCapture(pointerId);
+      } catch {
+        // Window listeners still provide safe cleanup where capture is unavailable.
+      }
+      const attachedTargetAnchorY = settledCaptionAnchorY(frame);
+      const onMove = (moveEvent: PointerEvent) => {
+        const gesture = captionGestureRef.current;
+        if (
+          !gesture ||
+          gesture.token !== token ||
+          moveEvent.pointerId !== pointerId
+        ) {
+          return;
+        }
+        const deltaCss = moveEvent.clientY - gesture.startClientY;
+        if (!gesture.activated && Math.abs(deltaCss) < 3) return;
+        gesture.activated = true;
+        const deltaLogical = (deltaCss / gesture.cssHeight) * height;
+        const rawAnchor = Math.min(
+          gesture.anchorRange.max,
+          Math.max(gesture.anchorRange.min, gesture.startAnchorY + deltaLogical)
+        );
+        const snapDistanceCss =
+          gesture.attachedTargetAnchorY === null
+            ? Infinity
+            : (Math.abs(rawAnchor - gesture.attachedTargetAnchorY) /
+                height) *
+              gesture.cssHeight;
+        gesture.snapped = snapDistanceCss <= 12;
+        gesture.finalAnchorY = gesture.snapped
+          ? gesture.attachedTargetAnchorY!
+          : rawAnchor;
+        captionTransientPositionRef.current = {
+          blockId: gesture.blockId,
+          positionYPct: gesture.finalAnchorY / height,
+        };
+        const guide = captionSnapGuideRef.current;
+        if (guide) {
+          guide.hidden = !gesture.snapped;
+          if (gesture.snapped) {
+            guide.style.top = `${
+              (gesture.finalAnchorY / height) * gesture.cssHeight
+            }px`;
+          }
+        }
+      };
+      const onUp = (upEvent: PointerEvent) => {
+        if (upEvent.pointerId !== pointerId) return;
+        const gesture = captionGestureRef.current;
+        if (gesture?.token === token) finishCaptionGesture(gesture, "end");
+      };
+      const onCancel = (cancelEvent: PointerEvent) => {
+        if (cancelEvent.pointerId !== pointerId) return;
+        const gesture = captionGestureRef.current;
+        if (gesture?.token === token) finishCaptionGesture(gesture, "cancel");
+      };
+      captionGestureRef.current = {
+        pointerId,
+        token,
+        element,
+        blockId: layout.activeBlockId,
+        sourceFrame: frame.sourceTime,
+        startClientY: event.clientY,
+        cssHeight: rect.height,
+        startAnchorY: layout.anchorY,
+        finalAnchorY: layout.anchorY,
+        anchorRange: { ...layout.anchorRange },
+        settledSplit: frame.settledSplit,
+        attachedTargetAnchorY,
+        activated: false,
+        snapped: false,
+        onMove,
+        onUp,
+        onCancel,
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onCancel);
+    },
+    [
+      currentCaptionFrame,
+      finishCaptionGesture,
+      height,
+      pause,
+      settledCaptionAnchorY,
+      width,
+    ]
+  );
+
+  const handleCaptionKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>) => {
+      const isAttach = event.key === "Enter" || event.key === " ";
+      const isPosition = ["ArrowUp", "ArrowDown", "Home", "End"].includes(
+        event.key
+      );
+      if (!isAttach && !isPosition) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.currentTarget.hidden) return;
+      const frame = currentCaptionFrame();
+      if (!frame) return;
+
+      const store = useRepurposeStore.getState();
+      let keyboardPlacement: NonNullable<CaptionFrameLayout["keyboardPlacement"]>;
+      if (isAttach) {
+        store.attachCaptionBlock(frame.layout.activeBlockId);
+        const attachedAnchorY = settledCaptionAnchorY(frame);
+        keyboardPlacement = {
+          attached: true,
+          requestedPositionYPct:
+            (attachedAnchorY ?? frame.layout.requestedAnchorY) / height,
+        };
+      } else {
+        const attachedAnchorY = settledCaptionAnchorY(frame);
+        const current = frame.keyboardPlacement
+          ? frame.keyboardPlacement.requestedPositionYPct
+          : frame.layout.style.pinToSplit
+            ? (attachedAnchorY ?? frame.layout.requestedAnchorY) / height
+            : frame.layout.requestedAnchorY / height;
+        const step = event.shiftKey ? 0.1 : 0.01;
+        const next =
+          event.key === "Home"
+            ? 0
+            : event.key === "End"
+              ? 1
+              : Math.max(
+                  0,
+                  Math.min(
+                    1,
+                    current + (event.key === "ArrowUp" ? -step : step)
+                  )
+                );
+        store.detachCaptionBlock(frame.layout.activeBlockId, next, {
+          discrete: true,
+        });
+        keyboardPlacement = {
+          attached: false,
+          requestedPositionYPct: next,
+        };
+      }
+      const nextStore = useRepurposeStore.getState();
+      captionFrameRef.current = {
+        ...frame,
+        projectEpoch: nextStore.projectEpoch,
+        captionBlocks: nextStore.captionBlocks,
+        keyboardPlacement,
+      };
+      updateCaptionSliderValue(
+        event.currentTarget,
+        keyboardPlacement.requestedPositionYPct,
+        keyboardPlacement.attached
+      );
+    },
+    [currentCaptionFrame, height, settledCaptionAnchorY]
+  );
+
   // ---------------------------------------------------------------------
-  // Split-handle drag: pointer on the divider adjusts the split for the SCENE
-  // under the playhead (per-clip), not the whole reel. Whichever kept clip owns
-  // the current playhead gets its own splitRatio; the cut into it eases from the
-  // previous scene's split. Falls back to the global default only when the
-  // playhead is over no kept clip (empty timeline / a collapsed region), so the
-  // handle is never dead. Reads the active clip fresh from the store each move
-  // (liveRef holds the current playhead + clips) so a clip edit mid-session is
-  // always respected.
+  // Split-handle drag: freeze the scene/global target and store transaction at
+  // pointer-down. A local transient ratio bypasses cut easing during direct
+  // manipulation; releasing returns every consumer to frame-resolved playback.
   // ---------------------------------------------------------------------
+  const finishSplitGesture = useCallback(
+    (
+      gesture: SplitDividerGesture,
+      mode: "end" | "cancel",
+      restoreFrame = true
+    ) => {
+      if (splitGestureRef.current !== gesture) return;
+      splitGestureRef.current = null;
+      window.removeEventListener("pointermove", gesture.onMove);
+      window.removeEventListener("pointerup", gesture.onUp);
+      window.removeEventListener("pointercancel", gesture.onCancel);
+      try {
+        gesture.element.releasePointerCapture(gesture.pointerId);
+      } catch {
+        // Capture may already have been released by the browser or node removal.
+      }
+      transientSplitRef.current = null;
+      const store = useRepurposeStore.getState();
+      if (mode === "end") store.endSplitRatioGesture(gesture.token);
+      else store.cancelSplitRatioGesture(gesture.token);
+
+      if (restoreFrame) {
+        const resolved = effectiveSplitRatio(
+          splitRatioAt(store.clips, store.playhead, store.splitRatio),
+          height
+        );
+        liveSplitRef.current = resolved;
+        handleSplitRef.current = resolved;
+        setHandleSplit(resolved);
+      }
+    },
+    [height]
+  );
+
+  useEffect(() => {
+    const unsubscribe = useRepurposeStore.subscribe((state, previous) => {
+      const gesture = splitGestureRef.current;
+      if (!gesture || splitGestureStoreUpdateRef.current) return;
+      if (
+        state.projectEpoch !== previous.projectEpoch ||
+        state.clips !== previous.clips ||
+        state.splitRatio !== previous.splitRatio
+      ) {
+        finishSplitGesture(gesture, "cancel");
+      }
+    });
+    const unsubscribeCancellation = useRepurposeStore
+      .getState()
+      .subscribeSplitRatioGestureCancellation(() => {
+        const gesture = splitGestureRef.current;
+        if (gesture) finishSplitGesture(gesture, "cancel");
+      });
+    return () => {
+      unsubscribe();
+      unsubscribeCancellation();
+      const gesture = splitGestureRef.current;
+      if (gesture) finishSplitGesture(gesture, "cancel", false);
+    };
+  }, [finishSplitGesture]);
+
   const handleDividerPointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
       e.preventDefault();
       e.stopPropagation();
       const container = containerRef.current;
       if (!container) return;
+
+      const previous = splitGestureRef.current;
+      if (previous) finishSplitGesture(previous, "cancel");
+
+      pause();
+      const store = useRepurposeStore.getState();
+      const active = activeClipAt(store.clips, store.playhead);
+      const gestureTarget = active
+        ? ({ kind: "clip", id: active.id } as const)
+        : ({ kind: "global" } as const);
+      const token = store.beginSplitRatioGesture(gestureTarget);
+      if (token === null) return;
+
       const pointerId = e.pointerId;
       const target = e.currentTarget;
       target.setPointerCapture(pointerId);
-
       const onMove = (moveEvent: PointerEvent) => {
+        const gesture = splitGestureRef.current;
+        if (!gesture || gesture.token !== token || moveEvent.pointerId !== pointerId) {
+          return;
+        }
         const rect = container.getBoundingClientRect();
+        if (rect.height <= 0) return;
         const localY = moveEvent.clientY - rect.top;
-        const ratio = clamp(localY / rect.height, MIN_SPLIT, MAX_SPLIT);
-        // Target the clip under the playhead so only THIS scene's split changes.
-        const { clips: liveClips, playhead: t } = liveRef.current;
-        const active = activeClipAt(liveClips, t);
-        if (active) setClipSplitRatio(active.id, ratio);
-        else setSplitRatio(ratio); // no scene here -> nudge the global default
+        const ratio = snapPointerSplitRatio(localY / rect.height);
+        transientSplitRef.current = ratio;
+        const effective = effectiveSplitRatio(ratio, height);
+        handleSplitRef.current = effective;
+        setHandleSplit(effective);
+        splitGestureStoreUpdateRef.current = true;
+        try {
+          useRepurposeStore
+            .getState()
+            .updateSplitRatioGesture(token, ratio);
+        } finally {
+          splitGestureStoreUpdateRef.current = false;
+        }
       };
-      const onUp = () => {
-        window.removeEventListener("pointermove", onMove);
-        window.removeEventListener("pointerup", onUp);
+      const onUp = (upEvent: PointerEvent) => {
+        if (upEvent.pointerId !== pointerId) return;
+        const gesture = splitGestureRef.current;
+        if (gesture?.token === token) finishSplitGesture(gesture, "end");
+      };
+      const onCancel = (cancelEvent: PointerEvent) => {
+        if (cancelEvent.pointerId !== pointerId) return;
+        const gesture = splitGestureRef.current;
+        if (gesture?.token === token) finishSplitGesture(gesture, "cancel");
+      };
+      splitGestureRef.current = {
+        pointerId,
+        token,
+        element: target,
+        onMove,
+        onUp,
+        onCancel,
       };
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onCancel);
     },
-    [setSplitRatio, setClipSplitRatio]
+    [finishSplitGesture, height, pause]
+  );
+
+  const handleDividerKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      let delta = 0;
+      let endpoint: number | null = null;
+      if (e.key === "ArrowUp" || e.key === "ArrowLeft") delta = -0.01;
+      else if (e.key === "ArrowDown" || e.key === "ArrowRight") delta = 0.01;
+      else if (e.key === "Home") endpoint = 0;
+      else if (e.key === "End") endpoint = 1;
+      else return;
+      e.preventDefault();
+
+      const store = useRepurposeStore.getState();
+      const active = activeClipAt(store.clips, store.playhead);
+      const current = active?.splitRatio ?? store.splitRatio;
+      const next = endpoint ?? clampSplitRatio(current + delta);
+      if (next === null) return;
+      if (active) store.setClipSplitRatio(active.id, next);
+      else store.setSplitRatio(next);
+    },
+    []
   );
 
   // ---------------------------------------------------------------------
@@ -1696,14 +2298,21 @@ export function PreviewCanvas({
       if (!el) return;
       const rect = el.getBoundingClientRect();
       const localY = e.clientY - rect.top;
+      const split = getEffectiveSplitRatio();
       const track: "screen" | "face" =
-        localY / rect.height < liveSplitRef.current ? "screen" : "face";
+        split <= 0
+          ? "face"
+          : split >= 1
+            ? "screen"
+            : localY / rect.height < split
+              ? "screen"
+              : "face";
       const current = currentTransformFor(track);
       const zoomDelta = -e.deltaY * 0.0015;
       const nextScale = clamp(current.scale * (1 + zoomDelta), ZOOM_MIN, ZOOM_MAX);
       writeTransform(track, { x: current.x, y: current.y, scale: nextScale });
     },
-    [currentTransformFor, writeTransform]
+    [currentTransformFor, getEffectiveSplitRatio, writeTransform]
   );
 
   // Bind the wheel-zoom handler as a NON-PASSIVE native listener so its
@@ -1731,7 +2340,10 @@ export function PreviewCanvas({
     return { left: r.left, top: r.top, width: r.width, height: r.height };
   }, []);
 
-  const { routePointerDown, beginHandleGesture } = useObjectSelection({ getRect });
+  const { routePointerDown, beginHandleGesture, adjustHandleByKeyboard } = useObjectSelection({
+    getRect,
+    getFrameSnapshot: getOverlayFrameSnapshot,
+  });
 
   // Clicking ANYWHERE outside the preview container (transcript rail, inspector,
   // timeline, top bar, or the dark margin around the 9:16) clears the canvas
@@ -1772,7 +2384,7 @@ export function PreviewCanvas({
         // band's share of the container per the composited split.
         const rect = e.currentTarget.getBoundingClientRect();
         const regionWidthPx = rect.width;
-        const split = liveSplitRef.current;
+        const split = getEffectiveSplitRatio();
         const regionHeightPx =
           route.region === "screen" ? rect.height * split : rect.height * (1 - split);
         beginRegionReframe(route.region, e, regionWidthPx, regionHeightPx);
@@ -1782,7 +2394,13 @@ export function PreviewCanvas({
       selectOverlay(null);
       selectClip(null);
     },
-    [routePointerDown, beginRegionReframe, selectClip, selectOverlay]
+    [
+      routePointerDown,
+      beginRegionReframe,
+      selectClip,
+      selectOverlay,
+      getEffectiveSplitRatio,
+    ]
   );
 
   // ---------------------------------------------------------------------
@@ -1797,9 +2415,9 @@ export function PreviewCanvas({
   //     screen-px -> normalized mapping the drag paths use, so nudge and drag agree.
   //   - Cmd/Ctrl+] bring forward, Cmd/Ctrl+[ send backward (setOverlayZ).
   //   - Esc clears the selection.
-  // Every nudge re-runs the HARD top-half keep-out (clampOverlayToTopHalf) so the
-  // overlay bottom can never be nudged across the split seam -- the same invariant
-  // drag/resize/duplicate/add enforce. Gated off the transcript panel + any
+  // Nudge writes only the explicit user delta onto the persisted transform. The
+  // frame resolver keeps the rendered overlay seam-safe without baking a
+  // transition's temporary correction. Gated off the transcript panel + any
   // editable target so typing never nudges or re-stacks an overlay.
   // ---------------------------------------------------------------------
   const updateOverlayTransform = useRepurposeStore((s) => s.updateOverlayTransform);
@@ -1815,12 +2433,34 @@ export function PreviewCanvas({
       ) {
         return;
       }
-      const id = useRepurposeStore.getState().selectedOverlayId;
-      if (!id) return;
+      const store = useRepurposeStore.getState();
+      if (!store.selectedOverlayId && store.selectedOverlayIds.length === 0) return;
 
       if (e.key === "Escape") {
         e.preventDefault();
-        useRepurposeStore.getState().selectOverlay(null);
+        store.selectOverlay(null);
+        return;
+      }
+
+      const settledSplit = getSettledSplitRatio();
+      const primary = resolveEffectivePrimaryOverlay(
+        store.overlays,
+        store.selectedOverlayIds,
+        store.selectedOverlayId,
+        settledSplit
+      );
+      if (!primary) return;
+      const id = primary.id;
+
+      // Overlay Cmd/Ctrl+D belongs here rather than Timeline: only the preview
+      // owns the current CSS rect and frame-effective (possibly per-scene) split.
+      if ((e.metaKey || e.ctrlKey) && e.code === "KeyD") {
+        const rect = getRect();
+        if (!rect) return;
+        e.preventDefault();
+        useRepurposeStore
+          .getState()
+          .duplicateOverlay(id, rect, settledSplit);
         return;
       }
 
@@ -1863,23 +2503,14 @@ export function PreviewCanvas({
       const ov = useRepurposeStore.getState().overlays.find((o) => o.id === id);
       if (!ov) return;
 
-      const nextX = ov.transform.x + (signX * px) / rect.width;
-      const nextY = ov.transform.y + (signY * px) / rect.height;
-      // HARD top-half keep-out -- correct the moved transform so the bottom edge
-      // never crosses the seam (splitRatio read fresh, like the drag paths).
-      const clampSplit = useRepurposeStore.getState().splitRatio;
-      const clamped = clampOverlayToTopHalf(
-        { ...ov.transform, x: nextX, y: nextY },
-        ov.naturalWidth,
-        ov.naturalHeight,
-        rect,
-        clampSplit
-      );
-      updateOverlayTransform(id, { x: clamped.x, y: clamped.y });
+      updateOverlayTransform(id, {
+        x: ov.transform.x + (signX * px) / rect.width,
+        y: ov.transform.y + (signY * px) / rect.height,
+      });
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [updateOverlayTransform, getRect]);
+  }, [updateOverlayTransform, getRect, getSettledSplitRatio]);
 
   // ---------------------------------------------------------------------
   // "P" = drop a mid-clip ZOOM PUNCH-IN at the playhead on the active scene.
@@ -2021,11 +2652,16 @@ export function PreviewCanvas({
             overlay={o}
             isPlaying={isPlaying}
             register={(el, previewSrc) => {
-              if (el) videoPoolRef.current.set(o.id, el);
-              else if (
+              if (el) {
+                videoPoolRef.current.set(o.id, el);
+                overlayPreviewSrcRef.current.set(o.id, previewSrc);
+              } else if (
                 videoPoolRef.current.get(o.id)?.dataset.overlaySrc === previewSrc
               ) {
                 videoPoolRef.current.delete(o.id);
+                if (overlayPreviewSrcRef.current.get(o.id) === previewSrc) {
+                  overlayPreviewSrcRef.current.delete(o.id);
+                }
               }
             }}
             reportFailure={() => reportOverlayFailure(o.id, o.src)}
@@ -2039,7 +2675,11 @@ export function PreviewCanvas({
           OUTSIDE the frame shows through, at reduced opacity -- so an overlay
           dragged/zoomed off-frame stays visible + grabbable without any change to
           the clipped canvas render or the export (DOM-only, like the grid). */}
-      <GhostOverflowLayer getRect={getRect} />
+      <GhostOverflowLayer
+        getRect={getRect}
+        getFrameSnapshot={getOverlayFrameSnapshot}
+        getOverlayPreviewSrc={getOverlayPreviewSrc}
+      />
 
       {/* The composited video. FLAT-edged to match the exported reel exactly --
           the real 1080x1920 output has no rounded corners, so the preview must not
@@ -2100,19 +2740,59 @@ export function PreviewCanvas({
       <div
         ref={interactionLayerRef}
         className={`absolute inset-0 z-[2] ${cloneModifier ? "cursor-copy" : "cursor-move"}`}
+        style={{ zIndex: 2, pointerEvents: "auto" }}
         onPointerDown={onLayerPointerDown}
         title="Click an overlay to select; drag to move it. Shift-click to multi-select, Cmd/Ctrl-drag to clone. Drag the canvas to pan / scroll to zoom."
       />
 
-      {/* Split handle -- the seam stays fully draggable (same hit strip, same
-          cursor, same onPointerDown), but the always-on coral pill is GONE: it
+      {/* Bounds-sized transparent caption surface. The render loop projects the
+          exact layout it just painted into CSS pixels without scheduling React. */}
+      <div
+        ref={captionHitTargetRef}
+        role="slider"
+        aria-label="Move active caption"
+        aria-orientation="vertical"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={0}
+        tabIndex={0}
+        className="absolute touch-none"
+        style={{ zIndex: 15 }}
+        hidden
+        onPointerDown={handleCaptionPointerDown}
+        onKeyDown={handleCaptionKeyDown}
+      />
+      <div
+        ref={captionSnapGuideRef}
+        data-caption-snap-guide
+        className="pointer-events-none absolute inset-x-0"
+        style={{ zIndex: 16, height: 1, backgroundColor: "#FF6B35" }}
+        hidden
+      />
+
+      {/* Split handle -- the seam stays draggable and keyboard-adjustable, but
+          the always-on coral pill is GONE: it
           overlapped the captions sitting on the seam and got in the way. The pill
           now shows ONLY on hover, so the divider is discoverable when you reach
-          for it yet invisible the rest of the time. Functionality is unchanged. */}
+          for it yet invisible the rest of the time. */}
       <div
-        className="group absolute inset-x-0 z-10 flex cursor-ns-resize items-center justify-center"
-        style={{ top: `${topPct}%`, height: 16, marginTop: -8 }}
+        role="separator"
+        aria-label="Adjust screen and face split"
+        aria-orientation="horizontal"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={topPct}
+        tabIndex={0}
+        className="group absolute inset-x-0 z-10 flex touch-none cursor-ns-resize items-center justify-center"
+        style={{
+          top: `${topPct}%`,
+          height: 16,
+          marginTop: -8,
+          zIndex: 10,
+          pointerEvents: "auto",
+        }}
         onPointerDown={handleDividerPointerDown}
+        onKeyDown={handleDividerKeyDown}
       >
         <div className="h-[3px] w-10 rounded-full bg-[#FF6B35] opacity-0 shadow-[0_0_0_3px_rgba(0,0,0,0.35)] transition-opacity group-hover:opacity-100" />
       </div>
@@ -2121,9 +2801,18 @@ export function PreviewCanvas({
           export stays clean). The box body is pointer-events:none so a drag on
           the media falls through to the router above; only the 8 resize handles
           + the rotate grip opt in and forward to beginHandleGesture. */}
-      <SelectionOverlay getRect={getRect} beginHandleGesture={beginHandleGesture} />
+      <SelectionOverlay
+        getRect={getRect}
+        getFrameSnapshot={getOverlayFrameSnapshot}
+        beginHandleGesture={beginHandleGesture}
+        adjustHandleByKeyboard={adjustHandleByKeyboard}
+      />
       {/* Floating, always-upright toolbar for whatever is selected. */}
-      <SelectionToolbar getRect={getRect} />
+      <SelectionToolbar
+        getRect={getRect}
+        getFrameSnapshot={getOverlayFrameSnapshot}
+        getSettledSplitRatio={getSettledSplitRatio}
+      />
     </div>
   );
 }

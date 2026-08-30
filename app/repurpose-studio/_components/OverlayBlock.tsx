@@ -110,11 +110,13 @@ export function OverlayBlock({
 
       {/* left trim edge */}
       <div
+        data-trim-edge="start"
         className="absolute left-0 top-0 h-full w-2 rounded-l-md hover:bg-[#a78bfa]/60"
         onPointerDown={handleEdgePointerDown("start")}
       />
       {/* right trim edge */}
       <div
+        data-trim-edge="end"
         className="absolute right-0 top-0 h-full w-2 rounded-r-md hover:bg-[#a78bfa]/60"
         onPointerDown={handleEdgePointerDown("end")}
       />

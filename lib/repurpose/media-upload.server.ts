@@ -5,10 +5,8 @@ import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
-import { REPURPOSE_FOOTAGE_DIR } from "@/lib/repurpose/media-paths.server";
+import { REPURPOSE_ORIGINALS_DIR } from "@/lib/repurpose/media-paths.server";
 import type { UploadedVideo, VideoRole } from "@/lib/repurpose/media-types";
-
-const ORIGINALS_DIR = path.join(REPURPOSE_FOOTAGE_DIR, "originals");
 
 export type MediaUploadDependencies = Partial<{
   linkSync: (existingPath: string, newPath: string) => void;
@@ -79,10 +77,10 @@ export async function storeUploadedVideo({
   signal?: AbortSignal;
 }, overrides?: MediaUploadDependencies): Promise<UploadedVideo> {
   const operations = resolveFileOperations(overrides);
-  await operations.mkdir(ORIGINALS_DIR, { recursive: true });
+  await operations.mkdir(REPURPOSE_ORIGINALS_DIR, { recursive: true });
 
   const extension = path.extname(name).toLowerCase();
-  const partialPath = path.join(ORIGINALS_DIR, `.${randomUUID()}.partial`);
+  const partialPath = path.join(REPURPOSE_ORIGINALS_DIR, `.${randomUUID()}.partial`);
   const hash = createHash("sha256");
   let size = 0;
   const hasher = new Transform({
@@ -102,7 +100,10 @@ export async function storeUploadedVideo({
     );
 
     const contentHash = hash.digest("hex");
-    const originalPath = path.join(ORIGINALS_DIR, `${contentHash}${extension}`);
+    const originalPath = path.join(
+      REPURPOSE_ORIGINALS_DIR,
+      `${contentHash}${extension}`
+    );
 
     // The signal is observed immediately before the synchronous, atomic hard-link.
     // That call is the commit point: after it starts, the upload is committed and

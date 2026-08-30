@@ -68,12 +68,36 @@ runFfmpeg(
 
 runFfmpeg(
   [
-    "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30:duration=2",
+    "-f", "lavfi", "-i", "color=c=0xE53935:size=320x180:rate=30:duration=3",
     "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", "-an",
+    ...videoMetadata,
+    join(fixtureDir, "split-screen-red.mp4"),
+  ],
+  "solid red split Screen fixture",
+);
+
+runFfmpeg(
+  [
+    "-f", "lavfi", "-i", "color=c=0x2450A4:size=320x180:rate=30:duration=3",
+    "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3",
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+    "-c:a", "aac", "-b:a", "96k", "-shortest",
+    ...videoMetadata,
+    join(fixtureDir, "split-face-blue-aac.mp4"),
+  ],
+  "solid blue split Face/AAC fixture",
+);
+
+runFfmpeg(
+  [
+    "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30:duration=2",
+    "-f", "lavfi", "-i", "sine=frequency=220:sample_rate=48000:duration=2,volume=4",
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+    "-c:a", "aac", "-b:a", "128k", "-shortest",
     ...videoMetadata,
     join(fixtureDir, "overlay.mp4"),
   ],
-  "video overlay fixture",
+  "video overlay fixture with isolated 220Hz AAC tone",
 );
 
 runFfmpeg(

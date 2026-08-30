@@ -1,4 +1,4 @@
-import { realpath } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -14,6 +14,10 @@ export const REPURPOSE_FOOTAGE_DIR = path.join(
   os.homedir(),
   "Downloads",
   "repurpose-footage"
+);
+export const REPURPOSE_ORIGINALS_DIR = path.join(
+  REPURPOSE_FOOTAGE_DIR,
+  "originals"
 );
 
 const ALLOWED_ROOTS = [
@@ -53,4 +57,44 @@ export async function resolveAllowedVideoPath(rawPath: string): Promise<string |
     }
   }
   return null;
+}
+
+export async function resolveImportedOriginalVideoPath(
+  rawPath: string,
+  fileSystem: {
+    realpath(path: string): Promise<string>;
+    stat(path: string): Promise<{ isFile(): boolean }>;
+  } = { realpath, stat }
+): Promise<string | null> {
+  if (!rawPath || !path.isAbsolute(rawPath)) return null;
+
+  const extension = path.extname(rawPath);
+  const normalizedName = `${path.basename(rawPath, extension)}${extension.toLowerCase()}`;
+  if (!/^[a-f0-9]{64}\.(mp4|mov|m4v|webm|mkv)$/.test(normalizedName)) {
+    return null;
+  }
+  if (path.resolve(path.dirname(rawPath)) !== path.resolve(REPURPOSE_ORIGINALS_DIR)) {
+    return null;
+  }
+
+  try {
+    const resolvedPath = await fileSystem.realpath(rawPath);
+    const originalsRoot = await fileSystem.realpath(REPURPOSE_ORIGINALS_DIR);
+    const resolvedExtension = path.extname(resolvedPath);
+    const resolvedName = `${path.basename(
+      resolvedPath,
+      resolvedExtension
+    )}${resolvedExtension.toLowerCase()}`;
+    if (
+      !/^[a-f0-9]{64}\.(mp4|mov|m4v|webm|mkv)$/.test(resolvedName) ||
+      path.dirname(resolvedPath) !== originalsRoot
+    ) {
+      return null;
+    }
+    const resolvedInfo = await fileSystem.stat(resolvedPath);
+    if (!resolvedInfo.isFile()) return null;
+    return resolvedPath;
+  } catch {
+    return null;
+  }
 }

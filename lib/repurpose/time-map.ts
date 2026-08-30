@@ -32,26 +32,21 @@
 import type { Clip, ClipPunch, ClipTransition, FaceFraming } from "./types";
 import type { PanZoomTransform } from "./compositor";
 import { easings } from "../engine/easing";
+import {
+  clampSplitRatio,
+  parsePersistedSplitRatio,
+} from "./split-ratio";
 
 /** Neutral framing -- a scene frames its region as shot when it carries no override. */
 const IDENTITY_FRAMING: FaceFraming = { x: 0, y: 0, scale: 1 };
 
-/**
- * Split-ratio bounds -- the fraction of frame height the SCREEN (top) half can
- * take. Mirrors the store's setSplitRatio clamp (0.4-0.6) so a per-clip split
- * resolved here can never exceed what the handle drag allows.
- */
-const SPLIT_MIN = 0.4;
-const SPLIT_MAX = 0.6;
-
-function clampSplit(v: number): number {
-  return Math.min(SPLIT_MAX, Math.max(SPLIT_MIN, v));
-}
-
 /** A clip's own split ratio if it set one, else the editor's global default. */
 function resolvedClipSplit(clip: Clip | null, globalSplit: number): number {
-  if (clip && typeof clip.splitRatio === "number") return clampSplit(clip.splitRatio);
-  return globalSplit;
+  const fallback = parsePersistedSplitRatio(globalSplit, 0.5);
+  if (clip && typeof clip.splitRatio === "number") {
+    return clampSplitRatio(clip.splitRatio) ?? fallback;
+  }
+  return fallback;
 }
 
 /**
@@ -249,12 +244,7 @@ export function splitRatioAt(
               tr.easing === "bounce"
                 ? easings.easeOutBack(raw)
                 : easings.easeInOutCubic(raw);
-            // Clamp the interpolated seam back into the 0.4-0.6 band: easeOutBack
-            // ("bounce") overshoots to ~1.10, which would push the split ~0.02
-            // past the band, and the compositor only re-clamps to [0,1] (it trusts
-            // callers to honor 0.4-0.6). Clamping here keeps the seam in-band while
-            // the transition motion (zoom/slide) still gets its bounce.
-            return clampSplit(from + (target - from) * eased);
+            return clampSplitRatio(from + (target - from) * eased) ?? target;
           }
         }
       }
@@ -264,7 +254,7 @@ export function splitRatioAt(
   }
   // Past the end (or nothing kept): hold the last kept clip's split, else global.
   if (prevKept) return resolvedClipSplit(prevKept, globalSplit);
-  return globalSplit;
+  return parsePersistedSplitRatio(globalSplit, 0.5);
 }
 
 /** A clip's own face framing if it set one, else neutral (framed as shot). */

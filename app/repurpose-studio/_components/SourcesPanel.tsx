@@ -15,11 +15,9 @@
 //      captions on a restored project (both moved here from TranscriptPanel so
 //      the transcript rail is purely the editable word view).
 //
-// LAYOUT: while footage is missing (no footageMeta OR no words) the four
-// ingest buttons show PROMINENTLY under a "Sources" header -- that's the first
-// thing to do on an empty editor. Once words and both source videos are loaded,
-// it collapses to a single "Re-import footage" fold so the grading controls
-// below get the room.
+// LAYOUT: while either source video is missing, the ingest buttons show
+// prominently under a "Sources" header. Once both videos are loaded, they
+// collapse behind "Re-import footage". Transcripts remain optional.
 // ===========================================================================
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -31,9 +29,17 @@ import {
 import type { FootageMeta } from "@/lib/repurpose/types";
 import {
   buildShortWithStats,
-  parseRawWordsFile,
-  type RawWordsFile,
 } from "@/lib/repurpose/ingest";
+import {
+  parseRawWordsFile,
+  parseSrtWords,
+  srtToPlainText,
+} from "@/lib/repurpose/transcript-ingest";
+import {
+  buildTranscriptCandidate,
+  effectiveVideoTimelineDuration,
+} from "@/lib/repurpose/transcript-application";
+import type { TranscriptionResult } from "@/lib/repurpose/transcription-contract";
 import {
   ingestOverlayFiles,
   type OverlayImportOwner,
@@ -47,51 +53,10 @@ import {
   VideoImportProgress,
   type VideoImportProgressState,
 } from "./VideoImportProgress";
-
-/** Parse an SRT timestamp "HH:MM:SS,mmm" to seconds. */
-function srtTimeToSec(t: string): number {
-  const m = t.trim().match(/(\d+):(\d+):(\d+)[,.](\d+)/);
-  if (!m) return 0;
-  return +m[1] * 3600 + +m[2] * 60 + +m[3] + +m[4] / 1000;
-}
-
-/** Parse raw .srt into per-word timings by spreading each block's time across
- * its words. Good enough for take-matching (block-level accuracy ~2-4s). */
-function srtToWords(srt: string): { text: string; start: number; end: number }[] {
-  const words: { text: string; start: number; end: number }[] = [];
-  for (const block of srt.split(/\r?\n\s*\r?\n/)) {
-    const lines = block.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-    const tl = lines.find((l) => l.includes("-->"));
-    if (!tl) continue;
-    const [a, b] = tl.split("-->");
-    const start = srtTimeToSec(a);
-    const end = srtTimeToSec(b);
-    const textLines = lines.slice(lines.indexOf(tl) + 1);
-    const toks = textLines.join(" ").split(/\s+/).filter(Boolean);
-    if (!toks.length) continue;
-    const per = (end - start) / toks.length;
-    toks.forEach((w, i) =>
-      words.push({ text: w, start: start + i * per, end: start + (i + 1) * per })
-    );
-  }
-  return words;
-}
-
-/** Strip SRT indices + timestamps to plain narration text. */
-function srtToText(srt: string): string {
-  return srt
-    .split(/\r?\n\s*\r?\n/)
-    .map((block) =>
-      block
-        .split(/\r?\n/)
-        .filter((l) => l.trim() && !l.includes("-->") && !/^\d+$/.test(l.trim()))
-        .join(" ")
-    )
-    .filter(Boolean)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
+import { TranscriptApplyDialog } from "./TranscriptApplyDialog";
+import { TranscriptionControls } from "./TranscriptionControls";
+import { useTranscriptApplication } from "./useTranscriptApplication";
+import { useTranscription } from "./useTranscription";
 
 export function SourcesPanel({
   overlayImportOwner,
@@ -99,7 +64,6 @@ export function SourcesPanel({
   overlayImportOwner?: OverlayImportOwner;
 } = {}) {
   const clips = useRepurposeStore((s) => s.clips);
-  const words = useRepurposeStore((s) => s.words);
   const footageMeta = useRepurposeStore((s) => s.footageMeta);
   const hydrating = useRepurposeStore((s) => s.hydrating);
   const projectEpoch = useRepurposeStore((s) => s.projectEpoch);
@@ -115,14 +79,40 @@ export function SourcesPanel({
   const [videoProgress, setVideoProgress] = useState<
     Partial<Record<"screen" | "face", VideoImportProgressState>>
   >({});
-  const rawWordsRef = useRef<RawWordsFile | null>(null);
-  const finalTranscriptRef = useRef<string>("");
+  const transcriptApplication = useTranscriptApplication();
+  const { clearPending, offerCandidate } = transcriptApplication;
+  const handleTranscriptionResult = useCallback(
+    (result: TranscriptionResult) => {
+      if (result.words.length === 0) {
+        offerCandidate({
+          kind: "ready",
+          words: [],
+          clips: [],
+          stats: null,
+          origin: "automatic",
+        });
+        return;
+      }
+      const duration = effectiveVideoTimelineDuration(
+        useRepurposeStore.getState().footageMeta
+      );
+      const candidate = buildTranscriptCandidate({
+        words: result.words,
+        ...(duration === null ? {} : { maxSourceDuration: duration }),
+      });
+      offerCandidate({ ...candidate, origin: "automatic" });
+    },
+    [offerCandidate]
+  );
+  const transcription = useTranscription({ onResult: handleTranscriptionResult });
+  const cancelTranscription = transcription.cancel;
   const backfilledRef = useRef(false);
   const autoLoadedRef = useRef(false);
   const videoImportsRef = useRef<
     Partial<Record<"screen" | "face", AbortController>>
   >({});
   const videoImportGenerationRef = useRef({ screen: 0, face: 0 });
+  const transcriptReadGenerationRef = useRef(0);
   const sourceImportTokensRef = useRef<
     Partial<Record<"screen" | "face", number>>
   >({});
@@ -169,8 +159,6 @@ export function SourcesPanel({
     const unsubscribe = useRepurposeStore.subscribe((state, previous) => {
       if (state.projectEpoch === previous.projectEpoch) return;
       sourceImportEpochRef.current = state.projectEpoch;
-      rawWordsRef.current = null;
-      finalTranscriptRef.current = "";
       backfilledRef.current = false;
       autoLoadedRef.current = false;
       invalidateSourceImports(false, true);
@@ -181,30 +169,6 @@ export function SourcesPanel({
       invalidateSourceImports(true, false);
     };
   }, [invalidateSourceImports]);
-
-  // --- Rebuild clips from whatever raw words + final transcript we have -------
-  const rebuild = useCallback(() => {
-    const raw = rawWordsRef.current;
-    if (!raw) return;
-    try {
-      // buildShortWithStats runs the ingest AND selectShort -> the timeline is
-      // the finished ~30-60s Reel, not the full-length cut (falls back to the
-      // full assembly only when there's no final transcript / no viable window),
-      // and returns the auto-cut savings summary alongside the clips.
-      const { clips: built, stats } = buildShortWithStats({
-        rawWords: raw.words,
-        finalTranscript: finalTranscriptRef.current || undefined,
-      });
-      setClips(built);
-      setEditStats(stats);
-      // Feed the raw word-level transcript to the store so captions can chunk it
-      // into on-screen blocks (timed in SOURCE seconds, mapped to output at draw).
-      setWords(raw.words);
-      setIngestError(null);
-    } catch (err) {
-      setIngestError(err instanceof Error ? err.message : "Failed to build clips");
-    }
-  }, [setClips, setWords, setEditStats]);
 
   // --- Backfill words for captions on a restored project ---------------------
   // A project restored from a pre-captions snapshot has clips but no `words`, so
@@ -226,22 +190,30 @@ export function SourcesPanel({
       const projectEpoch = st.projectEpoch;
       (async () => {
         try {
-          const res = await fetch("/repurpose/claude-routines-words.json");
+          const [wordsRes, manifestRes] = await Promise.all([
+            fetch("/repurpose/claude-routines-words.json"),
+            fetch("/repurpose/footage-manifest.json"),
+          ]);
           if (
-            !res.ok ||
+            !wordsRes.ok ||
+            !manifestRes.ok ||
             cancelled ||
             useRepurposeStore.getState().projectEpoch !== projectEpoch
           )
             return;
-          const parsed = parseRawWordsFile(await res.json());
+          const [parsed, manifest] = await Promise.all([
+            wordsRes.json().then(parseRawWordsFile),
+            manifestRes.json() as Promise<Partial<FootageMeta>>,
+          ]);
           const current = useRepurposeStore.getState();
           if (
             cancelled ||
             current.projectEpoch !== projectEpoch ||
-            current.words.length > 0
+            current.words.length > 0 ||
+            current.footageMeta?.faceCamPath !== manifest.faceCamPath ||
+            current.footageMeta?.screenPath !== manifest.screenPath
           )
             return;
-          rawWordsRef.current = parsed;
           setWords(parsed.words); // setWords also rebuilds caption blocks
         } catch {
           /* assets absent -> captions stay empty until a manual transcript load */
@@ -299,10 +271,16 @@ export function SourcesPanel({
         )
           return;
         // Bail if the user started loading something while we were fetching.
-        if (useRepurposeStore.getState().clips.length > 0) return;
+        const current = useRepurposeStore.getState();
+        if (
+          current.clips.length > 0 ||
+          current.footageMeta ||
+          current.sourceImportOwners.screen !== null ||
+          current.sourceImportOwners.face !== null
+        ) {
+          return;
+        }
 
-        rawWordsRef.current = rawWords;
-        finalTranscriptRef.current = finalText;
         // The short Reel (selectShort window), not the full 8-minute assembly,
         // plus the auto-cut savings summary for the transcript-rail readout.
         const { clips: built, stats } = buildShortWithStats({
@@ -350,23 +328,37 @@ export function SourcesPanel({
       const file = e.target.files?.[0];
       if (!file) return;
       const projectEpoch = useRepurposeStore.getState().projectEpoch;
+      const transcriptReadGeneration = transcriptReadGenerationRef.current;
       try {
         const text = await file.text();
-        if (useRepurposeStore.getState().projectEpoch !== projectEpoch) return;
+        if (
+          useRepurposeStore.getState().projectEpoch !== projectEpoch ||
+          transcriptReadGenerationRef.current !== transcriptReadGeneration
+        ) {
+          return;
+        }
         // Accept EITHER a pre-parsed words.json OR a raw .srt (what Descript
         // exports). An .srt is parsed into per-word timings in-app so Manthan
         // never has to pre-convert -- he just drops the file Descript gave him.
-        if (file.name.toLowerCase().endsWith(".srt")) {
-          const parsed = srtToWords(text);
-          rawWordsRef.current = {
-            words: parsed,
-            text: parsed.map((w) => w.text).join(" "),
-          };
-        } else {
-          rawWordsRef.current = parseRawWordsFile(JSON.parse(text));
+        const state = useRepurposeStore.getState();
+        const faceDuration = state.footageMeta?.faceCamSource?.inspection.durationSec;
+        const parsed = file.name.toLowerCase().endsWith(".srt")
+          ? parseSrtWords(text, { durationSec: faceDuration })
+          : parseRawWordsFile(JSON.parse(text), { durationSec: faceDuration });
+        const candidate = buildTranscriptCandidate({
+          words: parsed.words,
+          maxSourceDuration:
+            effectiveVideoTimelineDuration(state.footageMeta) ?? undefined,
+        });
+        if (candidate.kind === "no-shared-speech") {
+          throw new Error("No transcribed speech overlaps the shared source duration.");
         }
         setIngestError(null);
-        rebuild();
+        offerCandidate({
+          ...candidate,
+          origin: "manual",
+          recipe: { kind: "raw", fullWords: parsed.words },
+        });
       } catch (err) {
         if (useRepurposeStore.getState().projectEpoch === projectEpoch) {
           setIngestError(
@@ -375,7 +367,7 @@ export function SourcesPanel({
         }
       }
     },
-    [rebuild]
+    [offerCandidate]
   );
 
   const handleFinalTranscriptFile = useCallback(
@@ -383,16 +375,48 @@ export function SourcesPanel({
       const file = e.target.files?.[0];
       if (!file) return;
       const projectEpoch = useRepurposeStore.getState().projectEpoch;
+      const transcriptReadGeneration = transcriptReadGenerationRef.current;
       const text = await file.text();
-      if (useRepurposeStore.getState().projectEpoch !== projectEpoch) return;
+      if (
+        useRepurposeStore.getState().projectEpoch !== projectEpoch ||
+        transcriptReadGenerationRef.current !== transcriptReadGeneration
+      ) {
+        return;
+      }
       // Strip SRT block numbers + timestamps to plain narration text; a .txt
       // just collapses whitespace.
-      finalTranscriptRef.current = file.name.toLowerCase().endsWith(".srt")
-        ? srtToText(text)
-        : text.replace(/\s+/g, " ").trim();
-      rebuild();
+      try {
+        const finalTranscript = file.name.toLowerCase().endsWith(".srt")
+          ? srtToPlainText(text)
+          : text.replace(/\s+/g, " ").trim();
+        if (!finalTranscript) throw new Error("Final transcript is empty.");
+        const state = useRepurposeStore.getState();
+        const candidate = buildTranscriptCandidate({
+          words: state.words,
+          finalTranscript,
+          maxSourceDuration:
+            effectiveVideoTimelineDuration(state.footageMeta) ?? undefined,
+        });
+        if (candidate.kind === "no-shared-speech") {
+          throw new Error("No transcript words are available to match.");
+        }
+        offerCandidate({
+          ...candidate,
+          origin: "manual",
+          recipe: {
+            kind: "final-transcript",
+            fullWords: state.words,
+            transcript: finalTranscript,
+          },
+        });
+        setIngestError(null);
+      } catch (error) {
+        setIngestError(
+          error instanceof Error ? error.message : "Could not read that file"
+        );
+      }
     },
-    [rebuild]
+    [offerCandidate]
   );
 
   // --- Import source videos through the compatibility pipeline ---------------
@@ -401,6 +425,11 @@ export function SourcesPanel({
       const file = e.target.files?.[0];
       e.target.value = "";
       if (!file) return;
+      if (which === "face") {
+        void cancelTranscription();
+        transcriptReadGenerationRef.current += 1;
+        clearPending();
+      }
 
       const stateAtStart = useRepurposeStore.getState();
       if (sourceImportEpochRef.current !== stateAtStart.projectEpoch) {
@@ -521,6 +550,8 @@ export function SourcesPanel({
       invalidateSourceImports,
       setFootageMeta,
       setMediaReadiness,
+      cancelTranscription,
+      clearPending,
     ]
   );
 
@@ -547,8 +578,7 @@ export function SourcesPanel({
 
   // Keep onboarding open until every prerequisite for playback is present.
   const footageReady = Boolean(
-    words.length > 0 &&
-      footageMeta?.screenPath &&
+    footageMeta?.screenPath &&
       footageMeta.screenPath !== "reconnect:" &&
       footageMeta.faceCamPath &&
       footageMeta.faceCamPath !== "reconnect:"
@@ -590,6 +620,41 @@ export function SourcesPanel({
     </div>
   );
 
+  const waitingForScreen = Boolean(
+    transcription.status?.state === "completed" &&
+      transcription.status.result.words.length > 0 &&
+      transcriptApplication.pendingCandidate?.origin === "automatic" &&
+      effectiveVideoTimelineDuration(footageMeta) === null
+  );
+  const transcriptionUi = (
+    <>
+      <TranscriptionControls
+        transcription={transcription}
+        legacyFace={Boolean(footageMeta?.faceCamPath)}
+        notice={transcriptApplication.notice}
+        hasPendingApplication={Boolean(transcriptApplication.pendingCandidate)}
+        waitingForScreen={waitingForScreen}
+      />
+      {transcriptApplication.pendingCandidate &&
+        !transcriptApplication.dialogOpen &&
+        !waitingForScreen && (
+        <button
+          type="button"
+          onClick={transcriptApplication.reopenPending}
+          className="text-left text-[11px] font-medium text-[#FF8F6B]"
+        >
+          Revisar transcrição pendente
+        </button>
+      )}
+      <TranscriptApplyDialog
+        open={transcriptApplication.dialogOpen}
+        onPreserve={transcriptApplication.applyPreservingCuts}
+        onRebuild={transcriptApplication.applyRebuilding}
+        onApplyLater={transcriptApplication.applyLater}
+      />
+    </>
+  );
+
   // Collapsed: footage is loaded, so tuck the ingest behind a small fold and
   // give the grading controls below the room.
   if (footageReady) {
@@ -602,6 +667,7 @@ export function SourcesPanel({
           </summary>
           <div className="mt-3">{buttons}</div>
         </details>
+        {transcriptionUi}
         <AddMediaButton onChange={handleAddMedia} />
       </div>
     );
@@ -615,10 +681,11 @@ export function SourcesPanel({
         Sources
       </h3>
       <p className="text-[11px] leading-4 text-muted-foreground">
-        Start here: load the raw transcript to build the timeline. The final transcript is
-        optional. Then choose both Screen and Face videos to enable Play.
+        Choose both Screen and Face videos to enable Play. A raw transcript is optional
+        and automatically builds an edited timeline.
       </p>
       {buttons}
+      {transcriptionUi}
       <AddMediaButton onChange={handleAddMedia} />
     </div>
   );

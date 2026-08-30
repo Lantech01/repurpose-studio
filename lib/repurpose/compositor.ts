@@ -50,9 +50,9 @@
 // optional `overlays` array on DrawFrameOptions composites external image/video
 // layers on top of the base frame via a plain translate/rotate/scale drawImage
 // in normalized 9:16 space (see OverlayDraw). This is the ONLY place globalAlpha
-// is touched, and ONLY for an overlay's own static `opacity` asset property --
-// it is constant per overlay, never tweened at cuts, so the no-fade convention
-// still holds (opacity is not a crossfade). An absent/empty `overlays` array is
+// is touched, and ONLY for an overlay's frame-resolved opacity (authored opacity
+// times its appearance effect). This is not a scene crossfade, so the no-fade
+// cut convention still holds. An absent/empty `overlays` array is
 // a strict no-op: drawFrame renders byte-for-byte as before -- same additive
 // discipline as `filter` and `transition`.
 // ===========================================================================
@@ -209,10 +209,9 @@ export interface DrawFrameOptions {
  *     and 4K with no extra code.
  *   - rotation: DEGREES, clockwise, about the overlay center (converted to
  *     radians once at draw time here).
- *   - opacity: 0..1. The ONE place globalAlpha is used -- overlays only, never
- *     the base composite. It is a STATIC asset property, not a crossfade (it is
- *     constant per overlay, never tweened at cuts), so the no-fade convention is
- *     preserved.
+ *   - opacity: 0..1, already resolved for this frame from authored opacity and
+ *     any appearance effect. The ONE place globalAlpha is used -- overlays only,
+ *     never the base composite or a scene crossfade.
  */
 export interface OverlayDraw {
   source: DrawableSource | null;
@@ -225,6 +224,8 @@ export interface OverlayDraw {
     rotation: number;
     opacity: number;
   };
+  /** Uniform corner radius, normalized to the shorter rendered side (0..0.5). */
+  cornerRadius: number;
   /**
    * Which split-screen band this overlay is CLIPPED to, so cover-crop overflow
    * never bleeds onto the neighboring panel:
@@ -526,6 +527,12 @@ function drawOverlay(
   if (t.opacity < 1) ctx.globalAlpha = t.opacity;
   ctx.translate(cx, cy);
   if (t.rotation !== 0) ctx.rotate(t.rotation * DEG_TO_RAD);
+  if (ov.cornerRadius > 0) {
+    const radius = clamp(ov.cornerRadius, 0, 0.5) * Math.min(destW, destH);
+    ctx.beginPath();
+    ctx.roundRect(-destW / 2, -destH / 2, destW, destH, radius);
+    ctx.clip();
+  }
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
   ctx.drawImage(
@@ -586,14 +593,14 @@ export function drawFrame(ctx: AnyCtx2D, opts: DrawFrameOptions): void {
   ctx.fillStyle = backgroundColor;
   ctx.fillRect(0, 0, width, height);
 
-  // TOP: screen region.
-  drawRegion(ctx, screen, 0, 0, width, topH, screenMotion);
+  // TOP: screen region. A rounded-zero band performs no placeholder/cover/draw.
+  if (topH > 0) drawRegion(ctx, screen, 0, 0, width, topH, screenMotion);
 
-  // BOTTOM: face region.
-  drawRegion(ctx, face, 0, topH, width, bottomH, faceMotion);
+  // BOTTOM: face region. At topH=0 this is the full frame.
+  if (bottomH > 0) drawRegion(ctx, face, 0, topH, width, bottomH, faceMotion);
 
   // Divider.
-  if (showDivider && dividerWidth > 0) {
+  if (showDivider && dividerWidth > 0 && topH > 0 && bottomH > 0) {
     ctx.save();
     ctx.fillStyle = dividerColor;
     ctx.fillRect(0, topH - dividerWidth / 2, width, dividerWidth);
@@ -610,7 +617,11 @@ export function drawFrame(ctx: AnyCtx2D, opts: DrawFrameOptions): void {
     // Pass the SAME topH the base composite used, so a "screen"/"face" band clip
     // lines up with the split line to the pixel. "free"/undefined overlays ignore
     // it -> byte-identical to before.
-    for (const ov of opts.overlays) drawOverlay(ctx, ov, width, height, topH);
+    for (const ov of opts.overlays) {
+      if (ov.band === "screen" && topH === 0) continue;
+      if (ov.band === "face" && bottomH === 0) continue;
+      drawOverlay(ctx, ov, width, height, topH);
+    }
   }
 
   ctx.imageSmoothingEnabled = prevSmoothing;

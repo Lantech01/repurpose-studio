@@ -1,6 +1,15 @@
 import { create } from "zustand";
 import { clipForSourceTime, coalesceWordSpans } from "./word-clip-map";
 import { applyGapTighten } from "./gap-tighten";
+import {
+  clampSplitRatio,
+  parsePersistedSplitRatio,
+} from "./split-ratio";
+import { VIDEO_TIMELINE_CLIP_ID } from "./types";
+import {
+  effectiveVideoTimelineDuration,
+  isUntouchedVideoTimeline,
+} from "./transcript-application";
 import type {
   AttributeClipboard,
   Clip,
@@ -12,6 +21,7 @@ import type {
   MediaAsset,
   MusicTrack,
   Overlay,
+  OverlayEffect,
   OverlayTransform,
   SelectedObject,
   SfxTrack,
@@ -28,9 +38,12 @@ import type {
   DistributeAxis,
 } from "./overlay-geometry";
 import {
+  applyVisualTransformDeltaToPersisted,
   alignOverlays as computeAlignOverlays,
   distributeOverlays as computeDistributeOverlays,
-  clampOverlayToTopHalf,
+  clampOverlayToBand,
+  isOverlayBandVisible,
+  resolveOverlayTransformForFrame,
 } from "./overlay-geometry";
 import {
   CAPTION_TEMPLATES,
@@ -41,6 +54,7 @@ import {
   type CaptionBlock,
   type CaptionTemplateId,
 } from "./captions";
+import { normalizeOverlayAppearance } from "./overlay-effects";
 
 // ===========================================================================
 // REPURPOSE STUDIO -- editor store
@@ -80,8 +94,6 @@ type PlaybackPrerequisites = {
 export function getPlaybackBlockedReason(
   state: PlaybackPrerequisites
 ): string | null {
-  if (state.duration <= 0) return "This project has no playable duration.";
-  if (state.clips.length === 0) return "Add a clip before playing.";
   if (
     !state.footageMeta?.faceCamPath.trim() ||
     !state.footageMeta.screenPath.trim()
@@ -93,6 +105,9 @@ export function getPlaybackBlockedReason(
   }
   if (state.mediaReadiness === "error") {
     return state.playbackBlockedReason ?? MEDIA_ERROR_REASON;
+  }
+  if (state.clips.length === 0 || state.duration <= 0) {
+    return "This project has no playable duration.";
   }
   return null;
 }
@@ -307,6 +322,77 @@ function deriveDuration(clips: Clip[]): number {
   const kept = clips.filter((c) => c.kept);
   if (kept.length === 0) return 0;
   return kept.reduce((max, c) => Math.max(max, c.timelineEnd), 0);
+}
+
+function overlayEffectEqual(a: OverlayEffect, b: OverlayEffect): boolean {
+  return (
+    a.type === b.type &&
+    a.durationSec === b.durationSec &&
+    a.direction === b.direction
+  );
+}
+
+function normalizeClipSplitRatio(clip: Clip): Clip {
+  if (clip.splitRatio === undefined) return clip;
+  const splitRatio = clampSplitRatio(clip.splitRatio);
+  if (splitRatio === null) {
+    const { splitRatio: _invalidSplitRatio, ...rest } = clip;
+    return rest;
+  }
+  return splitRatio === clip.splitRatio ? clip : { ...clip, splitRatio };
+}
+
+function normalizeClipSplitRatios(clips: Clip[]): Clip[] {
+  let changed = false;
+  const normalized = clips.map((clip) => {
+    const next = normalizeClipSplitRatio(clip);
+    if (next !== clip) changed = true;
+    return next;
+  });
+  return changed ? normalized : clips;
+}
+
+function videoTimelineClip(duration: number): Clip {
+  return {
+    id: VIDEO_TIMELINE_CLIP_ID,
+    kind: "take",
+    label: "Full video",
+    srcStart: 0,
+    srcEnd: duration,
+    timelineStart: 0,
+    timelineEnd: duration,
+    kept: true,
+    isKeeperTake: true,
+    occurrences: [{ start: 0, end: duration }],
+    keeperIndex: 0,
+  };
+}
+
+function synchronizeVideoTimelineClips(
+  clips: Clip[],
+  words: Word[],
+  previousDuration: number | null,
+  nextDuration: number
+): Clip[] {
+  if (words.length > 0) return clips;
+  if (clips.length === 0) return [videoTimelineClip(nextDuration)];
+  if (
+    !isUntouchedVideoTimeline({
+      clips,
+      words,
+      effectiveDuration: previousDuration,
+    }) ||
+    Math.abs(nextDuration - previousDuration!) <= 1e-6
+  ) {
+    return clips;
+  }
+  return recomputeTimeline([
+    {
+      ...clips[0],
+      srcEnd: nextDuration,
+      occurrences: [{ start: 0, end: nextDuration }],
+    },
+  ]);
 }
 
 /**
@@ -665,6 +751,52 @@ interface CaptionOverrides {
   textOverride?: string[];
 }
 
+/** Remove contradictory persisted position keys for explicit attachment modes. */
+export function normalizeCaptionBlockPlacement(block: CaptionBlock): CaptionBlock {
+  const override = block.overrideStyle;
+  if (!override || typeof override !== "object") return block;
+  if (override.pinToSplit === true) {
+    if (!("positionYPct" in override) && !("splitOffsetPct" in override)) {
+      return block;
+    }
+    const {
+      positionYPct: _positionYPct,
+      splitOffsetPct: _splitOffsetPct,
+      ...rest
+    } = override;
+    return { ...block, overrideStyle: { ...rest, pinToSplit: true } };
+  }
+  if (override.pinToSplit !== false) return block;
+
+  const rawPosition = override.positionYPct;
+  const positionYPct = Number.isFinite(rawPosition)
+    ? Math.max(0, Math.min(1, rawPosition as number))
+    : undefined;
+  const hasStaleOffset = "splitOffsetPct" in override;
+  const hasInvalidPosition =
+    "positionYPct" in override && positionYPct === undefined;
+  if (
+    !hasStaleOffset &&
+    !hasInvalidPosition &&
+    positionYPct === rawPosition
+  ) {
+    return block;
+  }
+  const {
+    splitOffsetPct: _splitOffsetPct,
+    positionYPct: _positionYPct,
+    ...rest
+  } = override;
+  return {
+    ...block,
+    overrideStyle: {
+      ...rest,
+      pinToSplit: false,
+      ...(positionYPct !== undefined ? { positionYPct } : {}),
+    },
+  };
+}
+
 /**
  * A block's id is namespaced `${clipId}--${b.id}` (see rebuildCaptionBlocks).
  * Clip ids are `clip-N-ms` / `split-N` and never contain `--`, so the clip id
@@ -692,39 +824,53 @@ function overrideKey(block: CaptionBlock): string | null {
   return `${clipId ?? ""}:${startMs}`;
 }
 
-/**
- * Index the manual overrides carried on the CURRENT caption blocks by their
- * `${clipId}:${startMs}` key, so a re-chunk can re-attach them. Only blocks that
- * actually carry an override are recorded (a clean block contributes nothing).
- */
-function indexOverridesByFirstWordStart(
-  blocks: CaptionBlock[]
-): Map<string, CaptionOverrides> {
-  const map = new Map<string, CaptionOverrides>();
-  for (const b of blocks) {
-    const hasOverride =
-      b.overrideStyle !== undefined ||
-      b.keywordIndex !== undefined ||
-      b.textOverride !== undefined;
-    if (!hasOverride) continue;
-    const key = overrideKey(b);
-    if (key === null) continue;
-    map.set(key, {
-      overrideStyle: b.overrideStyle,
-      keywordIndex: b.keywordIndex,
-      textOverride: b.textOverride,
-    });
-  }
-  return map;
+interface CaptionOverrideIndex {
+  exact: Map<string, CaptionOverrides>;
+  legacyByStart: Map<number, CaptionOverrides[]>;
 }
 
 /**
- * Re-attach preserved overrides onto freshly-chunked blocks by their
- * `${clipId}:${startMs}` key. A block whose key matches a stashed override gets
- * it back (so a manual color override / keyword / typo-fix survives the rebuild);
- * a block with no match is left clean. Because the key carries the clip id, an
- * override on one clip never bleeds onto a DIFFERENT clip that happens to reuse
- * the same source span. Mutates + returns the same array (throwaway locals).
+ * Index namespaced overrides by their exact `${clipId}:${startMs}` key. Legacy
+ * unnamespaced overrides are queued by start in persisted order so each can be
+ * consumed at most once when multiple clips reuse the same source anchor.
+ */
+function indexOverridesByFirstWordStart(
+  blocks: CaptionBlock[]
+): CaptionOverrideIndex {
+  const exact = new Map<string, CaptionOverrides>();
+  const legacyByStart = new Map<number, CaptionOverrides[]>();
+  for (const b of blocks) {
+    const normalized = normalizeCaptionBlockPlacement(b);
+    const hasOverride =
+      normalized.overrideStyle !== undefined ||
+      normalized.keywordIndex !== undefined ||
+      normalized.textOverride !== undefined;
+    if (!hasOverride) continue;
+    const first = normalized.words[0];
+    if (!first) continue;
+    const saved = {
+      overrideStyle: normalized.overrideStyle,
+      keywordIndex: normalized.keywordIndex,
+      textOverride: normalized.textOverride,
+    };
+    const clipId = clipIdFromBlockId(normalized.id);
+    if (clipId !== null) {
+      exact.set(`${clipId}:${Math.round(first.start * 1000)}`, saved);
+      continue;
+    }
+    const startMs = Math.round(first.start * 1000);
+    const queue = legacyByStart.get(startMs) ?? [];
+    queue.push(saved);
+    legacyByStart.set(startMs, queue);
+  }
+  return { exact, legacyByStart };
+}
+
+/**
+ * Re-attach an exact namespaced override when available, otherwise consume the
+ * next legacy override at the same first-word start. Exact matches never consume
+ * the fallback queue, and fallback entries never duplicate across clips.
+ * Mutates + returns the same array (throwaway locals).
  *
  * textOverride is length-sensitive (it's positional per word). A re-chunk can
  * change a block's word count (density/budget change), so only re-attach a
@@ -733,13 +879,27 @@ function indexOverridesByFirstWordStart(
  */
 function reattachOverrides(
   clipBlocks: CaptionBlock[],
-  prevMap: Map<string, CaptionOverrides>
+  previous: CaptionOverrideIndex
 ): CaptionBlock[] {
-  if (prevMap.size === 0) return clipBlocks;
+  if (previous.exact.size === 0 && previous.legacyByStart.size === 0) {
+    return clipBlocks;
+  }
   for (const b of clipBlocks) {
     const key = overrideKey(b);
     if (key === null) continue;
-    const saved = prevMap.get(key);
+    let saved = previous.exact.get(key);
+    if (saved) {
+      previous.exact.delete(key);
+    } else {
+      const first = b.words[0];
+      const queue = first
+        ? previous.legacyByStart.get(Math.round(first.start * 1000))
+        : undefined;
+      saved = queue?.shift();
+      if (queue?.length === 0 && first) {
+        previous.legacyByStart.delete(Math.round(first.start * 1000));
+      }
+    }
     if (!saved) continue;
     if (saved.overrideStyle !== undefined) b.overrideStyle = saved.overrideStyle;
     if (saved.keywordIndex !== undefined) b.keywordIndex = saved.keywordIndex;
@@ -751,6 +911,41 @@ function reattachOverrides(
     }
   }
   return clipBlocks;
+}
+
+function buildCaptionBlocksForState(input: {
+  words: Word[];
+  clips: Clip[];
+  deletedWordIndices: number[];
+  style: CaptionStyle;
+  previousBlocks?: CaptionBlock[];
+}): CaptionBlock[] {
+  const previousOverrides = indexOverridesByFirstWordStart(
+    input.previousBlocks ?? []
+  );
+  const deleted = new Set(input.deletedWordIndices);
+  const kept = input.clips
+    .filter((clip) => clip.kept)
+    .sort((a, b) => a.timelineStart - b.timelineStart);
+  const blocks: CaptionBlock[] = [];
+
+  for (const clip of kept) {
+    const words = input.words.filter(
+      (word, index) =>
+        !deleted.has(index) &&
+        word.start >= clip.srcStart &&
+        word.start < clip.srcEnd
+    );
+    if (words.length === 0) continue;
+    const clipBlocks = chunkWordsIntoBlocks(words, input.style).map((block) => ({
+      ...block,
+      id: `${clip.id}--${block.id}`,
+    }));
+    reattachOverrides(clipBlocks, previousOverrides);
+    blocks.push(...clipBlocks);
+  }
+
+  return blocks;
 }
 
 /**
@@ -779,7 +974,13 @@ function captureSnapshot(state: RepurposeState): EditableSnapshot {
  * the restored clips (duration is derived, never stored in history).
  */
 function snapshotToPatch(snap: EditableSnapshot): Partial<RepurposeState> {
-  return { ...snap, duration: deriveDuration(snap.clips) };
+  const clips = normalizeClipSplitRatios(snap.clips);
+  return {
+    ...snap,
+    clips,
+    splitRatio: parsePersistedSplitRatio(snap.splitRatio, 0.5),
+    duration: deriveDuration(clips),
+  };
 }
 
 /**
@@ -822,6 +1023,24 @@ interface EditableSnapshot {
   deletedWordIndices: number[];
 }
 
+export type CaptionGestureCompletion =
+  | { kind: "attach" }
+  | { kind: "detach"; positionYPct: number };
+
+function synchronizeVideoTimelineSnapshot(
+  snapshot: EditableSnapshot,
+  previousDuration: number | null,
+  nextDuration: number
+): EditableSnapshot {
+  const clips = synchronizeVideoTimelineClips(
+    snapshot.clips,
+    snapshot.words,
+    previousDuration,
+    nextDuration
+  );
+  return clips === snapshot.clips ? snapshot : { ...snapshot, clips };
+}
+
 interface RepurposeState {
   clips: Clip[];
   duration: number;
@@ -851,7 +1070,7 @@ interface RepurposeState {
    */
   commitHistory: (coalesceKey?: string) => void;
 
-  splitRatio: number; // 0.4 - 0.6, fraction of frame height given to screen (top)
+  splitRatio: number; // 0 - 1, fraction of frame height given to Screen (top)
 
   /**
    * Descript-style color-grade preset ids per track (see
@@ -871,6 +1090,12 @@ interface RepurposeState {
    */
   words: Word[];
   setWords: (words: Word[]) => void;
+  applyTranscript: (input: {
+    words: Word[];
+    mode: "preserve-cuts" | "rebuild";
+    rebuiltClips?: Clip[];
+    editStats?: EditStats | null;
+  }) => void;
 
   // --- sound effects (SFX track) --------------------------------------------
   /**
@@ -921,6 +1146,25 @@ interface RepurposeState {
   patchCaptionStyle: (patch: Partial<CaptionStyle>) => void;
   /** Set/clear per-block style overrides (the "adjustable per scene" edit). */
   patchCaptionBlock: (id: string, patch: Partial<CaptionBlock>) => void;
+  /** Explicitly pin one block to the split while inheriting the global offset. */
+  attachCaptionBlock: (id: string) => void;
+  /** Explicitly detach one block at an absolute requested output position. */
+  detachCaptionBlock: (
+    id: string,
+    positionYPct: number,
+    options?: { discrete?: boolean }
+  ) => void;
+  beginCaptionGesture: (blockId: string) => string | null;
+  completeCaptionGesture: (
+    token: string,
+    completion: CaptionGestureCompletion
+  ) => void;
+  cancelCaptionGesture: (token: string) => void;
+  beginCaptionPositionGesture: (blockId: string) => string | null;
+  updateCaptionPositionGesture: (token: string, positionYPct: number) => void;
+  endCaptionPositionGesture: (token: string) => void;
+  cancelCaptionPositionGesture: (token: string) => void;
+  subscribeCaptionGestureCancellation: (listener: () => void) => () => void;
   /**
    * Set this ONE block's vertical position as a per-scene override (the "put
    * captions higher/lower for this scene" edit). Writes into the block's
@@ -929,7 +1173,11 @@ interface RepurposeState {
    * resolved style uses: `splitOffsetPct` when pinned to the split seam, else
    * the absolute `positionYPct`.
    */
-  setBlockPosition: (id: string, positionYPct: number) => void;
+  setBlockPosition: (
+    id: string,
+    positionYPct: number,
+    effectiveSplitRatio?: number
+  ) => void;
   /** Clear a block's per-scene position override (revert this scene to global). */
   clearBlockPosition: (id: string) => void;
   /** Rebuild caption blocks from the current words + style (called after ingest / template change). */
@@ -1046,15 +1294,19 @@ interface RepurposeState {
    * Align every selected overlay's AABB to a shared edge/center of the combined
    * selection bounds. Needs the preview rect (pure geometry; the store has no
    * DOM). No-op with < 2 selected. One undo step (discrete). Each result is
-   * re-clamped to the top half so an aligned overlay can't cross the seam.
+   * re-clamped to its own band so it can't cross the seam.
    */
-  alignOverlays: (edge: AlignEdge, rect: PreviewRect) => void;
+  alignOverlays: (edge: AlignEdge, rect: PreviewRect, effectiveSplitRatio: number) => void;
   /**
    * Distribute the selected overlays so gaps are equal along the axis, holding
    * the two outermost fixed. Needs the preview rect. No-op with < 3 selected. One
-   * undo step. Each moved overlay is re-clamped to the top half.
+   * undo step. Each moved overlay is re-clamped to its own band.
    */
-  distributeOverlays: (axis: DistributeAxis, rect: PreviewRect) => void;
+  distributeOverlays: (
+    axis: DistributeAxis,
+    rect: PreviewRect,
+    effectiveSplitRatio: number
+  ) => void;
 
   /**
    * Attribute clipboard for "copy position" (Cmd/Ctrl+C) -> "paste attributes"
@@ -1071,7 +1323,7 @@ interface RepurposeState {
    * was copied so the key handler only preventDefaults a copy that was ours
    * (a plain text copy elsewhere keeps the native behavior).
    */
-  copySelectedAttributes: () => boolean;
+  copySelectedAttributes: (overlayId?: string) => boolean;
   /**
    * Apply `attributeClipboard` onto the current SAME-KIND selection: clip
    * attributes onto the selected scene (face framing through the syncFaceCam
@@ -1079,7 +1331,10 @@ interface RepurposeState {
    * attributes onto EVERY selected overlay. One discrete undo step. Returns
    * true when anything was applied.
    */
-  pasteAttributesToSelection: () => boolean;
+  pasteAttributesToSelection: (
+    rect?: PreviewRect,
+    effectiveSplitRatio?: number
+  ) => boolean;
 
   /**
    * The currently-selected CAPTION BLOCK (its id), or null. TRANSIENT like
@@ -1242,6 +1497,7 @@ interface RepurposeState {
   /** Raw dual-track source metadata (paths, fps, dims, duration). Null until footage is loaded/imported. */
   footageMeta: FootageMeta | null;
   setFootageMeta: (meta: FootageMeta | null) => void;
+  syncVideoTimeline: (previousMeta: FootageMeta | null) => void;
   setVideoSourceRecord: (
     target: VideoSourceTarget,
     source: VideoSourceRecord
@@ -1364,13 +1620,13 @@ interface RepurposeState {
   setClipTransition: (id: string, transition: ClipTransition | null) => void;
   /**
    * Set (or clear, with null) a clip's PER-SCENE split ratio -- the fraction of
-   * height given to the screen (top) half for just this clip. Clamped 0.4-0.6.
+   * height given to the Screen (top) band for just this clip. Clamped to [0, 1].
    * null reverts the clip to the global default. Render-time only -- does NOT
    * change srcStart/srcEnd, so it never ripples the timeline. This is what the
    * coral split handle writes when dragged over a
    * scene: only that scene's split changes, and the cut into it eases from the
-   * previous scene's split (see splitRatioAt in ./time-map.ts). The whole drag
-   * coalesces into ONE undo step (keyed on the clip id).
+   * previous scene's split (see splitRatioAt in ./time-map.ts). Each regular
+   * call is a discrete undo step; pointer drags use the gesture actions below.
    */
   setClipSplitRatio: (id: string, ratio: number | null) => void;
   /**
@@ -1399,28 +1655,44 @@ interface RepurposeState {
    * centered transform ({ x:0.5, y:0.5, scale:1, rotation:0 }, opacity 1) unless
    * the descriptor overrides x/y/scale. Selects the new overlay. Returns its id.
    */
-  addOverlay: (descriptor: {
-    kind: "image" | "video";
-    src: string;
-    sourcePath?: string;
-    videoSource?: VideoSourceRecord;
-    naturalWidth: number;
-    naturalHeight: number;
-    /** Playhead / drop time -> timelineStart (clamped to [0, duration]). */
-    atTime: number;
-    /** For video: full source duration (seconds) -> srcDuration + default window. */
-    srcDuration?: number;
-    /** Normalized drop-point center override (defaults to 0.5, 0.5). */
-    atPoint?: { x: number; y: number };
-    /** Initial scale (fraction of output width) override (defaults to 1). */
-    scale?: number;
-  }) => string;
+  addOverlay: (
+    descriptor: {
+      kind: "image" | "video";
+      src: string;
+      sourcePath?: string;
+      videoSource?: VideoSourceRecord;
+      naturalWidth: number;
+      naturalHeight: number;
+      /** Playhead / drop time -> timelineStart (clamped to [0, duration]). */
+      atTime: number;
+      /** For video: full source duration (seconds) -> srcDuration + default window. */
+      srcDuration?: number;
+      /** Normalized drop-point center override (defaults to 0.5, 0.5). */
+      atPoint?: { x: number; y: number };
+      /** Initial scale (fraction of output width) override (defaults to 1). */
+      scale?: number;
+      /** Split band to publish into (new editor overlays default to Screen). */
+      band?: Overlay["band"];
+    },
+    previewRect?: PreviewRect,
+    effectiveSplitRatio?: number
+  ) => string;
   /**
    * Patch an overlay's transform (x/y/scale/rotation). The whole continuous
    * gesture (a canvas drag-move / resize / rotate) coalesces into ONE undo step
    * via the `ovxform:${id}` key. Render-time only -- no ripple.
    */
   updateOverlayTransform: (id: string, patch: Partial<OverlayTransform>) => void;
+  beginOverlayTransformGesture: (id: string) => string | null;
+  updateOverlayTransformGesture: (
+    token: string,
+    patch: Partial<OverlayTransform>
+  ) => void;
+  endOverlayTransformGesture: (token: string) => void;
+  cancelOverlayTransformGesture: (token: string) => void;
+  subscribeOverlayTransformGestureCancellation: (
+    listener: () => void
+  ) => () => void;
   /**
    * Set an overlay's static `opacity` (0..1, clamped). Coalesces the whole
    * slider drag into ONE undo step via the `ovopacity:${id}` key -- the same
@@ -1429,6 +1701,19 @@ interface RepurposeState {
    * cut), so the no-fade convention is preserved.
    */
   setOverlayOpacity: (id: string, opacity: number) => void;
+  setOverlayEntranceEffect: (id: string, effect: OverlayEffect) => void;
+  setOverlayExitEffect: (id: string, effect: OverlayEffect) => void;
+  setOverlayCornerRadius: (id: string, radius: number) => void;
+  beginOverlayAppearanceGesture: (
+    id: string,
+    field: "entranceDuration" | "exitDuration" | "cornerRadius"
+  ) => string | null;
+  updateOverlayAppearanceGesture: (token: string, value: number) => void;
+  endOverlayAppearanceGesture: (token: string) => void;
+  cancelOverlayAppearanceGesture: (token: string) => void;
+  subscribeOverlayAppearanceGestureCancellation: (
+    listener: () => void
+  ) => () => void;
   /**
    * Slide an overlay in OUTPUT time, preserving its length. `timelineStart` is
    * clamped to [0, duration - length]. The whole drag coalesces (`ovmove:${id}`).
@@ -1452,12 +1737,17 @@ interface RepurposeState {
    */
   removeOverlay: (id: string) => void;
   /**
-   * Duplicate an overlay: a fresh id, the SAME src/media, nudged transform (so
-   * the copy is visibly offset), stacked on top (`zIndex` = max + 1). Discrete.
+   * Duplicate an overlay: a fresh id, the SAME src/media, nudged transform
+   * clamped to its frame-effective band, stacked on top (`zIndex` = max + 1).
+   * Discrete.
    * Selects the copy. Returns the NEW overlay's id (or null for an unknown id) so
    * a caller like the Cmd/Ctrl-drag clone gesture can immediately grab + drag it.
    */
-  duplicateOverlay: (id: string) => string | null;
+  duplicateOverlay: (
+    id: string,
+    rect: PreviewRect,
+    effectiveSplitRatio: number
+  ) => string | null;
   /**
    * Re-stack an overlay among overlays only: bring to front / forward one /
    * backward one / send to back. Re-dense-packs `zIndex` to 0..N-1. Discrete.
@@ -1478,6 +1768,16 @@ interface RepurposeState {
 
   // --- split / pan-zoom -----------------------------------------------------
   setSplitRatio: (ratio: number) => void;
+  beginSplitRatioGesture: (
+    target: { kind: "clip"; id: string } | { kind: "global" }
+  ) => string | null;
+  updateSplitRatioGesture: (token: string, ratio: number) => void;
+  endSplitRatioGesture: (token: string) => void;
+  cancelSplitRatioGesture: (token: string) => void;
+  /** Transient signal only; publishes no Zustand state and cannot trigger persistence. */
+  subscribeSplitRatioGestureCancellation: (
+    listener: () => void
+  ) => () => void;
   /** Set a track's color-grade preset id (see lib/repurpose/color-grade.ts). */
   setGrade: (track: "screen" | "face", gradeId: string) => void;
   /**
@@ -1530,7 +1830,255 @@ export const PLAYBACK_RATES = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 2.5] as c
 const MIN_PLAYBACK_RATE = PLAYBACK_RATES[0];
 const MAX_PLAYBACK_RATE = PLAYBACK_RATES[PLAYBACK_RATES.length - 1];
 
-export const useRepurposeStore = create<RepurposeState>((set, get) => ({
+export const useRepurposeStore = create<RepurposeState>((set, get) => {
+  let splitRatioGestureCounter = 0;
+  const splitRatioGestureCancellationListeners = new Set<() => void>();
+  let activeSplitRatioGesture: {
+    token: string;
+    target: { kind: "clip"; id: string } | { kind: "global" };
+    historyCommitted: boolean;
+  } | null = null;
+  type OverlayAppearanceGestureField =
+    | "entranceDuration"
+    | "exitDuration"
+    | "cornerRadius";
+  let overlayAppearanceGestureCounter = 0;
+  const overlayAppearanceGestureCancellationListeners = new Set<() => void>();
+  let activeOverlayAppearanceGesture: {
+    token: string;
+    id: string;
+    field: OverlayAppearanceGestureField;
+    initialValue: OverlayEffect | number | undefined;
+    past: EditableSnapshot[];
+    future: EditableSnapshot[];
+    historyCommitted: boolean;
+  } | null = null;
+  let overlayTransformGestureCounter = 0;
+  const overlayTransformGestureCancellationListeners = new Set<() => void>();
+  let activeOverlayTransformGesture: {
+    token: string;
+    id: string;
+    initialTransform: OverlayTransform;
+    past: EditableSnapshot[];
+    future: EditableSnapshot[];
+    historyCommitted: boolean;
+  } | null = null;
+  let captionGestureCounter = 0;
+  const captionGestureCancellationListeners = new Set<() => void>();
+  let activeCaptionGesture:
+    | { kind: "completion"; token: string; blockId: string }
+    | {
+        kind: "position";
+        token: string;
+        blockId: string;
+        captionBlocks: CaptionBlock[];
+        past: EditableSnapshot[];
+        future: EditableSnapshot[];
+        historyCommitted: boolean;
+      }
+    | null = null;
+  const captionGestureOwnsFrame = (): boolean => activeCaptionGesture !== null;
+
+  const cancelActiveSplitRatioGesture = (): boolean => {
+    if (!activeSplitRatioGesture) return false;
+    activeSplitRatioGesture = null;
+    return true;
+  };
+
+  const signalSplitRatioGestureCancellation = (): void => {
+    for (const listener of splitRatioGestureCancellationListeners) listener();
+  };
+
+  const cancelActiveSplitRatioGestureForClip = (id: string): void => {
+    if (
+      activeSplitRatioGesture?.target.kind === "clip" &&
+      activeSplitRatioGesture.target.id === id
+    ) {
+      cancelActiveSplitRatioGesture();
+      signalSplitRatioGestureCancellation();
+    }
+  };
+
+  const closeSplitRatioGesture = (token: string, signal: boolean): void => {
+    if (activeSplitRatioGesture?.token !== token) return;
+    cancelActiveSplitRatioGesture();
+    if (signal) signalSplitRatioGestureCancellation();
+  };
+
+  const signalOverlayAppearanceGestureCancellation = (): void => {
+    for (const listener of overlayAppearanceGestureCancellationListeners) listener();
+  };
+
+  const signalOverlayTransformGestureCancellation = (): void => {
+    for (const listener of overlayTransformGestureCancellationListeners) listener();
+  };
+
+  const restoreOverlayTransformGesture = (
+    gesture: NonNullable<typeof activeOverlayTransformGesture>
+  ): void => {
+    set({
+      overlays: get().overlays.map((overlay) =>
+        overlay.id === gesture.id
+          ? { ...overlay, transform: { ...gesture.initialTransform } }
+          : overlay
+      ),
+      past: gesture.past,
+      future: gesture.future,
+    });
+  };
+
+  const cancelActiveOverlayTransformGesture = (signal = true): boolean => {
+    const gesture = activeOverlayTransformGesture;
+    if (!gesture) return false;
+    activeOverlayTransformGesture = null;
+    if (gesture.historyCommitted) restoreOverlayTransformGesture(gesture);
+    if (signal) signalOverlayTransformGestureCancellation();
+    return true;
+  };
+
+  const closeActiveOverlayTransformGestureForHistory = (): boolean => {
+    if (!activeOverlayTransformGesture) return false;
+    activeOverlayTransformGesture = null;
+    signalOverlayTransformGestureCancellation();
+    return true;
+  };
+
+  const restoreOverlayAppearanceGesture = (
+    gesture: NonNullable<typeof activeOverlayAppearanceGesture>
+  ): void => {
+    const overlays = get().overlays.map((overlay) => {
+      if (overlay.id !== gesture.id) return overlay;
+      if (gesture.field === "cornerRadius") {
+        if (gesture.initialValue === undefined) {
+          const { cornerRadius: _cornerRadius, ...rest } = overlay;
+          return rest as Overlay;
+        }
+        return { ...overlay, cornerRadius: gesture.initialValue as number };
+      }
+      const effectField =
+        gesture.field === "entranceDuration" ? "entranceEffect" : "exitEffect";
+      if (gesture.initialValue === undefined) {
+        const next = { ...overlay };
+        delete next[effectField];
+        return next;
+      }
+      return {
+        ...overlay,
+        [effectField]: { ...(gesture.initialValue as OverlayEffect) },
+      };
+    });
+    set({ overlays, past: gesture.past, future: gesture.future });
+  };
+
+  const cancelActiveOverlayAppearanceGesture = (
+    signal = true
+  ): boolean => {
+    const gesture = activeOverlayAppearanceGesture;
+    if (!gesture) return false;
+    activeOverlayAppearanceGesture = null;
+    if (gesture.historyCommitted) restoreOverlayAppearanceGesture(gesture);
+    if (signal) signalOverlayAppearanceGestureCancellation();
+    return true;
+  };
+
+  const cancelActiveOverlayAppearanceGestureForOverlay = (
+    id: string
+  ): boolean => {
+    if (activeOverlayAppearanceGesture?.id !== id) return false;
+    return cancelActiveOverlayAppearanceGesture();
+  };
+
+  const signalCaptionGestureCancellation = (): void => {
+    for (const listener of captionGestureCancellationListeners) listener();
+  };
+
+  const cancelActiveCaptionGesture = (signal = true): boolean => {
+    const gesture = activeCaptionGesture;
+    if (!gesture) return false;
+    activeCaptionGesture = null;
+    if (gesture.kind === "position" && gesture.historyCommitted) {
+      set({
+        captionBlocks: gesture.captionBlocks,
+        past: gesture.past,
+        future: gesture.future,
+      });
+    }
+    if (signal) signalCaptionGestureCancellation();
+    return true;
+  };
+
+  const closeActiveHistoryGestures = (): void => {
+    cancelActiveOverlayTransformGesture();
+    cancelActiveCaptionGesture();
+    cancelActiveOverlayAppearanceGesture();
+    if (cancelActiveSplitRatioGesture()) {
+      signalSplitRatioGestureCancellation();
+    }
+  };
+
+  const withAttachedCaptionOverride = (block: CaptionBlock): CaptionBlock => {
+    const override = block.overrideStyle;
+    if (
+      override?.pinToSplit === true &&
+      !("positionYPct" in override) &&
+      !("splitOffsetPct" in override)
+    ) {
+      return block;
+    }
+    const {
+      positionYPct: _positionYPct,
+      splitOffsetPct: _splitOffsetPct,
+      ...rest
+    } = override ?? {};
+    return { ...block, overrideStyle: { ...rest, pinToSplit: true } };
+  };
+
+  const withDetachedCaptionOverride = (
+    block: CaptionBlock,
+    positionYPct: number
+  ): CaptionBlock => {
+    if (!Number.isFinite(positionYPct)) return block;
+    const clamped = Math.max(0, Math.min(1, positionYPct));
+    const override = block.overrideStyle;
+    if (
+      override?.pinToSplit === false &&
+      override.positionYPct === clamped &&
+      !("splitOffsetPct" in override)
+    ) {
+      return block;
+    }
+    const { splitOffsetPct: _splitOffsetPct, ...rest } = override ?? {};
+    return {
+      ...block,
+      overrideStyle: {
+        ...rest,
+        pinToSplit: false,
+        positionYPct: clamped,
+      },
+    };
+  };
+
+  const captureHistoryEntry = (coalesceKey?: string): void => {
+    const now = Date.now();
+    if (
+      coalesceKey !== undefined &&
+      coalesceKey === lastCommitKey &&
+      now - lastCommitAt < COALESCE_WINDOW_MS
+    ) {
+      lastCommitAt = now;
+      if (get().future.length > 0) set({ future: [] });
+      return;
+    }
+    lastCommitKey = coalesceKey ?? null;
+    lastCommitAt = now;
+
+    const state = get();
+    const past = [...state.past, captureSnapshot(state)];
+    if (past.length > HISTORY_LIMIT) past.splice(0, past.length - HISTORY_LIMIT);
+    set({ past, future: [] });
+  };
+
+  return {
   clips: [],
   duration: 0,
 
@@ -1593,6 +2141,10 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   // history + transient selection/playback). Deliberately does NOT reset the
   // module id counters; the loader reseeds them after hydrating the target project.
   resetProject: () => {
+    cancelActiveOverlayTransformGesture();
+    cancelActiveCaptionGesture();
+    cancelActiveOverlayAppearanceGesture();
+    cancelActiveSplitRatioGesture();
     overlayDeleteStash.clear();
     set({
       clips: [],
@@ -1685,6 +2237,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   playbackBlockedReason: null,
   sourceImportOwners: { screen: null, face: null },
   setFootageMeta: (meta) => {
+    const previousMeta = get().footageMeta;
     const normalizedMeta = meta
       ? {
           ...meta,
@@ -1706,6 +2259,38 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
       ...(hasBothPaths
         ? { isPlaying: false, playbackRate: 1 }
         : {}),
+    });
+    get().syncVideoTimeline(previousMeta);
+  },
+  syncVideoTimeline: (previousMeta) => {
+    const state = get();
+    const nextDuration = effectiveVideoTimelineDuration(state.footageMeta);
+    if (nextDuration === null) return;
+    const previousDuration = effectiveVideoTimelineDuration(previousMeta);
+    const clips = synchronizeVideoTimelineClips(
+      state.clips,
+      state.words,
+      previousDuration,
+      nextDuration
+    );
+    const past = state.past.map((snapshot) =>
+      synchronizeVideoTimelineSnapshot(snapshot, previousDuration, nextDuration)
+    );
+    const future = state.future.map((snapshot) =>
+      synchronizeVideoTimelineSnapshot(snapshot, previousDuration, nextDuration)
+    );
+    if (
+      clips === state.clips &&
+      past.every((snapshot, index) => snapshot === state.past[index]) &&
+      future.every((snapshot, index) => snapshot === state.future[index])
+    ) {
+      return;
+    }
+    set({
+      clips,
+      duration: deriveDuration(clips),
+      past,
+      future,
     });
   },
   setVideoSourceRecord: (target, source) => {
@@ -1807,31 +2392,16 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
 
   // --- undo / redo ----------------------------------------------------------
   commitHistory: (coalesceKey) => {
-    const now = Date.now();
-    // Coalesce: same continuous gesture, still inside the window -> fold in
-    // (don't push another snapshot), but keep the redo branch cleared since the
-    // gesture is still producing new edits.
-    if (
-      coalesceKey !== undefined &&
-      coalesceKey === lastCommitKey &&
-      now - lastCommitAt < COALESCE_WINDOW_MS
-    ) {
-      lastCommitAt = now;
-      if (get().future.length > 0) set({ future: [] });
-      return;
-    }
-    lastCommitKey = coalesceKey ?? null;
-    lastCommitAt = now;
-
-    const state = get();
-    const past = [...state.past, captureSnapshot(state)];
-    // Cap depth: drop the oldest entries once we exceed the limit.
-    if (past.length > HISTORY_LIMIT) past.splice(0, past.length - HISTORY_LIMIT);
-    // A fresh edit invalidates any redo branch.
-    set({ past, future: [] });
+    closeActiveHistoryGestures();
+    captureHistoryEntry(coalesceKey);
   },
 
   undo: () => {
+    closeActiveOverlayTransformGestureForHistory();
+    cancelActiveCaptionGesture();
+    cancelActiveOverlayAppearanceGesture();
+    const cancelledGesture = cancelActiveSplitRatioGesture();
+    if (cancelledGesture) signalSplitRatioGestureCancellation();
     const state = get();
     if (state.past.length === 0) return;
     const past = state.past.slice(0, -1);
@@ -1845,6 +2415,11 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   },
 
   redo: () => {
+    cancelActiveOverlayTransformGesture();
+    cancelActiveCaptionGesture();
+    cancelActiveOverlayAppearanceGesture();
+    const cancelledGesture = cancelActiveSplitRatioGesture();
+    if (cancelledGesture) signalSplitRatioGestureCancellation();
     const state = get();
     if (state.future.length === 0) return;
     const future = state.future.slice(0, -1);
@@ -1856,7 +2431,11 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   },
 
   setClips: (clips) => {
-    const laidOut = recomputeTimeline(clips);
+    cancelActiveOverlayTransformGesture();
+    cancelActiveCaptionGesture();
+    cancelActiveOverlayAppearanceGesture();
+    cancelActiveSplitRatioGesture();
+    const laidOut = recomputeTimeline(normalizeClipSplitRatios(clips));
     // setClips establishes a fresh baseline (ingest / auto-load / session
     // restore), never an incremental user edit -- so it RESETS history rather
     // than committing. You should never be able to undo back into a previous
@@ -1881,6 +2460,25 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   },
 
   deleteClip: (id) => {
+    cancelActiveSplitRatioGestureForClip(id);
+    const initial = get();
+    const initialGone = initial.clips.find((clip) => clip.id === id && clip.kept);
+    const projectedOverlays = initialGone
+      ? rippleOverlaysAfterDelete(
+          initial.overlays,
+          initialGone.timelineStart,
+          initialGone.timelineEnd
+        )
+      : initial.overlays;
+    const activeTargetId = activeOverlayAppearanceGesture?.id;
+    if (
+      activeTargetId &&
+      initial.overlays.some((overlay) => overlay.id === activeTargetId) &&
+      !projectedOverlays.some((overlay) => overlay.id === activeTargetId)
+    ) {
+      cancelActiveOverlayAppearanceGestureForOverlay(activeTargetId);
+    }
+
     get().commitHistory();
     const { clips, overlays } = get();
     // The scene's OUTPUT window BEFORE recompute -- the span that collapses. Any
@@ -1919,7 +2517,9 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     get().commitHistory();
     const { clips, overlays } = get();
     const wasDeleted = clips.some((c) => c.id === id && !c.kept);
-    const updated = clips.map((c) => (c.id === id ? { ...c, kept: true } : c));
+    const updated = clips.map((c) =>
+      c.id === id ? { ...normalizeClipSplitRatio(c), kept: true } : c
+    );
     const laidOut = recomputeTimeline(updated);
     // Inverse of the deleteClip overlay ripple: the restored scene
     // re-opens its window, so overlays at/after it shift RIGHT by its duration,
@@ -1966,7 +2566,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     const index = clips.findIndex((c) => c.id === id);
     if (index === -1) return;
     get().commitHistory();
-    const src = clips[index];
+    const src = normalizeClipSplitRatio(clips[index]);
     // A clean, kept copy: fresh id, same source range + retake list, but not a
     // keeper sibling and no incoming transition (it's a manual dupe, an internal
     // cut). timelineStart/End are re-derived by recomputeTimeline.
@@ -2050,14 +2650,13 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     const { clips } = get();
     const target = clips.find((c) => c.id === id);
     if (!target) return;
-    const next =
-      ratio === null ? undefined : Math.max(0.4, Math.min(0.6, ratio));
+    const next = ratio === null ? undefined : clampSplitRatio(ratio);
+    if (next === null) return;
     // No-op if unchanged (a drag frame that didn't move past clamp): don't push
     // a redundant undo step or fire subscribers (which would re-arm a smooth
     // re-render for nothing).
     if (next === target.splitRatio) return;
-    // Coalesce the whole handle drag on THIS clip into one undo step.
-    get().commitHistory(`clipSplit:${id}`);
+    get().commitHistory();
     const updated = clips.map((c) =>
       c.id === id ? { ...c, splitRatio: next } : c
     );
@@ -2079,7 +2678,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     );
     if (index === -1) return; // playhead not strictly inside a kept clip
 
-    const clip = clips[index];
+    const clip = normalizeClipSplitRatio(clips[index]);
     // Source time under the playhead within THIS clip (frame-locked timebase).
     const splitSrc = clip.srcStart + (at - clip.timelineStart);
 
@@ -2165,8 +2764,8 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     return id;
   },
   removeMediaAsset: (id) => {
-    const s = get();
-    const asset = s.mediaAssets.find((a) => a.id === id);
+    const initial = get();
+    const asset = initial.mediaAssets.find((a) => a.id === id);
     if (!asset) return;
 
     // Deleting a Files-bin entry deletes the asset EVERYWHERE: the bin row AND
@@ -2180,6 +2779,19 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
         ? ref.sourcePath === asset.sourcePath
         : ref.src === asset.src;
 
+    const activeTargetId = activeOverlayAppearanceGesture?.id;
+    if (
+      activeTargetId &&
+      initial.overlays.some(
+        (overlay) => overlay.id === activeTargetId && matches(overlay)
+      )
+    ) {
+      cancelActiveOverlayAppearanceGestureForOverlay(activeTargetId);
+    }
+
+    const removesOverlay = initial.overlays.some(matches);
+    if (removesOverlay) get().commitHistory();
+    const s = get();
     const nextAssets = s.mediaAssets.filter((a) => a.id !== id);
     const remainingOverlays = s.overlays.filter((o) => !matches(o));
     const clearMusic = s.musicTrack ? matches(s.musicTrack) : false;
@@ -2206,7 +2818,11 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   },
 
   // --- overlay actions ------------------------------------------------------
-  addOverlay: (descriptor) => {
+  addOverlay: (
+    descriptor,
+    previewRect = { left: 0, top: 0, width: 1080, height: 1920 },
+    effectiveSplitRatio = get().splitRatio
+  ) => {
     get().commitHistory();
     const { overlays, duration } = get();
     const id = nextOverlayId();
@@ -2229,14 +2845,13 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     // Stack on top: max existing z + 1 (0 for the first overlay).
     const maxZ = overlays.reduce((m, o) => Math.max(m, o.zIndex), -1);
 
-    // Default placement: a new overlay belongs in the SCREEN (top) band, not
-    // straddling the divider or landing in the face half. Center it vertically in
-    // the top band by default, then hard-clamp so its BOTTOM edge never crosses
-    // splitRatio -- the same top-half keep-out clampOverlayToTopHalf enforces on
-    // drag, done here rect-free (the store is pure TS and has no preview rect).
-    // A freshly added overlay is always unrotated (rotation 0), so its AABB
-    // half-height equals its plain half-height -- no corner math needed.
-    const { splitRatio } = get();
+    // Resolve all initial transforms against the caller's frame-effective split
+    // and preview geometry before publishing them to rendering or hit testing.
+    const splitRatio = parsePersistedSplitRatio(
+      effectiveSplitRatio,
+      get().splitRatio
+    );
+    const band = descriptor.band ?? "screen";
     // DEFAULT PLACEMENT = COVER THE SCREEN (top) BAND. Every overlay --
     // FCPXML B-roll AND a manually dropped image/video -- lands filling the screen
     // recording panel edge-to-edge (crop overflow), clipped to that band so it
@@ -2251,28 +2866,39 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     let x: number;
     let y: number;
     if (!explicit) {
-      // Cover the screen band, centered in it.
+      const bandHeight =
+        band === "screen" ? splitRatio : band === "face" ? 1 - splitRatio : 1;
       scale = screenCoverScale(
         descriptor.naturalWidth,
         descriptor.naturalHeight,
-        splitRatio
+        bandHeight
       );
       x = 0.5;
-      y = splitRatio / 2;
+      y =
+        band === "screen"
+          ? splitRatio / 2
+          : band === "face"
+            ? (1 + splitRatio) / 2
+            : 0.5;
     } else {
       scale = descriptor.scale ?? 1;
-      const natW = descriptor.naturalWidth > 0 ? descriptor.naturalWidth : 1;
-      const natH = descriptor.naturalHeight > 0 ? descriptor.naturalHeight : 1;
-      const aspect = natH / natW; // drawn height / drawn width
-      // Overlay half-height as a fraction of OUTPUT HEIGHT (see OUTPUT_RATIO note).
-      const halfHNorm = (scale * aspect * OUTPUT_RATIO) / 2;
       x = descriptor.atPoint?.x ?? 0.5;
-      y = descriptor.atPoint?.y ?? splitRatio / 2;
-      // Push up if the bottom edge would cross the seam (legacy keep-out).
-      if (y + halfHNorm > splitRatio) y = splitRatio - halfHNorm;
+      y =
+        descriptor.atPoint?.y ??
+        (band === "screen"
+          ? splitRatio / 2
+          : band === "face"
+            ? (1 + splitRatio) / 2
+            : 0.5);
     }
 
-    const overlay: Overlay = {
+    const initialTransform: OverlayTransform = {
+      x,
+      y,
+      scale,
+      rotation: 0,
+    };
+    const overlayBase: Overlay = {
       id,
       kind: descriptor.kind,
       src:
@@ -2292,18 +2918,22 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
       timelineEnd: timelineStart + length,
       srcStart: 0,
       srcDuration,
-      transform: {
-        x,
-        y,
-        scale,
-        rotation: 0,
-      },
-      // Clip to the screen band so a cover-sized overlay fills the screen panel
-      // and never bleeds onto the face cam.
-      band: "screen",
+      transform: initialTransform,
+      // Band clipping and selection geometry share this same published transform.
+      band,
       zIndex: maxZ + 1,
       opacity: 1,
+      ...normalizeOverlayAppearance({}),
       ...(isVideo ? { muted: true as const } : {}),
+    };
+    const overlay: Overlay = {
+      ...overlayBase,
+      transform: clampOverlayToBand(
+        overlayBase,
+        initialTransform,
+        previewRect,
+        splitRatio
+      ),
     };
 
     // Selecting the new overlay clears any clip selection (mutual exclusion) and
@@ -2318,11 +2948,18 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   },
 
   updateOverlayTransform: (id, patch) => {
-    const { overlays } = get();
-    const target = overlays.find((o) => o.id === id);
+    const target = get().overlays.find((overlay) => overlay.id === id);
     if (!target) return;
+    const next = { ...target.transform, ...patch };
+    if (
+      next.x === target.transform.x &&
+      next.y === target.transform.y &&
+      next.scale === target.transform.scale &&
+      next.rotation === target.transform.rotation
+    ) return;
     // Coalesce the whole canvas gesture (move/resize/rotate) into one undo step.
     get().commitHistory(`ovxform:${id}`);
+    const overlays = get().overlays;
     set({
       overlays: overlays.map((o) =>
         o.id === id ? { ...o, transform: { ...o.transform, ...patch } } : o
@@ -2330,30 +2967,98 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     });
   },
 
+  beginOverlayTransformGesture: (id) => {
+    cancelActiveCaptionGesture();
+    cancelActiveOverlayAppearanceGesture();
+    if (cancelActiveSplitRatioGesture()) signalSplitRatioGestureCancellation();
+    cancelActiveOverlayTransformGesture();
+    const target = get().overlays.find((overlay) => overlay.id === id);
+    if (!target) return null;
+    const token = `overlay-transform-gesture-${++overlayTransformGestureCounter}`;
+    activeOverlayTransformGesture = {
+      token,
+      id,
+      initialTransform: { ...target.transform },
+      past: get().past,
+      future: get().future,
+      historyCommitted: false,
+    };
+    return token;
+  },
+
+  updateOverlayTransformGesture: (token, patch) => {
+    const gesture = activeOverlayTransformGesture;
+    if (!gesture || gesture.token !== token) return;
+    const overlays = get().overlays;
+    const target = overlays.find((overlay) => overlay.id === gesture.id);
+    if (!target) {
+      cancelActiveOverlayTransformGesture();
+      return;
+    }
+    const next: OverlayTransform = { ...target.transform };
+    for (const field of ["x", "y", "scale", "rotation"] as const) {
+      const value = patch[field];
+      if (value !== undefined && Number.isFinite(value)) next[field] = value;
+    }
+    if (
+      next.x === target.transform.x &&
+      next.y === target.transform.y &&
+      next.scale === target.transform.scale &&
+      next.rotation === target.transform.rotation
+    ) return;
+    if (!gesture.historyCommitted) {
+      captureHistoryEntry();
+      gesture.historyCommitted = true;
+    }
+    set({
+      overlays: overlays.map((overlay) =>
+        overlay.id === gesture.id ? { ...overlay, transform: next } : overlay
+      ),
+    });
+  },
+
+  endOverlayTransformGesture: (token) => {
+    if (activeOverlayTransformGesture?.token !== token) return;
+    activeOverlayTransformGesture = null;
+  },
+  cancelOverlayTransformGesture: (token) => {
+    if (activeOverlayTransformGesture?.token !== token) return;
+    cancelActiveOverlayTransformGesture();
+  },
+  subscribeOverlayTransformGestureCancellation: (listener) => {
+    overlayTransformGestureCancellationListeners.add(listener);
+    return () => overlayTransformGestureCancellationListeners.delete(listener);
+  },
+
   setOverlayOpacity: (id, opacity) => {
-    const { overlays } = get();
-    const target = overlays.find((o) => o.id === id);
+    const target = get().overlays.find((overlay) => overlay.id === id);
     if (!target) return;
     const next = Math.max(0, Math.min(1, opacity));
     if (next === target.opacity) return; // no-op frame -- no step
     // Coalesce the whole slider drag into one undo step (own key namespace).
     get().commitHistory(`ovopacity:${id}`);
+    const overlays = get().overlays;
     set({
       overlays: overlays.map((o) => (o.id === id ? { ...o, opacity: next } : o)),
     });
   },
 
-  copySelectedAttributes: () => {
+  copySelectedAttributes: (overlayId) => {
     const { selectedOverlayId, overlays, selectedClipId, clips, splitRatio } =
       get();
-    if (selectedOverlayId) {
-      const o = overlays.find((x) => x.id === selectedOverlayId);
+    const targetOverlayId = overlayId ?? selectedOverlayId;
+    if (targetOverlayId) {
+      const o = overlays.find((x) => x.id === targetOverlayId);
       if (!o) return false;
+      const appearance = normalizeOverlayAppearance(o);
       set({
         attributeClipboard: {
           kind: "overlay",
           transform: { ...o.transform },
           opacity: o.opacity,
+          entranceEffect: { ...appearance.entranceEffect },
+          exitEffect: { ...appearance.exitEffect },
+          cornerRadius: appearance.cornerRadius,
         },
       });
       return true;
@@ -2361,10 +3066,9 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     if (selectedClipId) {
       const index = clips.findIndex((c) => c.id === selectedClipId);
       if (index === -1 || !clips[index].kept) return false;
-      // Resolve the VISIBLE per-scene values: an absent field means "inherit
-      // the previous kept clip's resolved value" (faceFramingAt/splitRatioAt in
-      // ./time-map.ts), so walk back to the nearest kept clip that carries one.
-      const resolve = <K extends "faceFraming" | "screenFraming" | "splitRatio">(
+      // Framing preserves its existing backward-inheritance behavior. Split is
+      // different: an absent scene override resolves directly to the global.
+      const resolveFraming = <K extends "faceFraming" | "screenFraming">(
         field: K
       ): Clip[K] => {
         for (let i = index; i >= 0; i--) {
@@ -2373,14 +3077,16 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
         }
         return undefined;
       };
-      const face = resolve("faceFraming");
-      const screen = resolve("screenFraming");
+      const face = resolveFraming("faceFraming");
+      const screen = resolveFraming("screenFraming");
       set({
         attributeClipboard: {
           kind: "clip",
           faceFraming: face ? { ...face } : undefined,
           screenFraming: screen ? { ...screen } : undefined,
-          splitRatio: resolve("splitRatio") ?? splitRatio,
+          splitRatio:
+            clampSplitRatio(clips[index].splitRatio ?? Number.NaN) ??
+            parsePersistedSplitRatio(splitRatio, 0.5),
         },
       });
       return true;
@@ -2388,46 +3094,64 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     return false;
   },
 
-  pasteAttributesToSelection: () => {
+  pasteAttributesToSelection: (
+    rect = { left: 0, top: 0, width: 1080, height: 1920 },
+    effectiveSplitRatio = get().splitRatio
+  ) => {
     const cb = get().attributeClipboard;
     if (!cb) return false;
 
     if (cb.kind === "overlay") {
-      const { selectedOverlayIds, overlays, splitRatio } = get();
+      const { selectedOverlayIds } = get();
       if (selectedOverlayIds.length === 0) return false;
       const targets = new Set(selectedOverlayIds);
-      // Clamp the pasted CENTER into each target's own band, so a paste can
-      // never strand an overlay entirely outside the region it's clipped to
-      // (fully band-clipped = composites to nothing = "the paste deleted it").
-      // Center-in-band keeps at least half of it visible; "free" overlays take
-      // the position as-is.
-      const clampY = (band: Overlay["band"], y: number): number =>
-        band === "screen"
-          ? Math.max(0, Math.min(splitRatio, y))
-          : band === "face"
-            ? Math.max(splitRatio, Math.min(1, y))
-            : y;
-      let changed = false;
-      const next = overlays.map((o) => {
-        if (!targets.has(o.id)) return o;
-        const transform = { ...cb.transform, y: clampY(o.band, cb.transform.y) };
-        if (
-          o.opacity === cb.opacity &&
-          o.transform.x === transform.x &&
-          o.transform.y === transform.y &&
-          o.transform.scale === transform.scale &&
-          o.transform.rotation === transform.rotation
-        ) {
-          return o; // already matches -- keep the same reference
-        }
-        changed = true;
-        return { ...o, transform, opacity: cb.opacity };
-      });
+      const apply = (overlays: Overlay[]) => {
+        let changed = false;
+        const next = overlays.map((overlay) => {
+          if (!targets.has(overlay.id)) return overlay;
+          if (!isOverlayBandVisible(overlay.band, effectiveSplitRatio)) {
+            return overlay;
+          }
+          const transform = clampOverlayToBand(
+            overlay,
+            { ...cb.transform },
+            rect,
+            effectiveSplitRatio
+          );
+          const appearance = normalizeOverlayAppearance(overlay);
+          if (
+            overlay.opacity === cb.opacity &&
+            overlay.transform.x === transform.x &&
+            overlay.transform.y === transform.y &&
+            overlay.transform.scale === transform.scale &&
+            overlay.transform.rotation === transform.rotation &&
+            overlayEffectEqual(appearance.entranceEffect, cb.entranceEffect) &&
+            overlayEffectEqual(appearance.exitEffect, cb.exitEffect) &&
+            appearance.cornerRadius === cb.cornerRadius
+          ) {
+            return overlay;
+          }
+          changed = true;
+          return {
+            ...overlay,
+            transform,
+            opacity: cb.opacity,
+            entranceEffect: { ...cb.entranceEffect },
+            exitEffect: { ...cb.exitEffect },
+            cornerRadius: cb.cornerRadius,
+          };
+        });
+        return { changed, next };
+      };
+      const initial = apply(get().overlays);
       // Nothing would actually change: no phantom history step (same no-op
       // discipline as updateOverlayTransform/setOverlayOpacity).
-      if (!changed) return false;
+      if (!initial.changed) return false;
+      cancelActiveOverlayAppearanceGesture();
+      const fresh = apply(get().overlays);
+      if (!fresh.changed) return false;
       get().commitHistory();
-      set({ overlays: next });
+      set({ overlays: fresh.next });
       return true;
     }
 
@@ -2447,7 +3171,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     });
     const face = cb.faceFraming ? clampFraming(cb.faceFraming) : undefined;
     const screen = cb.screenFraming ? clampFraming(cb.screenFraming) : undefined;
-    const ratio = Math.max(0.4, Math.min(0.6, cb.splitRatio));
+    const ratio = clampSplitRatio(cb.splitRatio);
     const framingEq = (a: FaceFraming | undefined, b: FaceFraming): boolean =>
       !!a && a.x === b.x && a.y === b.y && a.scale === b.scale;
 
@@ -2459,13 +3183,13 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
         !!face && (isTarget || syncFaceCam) && !framingEq(c.faceFraming, face);
       const needScreen =
         isTarget && !!screen && !framingEq(c.screenFraming, screen);
-      const needRatio = isTarget && c.splitRatio !== ratio;
+      const needRatio = isTarget && ratio !== null && c.splitRatio !== ratio;
       if (!needFace && !needScreen && !needRatio) return c;
       changed = true;
       const nextClip = { ...c };
       if (needFace && face) nextClip.faceFraming = { ...face };
       if (needScreen && screen) nextClip.screenFraming = { ...screen };
-      if (needRatio) nextClip.splitRatio = ratio;
+      if (needRatio && ratio !== null) nextClip.splitRatio = ratio;
       return nextClip;
     });
     // Pasting attributes the selection already has: no phantom history step
@@ -2477,16 +3201,20 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   },
 
   moveOverlay: (id, timelineStart) => {
-    const { overlays, duration } = get();
-    const target = overlays.find((o) => o.id === id);
+    const initial = get();
+    const target = initial.overlays.find((overlay) => overlay.id === id);
     if (!target) return;
     const length = target.timelineEnd - target.timelineStart;
     // Preserve length; clamp so the whole window stays inside [0, duration].
     // With no timeline yet (duration 0) only the >= 0 floor applies.
-    const maxStart = Math.max(0, duration > 0 ? duration - length : timelineStart);
+    const maxStart = Math.max(
+      0,
+      initial.duration > 0 ? initial.duration - length : timelineStart
+    );
     const nextStart = Math.max(0, Math.min(maxStart, timelineStart));
     if (nextStart === target.timelineStart) return; // no-op drag frame -- no step
     get().commitHistory(`ovmove:${id}`);
+    const overlays = get().overlays;
     set({
       overlays: overlays.map((o) =>
         o.id === id
@@ -2498,10 +3226,10 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   },
 
   trimOverlay: (id, edge, timelineTarget) => {
-    const { overlays, duration } = get();
-    const target = overlays.find((o) => o.id === id);
+    const target = get().overlays.find((overlay) => overlay.id === id);
     if (!target) return;
     get().commitHistory(`ovtrim:${id}:${edge}`);
+    const { overlays, duration } = get();
     set({
       overlays: overlays.map((o) => {
         if (o.id !== id) return o;
@@ -2537,9 +3265,10 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   },
 
   removeOverlay: (id) => {
-    const { overlays, selectedOverlayId } = get();
-    if (!overlays.some((o) => o.id === id)) return;
+    if (!get().overlays.some((overlay) => overlay.id === id)) return;
+    cancelActiveOverlayAppearanceGestureForOverlay(id);
     get().commitHistory();
+    const { overlays, selectedOverlayId } = get();
     // Dense-pack the survivors so z gaps never grow, and drop a dangling select.
     const remaining = densePackOverlayZ(overlays.filter((o) => o.id !== id));
     const nextIds = get().selectedOverlayIds.filter((sid) => sid !== id);
@@ -2553,39 +3282,32 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     });
   },
 
-  duplicateOverlay: (id) => {
-    const { overlays } = get();
-    const src = overlays.find((o) => o.id === id);
-    if (!src) return null;
+  duplicateOverlay: (id, rect, effectiveSplitRatio) => {
+    if (!get().overlays.some((overlay) => overlay.id === id)) return null;
     get().commitHistory();
+    const overlays = get().overlays;
+    const src = overlays.find((overlay) => overlay.id === id)!;
     const copyId = nextOverlayId();
     const maxZ = overlays.reduce((m, o) => Math.max(m, o.zIndex), -1);
     // Nudge the copy a hair down-right (normalized) so it's visibly offset, and
     // stack it on top. Same src/media -- a duplicate shares the on-disk asset.
-    const nudgedX = src.transform.x + 0.04;
-    let nudgedY = src.transform.y + 0.04;
-    // HARD top-half keep-out (same invariant addOverlay + every drag/resize path
-    // enforce): the +0.04 down-nudge would push a copy of an overlay already
-    // sitting on the seam BELOW it, into the face-cam band -- clamp the copy's
-    // bottom edge back to the seam. Rect-free like addOverlay: a duplicate keeps
-    // src's rotation, but an overlay that respected the keep-out is unrotated
-    // in the vast majority of cases; for a rotated overlay the plain half-height
-    // is a safe upper bound on the AABB half-height (rotation only ever grows it),
-    // so clamping by it can never leave the bottom below the seam.
-    const cScale = src.transform.scale;
-    const cNatW = src.naturalWidth > 0 ? src.naturalWidth : 1;
-    const cNatH = src.naturalHeight > 0 ? src.naturalHeight : 1;
-    const cHalfHNorm = (cScale * (cNatH / cNatW) * OUTPUT_RATIO) / 2;
-    const { splitRatio: dupSplit } = get();
-    if (nudgedY + cHalfHNorm > dupSplit) nudgedY = dupSplit - cHalfHNorm;
+    const transform = clampOverlayToBand(
+      src,
+      {
+        ...src.transform,
+        x: src.transform.x + 0.04,
+        y: src.transform.y + 0.04,
+      },
+      rect,
+      effectiveSplitRatio
+    );
     const copy: Overlay = {
       ...src,
       id: copyId,
-      transform: {
-        ...src.transform,
-        x: nudgedX,
-        y: nudgedY,
-      },
+      transform,
+      ...normalizeOverlayAppearance(src),
+      entranceEffect: { ...normalizeOverlayAppearance(src).entranceEffect },
+      exitEffect: { ...normalizeOverlayAppearance(src).exitEffect },
       zIndex: maxZ + 1,
     };
     set({
@@ -2600,18 +3322,23 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   },
 
   setOverlayZ: (id, dir) => {
-    const { overlays } = get();
-    if (overlays.length < 2 || !overlays.some((o) => o.id === id)) return;
+    const initialOverlays = get().overlays;
+    if (
+      initialOverlays.length < 2 ||
+      !initialOverlays.some((overlay) => overlay.id === id)
+    ) return;
     // Work on a z-sorted view; move the target within it, then dense-pack back.
-    const ordered = [...overlays].sort((a, b) => a.zIndex - b.zIndex);
-    const from = ordered.findIndex((o) => o.id === id);
+    const initialOrder = [...initialOverlays].sort((a, b) => a.zIndex - b.zIndex);
+    const from = initialOrder.findIndex((overlay) => overlay.id === id);
     let to = from;
-    if (dir === "front") to = ordered.length - 1;
+    if (dir === "front") to = initialOrder.length - 1;
     else if (dir === "back") to = 0;
-    else if (dir === "forward") to = Math.min(ordered.length - 1, from + 1);
+    else if (dir === "forward") to = Math.min(initialOrder.length - 1, from + 1);
     else if (dir === "backward") to = Math.max(0, from - 1);
     if (to === from) return; // already at the requested end -- no step
     get().commitHistory();
+    const overlays = get().overlays;
+    const ordered = [...overlays].sort((a, b) => a.zIndex - b.zIndex);
     const [moved] = ordered.splice(from, 1);
     ordered.splice(to, 0, moved);
     // Assign dense 0..n-1 by the new order; map back onto the store array order.
@@ -2658,14 +3385,24 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     });
   },
 
-  alignOverlays: (edge, rect) => {
+  alignOverlays: (edge, rect, effectiveSplitRatio) => {
     const { overlays, selectedOverlayIds } = get();
-    const selected = overlays.filter((o) => selectedOverlayIds.includes(o.id));
+    const selected = overlays.filter(
+      (o) =>
+        selectedOverlayIds.includes(o.id) &&
+        isOverlayBandVisible(o.band, effectiveSplitRatio)
+    );
     if (selected.length < 2) return; // nothing to align
+    const visualById = new Map(
+      selected.map((o) => [
+        o.id,
+        resolveOverlayTransformForFrame(o, rect, effectiveSplitRatio),
+      ])
+    );
     const moves = computeAlignOverlays(
       selected.map((o) => ({
         id: o.id,
-        transform: o.transform,
+        transform: visualById.get(o.id)!,
         naturalWidth: o.naturalWidth,
         naturalHeight: o.naturalHeight,
       })),
@@ -2673,33 +3410,190 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
       rect
     );
     if (moves.size === 0) return; // already aligned -- no step
+    let changed = false;
+    const next = overlays.map((o) => {
+      const moved = moves.get(o.id);
+      if (!moved) return o;
+      const transform = applyVisualTransformDeltaToPersisted(
+        o.transform,
+        visualById.get(o.id)!,
+        moved
+      );
+      if (
+        transform.x === o.transform.x &&
+        transform.y === o.transform.y &&
+        transform.scale === o.transform.scale &&
+        transform.rotation === o.transform.rotation
+      ) return o;
+      changed = true;
+      return { ...o, transform };
+    });
+    if (!changed) return;
     get().commitHistory(); // discrete: one undo step
-    const { splitRatio } = get();
     set({
-      overlays: overlays.map((o) => {
-        const moved = moves.get(o.id);
-        if (!moved) return o;
-        // Re-clamp so an aligned overlay's bottom can never cross the seam.
-        const clamped = clampOverlayToTopHalf(
-          moved,
-          o.naturalWidth,
-          o.naturalHeight,
-          rect,
-          splitRatio
+      overlays: get().overlays.map((overlay) => {
+        const moved = moves.get(overlay.id);
+        if (!moved) return overlay;
+        const transform = applyVisualTransformDeltaToPersisted(
+          overlay.transform,
+          visualById.get(overlay.id)!,
+          moved
         );
-        return { ...o, transform: clamped };
+        return { ...overlay, transform };
       }),
     });
   },
 
-  distributeOverlays: (axis, rect) => {
+  setOverlayEntranceEffect: (id, effect) => {
+    cancelActiveOverlayAppearanceGesture();
+    const target = get().overlays.find((overlay) => overlay.id === id);
+    if (!target) return;
+    const current = normalizeOverlayAppearance(target).entranceEffect;
+    const next = normalizeOverlayAppearance({ entranceEffect: effect }).entranceEffect;
+    if (overlayEffectEqual(current, next)) return;
+    get().commitHistory();
+    const overlays = get().overlays;
+    set({
+      overlays: overlays.map((overlay) =>
+        overlay.id === id ? { ...overlay, entranceEffect: { ...next } } : overlay
+      ),
+    });
+  },
+
+  setOverlayExitEffect: (id, effect) => {
+    cancelActiveOverlayAppearanceGesture();
+    const target = get().overlays.find((overlay) => overlay.id === id);
+    if (!target) return;
+    const current = normalizeOverlayAppearance(target).exitEffect;
+    const next = normalizeOverlayAppearance({ exitEffect: effect }).exitEffect;
+    if (overlayEffectEqual(current, next)) return;
+    get().commitHistory();
+    const overlays = get().overlays;
+    set({
+      overlays: overlays.map((overlay) =>
+        overlay.id === id ? { ...overlay, exitEffect: { ...next } } : overlay
+      ),
+    });
+  },
+
+  setOverlayCornerRadius: (id, radius) => {
+    cancelActiveOverlayAppearanceGesture();
+    const target = get().overlays.find((overlay) => overlay.id === id);
+    if (!target || !Number.isFinite(radius)) return;
+    const current = normalizeOverlayAppearance(target).cornerRadius;
+    const next = normalizeOverlayAppearance({ cornerRadius: radius }).cornerRadius;
+    if (current === next) return;
+    get().commitHistory();
+    const overlays = get().overlays;
+    set({
+      overlays: overlays.map((overlay) =>
+        overlay.id === id ? { ...overlay, cornerRadius: next } : overlay
+      ),
+    });
+  },
+
+  beginOverlayAppearanceGesture: (id, field) => {
+    cancelActiveOverlayTransformGesture();
+    cancelActiveCaptionGesture();
+    if (cancelActiveSplitRatioGesture()) {
+      signalSplitRatioGestureCancellation();
+    }
+    cancelActiveOverlayAppearanceGesture();
+    const target = get().overlays.find((overlay) => overlay.id === id);
+    if (!target) return null;
+    const initialValue =
+      field === "cornerRadius"
+        ? target.cornerRadius
+        : field === "entranceDuration"
+          ? target.entranceEffect
+            ? { ...target.entranceEffect }
+            : undefined
+          : target.exitEffect
+            ? { ...target.exitEffect }
+            : undefined;
+    const token = `overlay-appearance-gesture-${++overlayAppearanceGestureCounter}`;
+    activeOverlayAppearanceGesture = {
+      token,
+      id,
+      field,
+      initialValue,
+      past: get().past,
+      future: get().future,
+      historyCommitted: false,
+    };
+    return token;
+  },
+
+  updateOverlayAppearanceGesture: (token, value) => {
+    const gesture = activeOverlayAppearanceGesture;
+    if (!gesture || gesture.token !== token || !Number.isFinite(value)) return;
+    const overlays = get().overlays;
+    const target = overlays.find((overlay) => overlay.id === gesture.id);
+    if (!target) {
+      cancelActiveOverlayAppearanceGesture();
+      return;
+    }
+
+    const appearance = normalizeOverlayAppearance(target);
+    let nextOverlay: Overlay;
+    if (gesture.field === "cornerRadius") {
+      const cornerRadius = normalizeOverlayAppearance({ cornerRadius: value })
+        .cornerRadius;
+      if (cornerRadius === appearance.cornerRadius) return;
+      nextOverlay = { ...target, cornerRadius };
+    } else {
+      const effectField =
+        gesture.field === "entranceDuration" ? "entranceEffect" : "exitEffect";
+      const current = appearance[effectField];
+      const next = normalizeOverlayAppearance({
+        [effectField]: { ...current, durationSec: value },
+      })[effectField];
+      if (overlayEffectEqual(current, next)) return;
+      nextOverlay = { ...target, [effectField]: { ...next } };
+    }
+
+    if (!gesture.historyCommitted) {
+      captureHistoryEntry();
+      gesture.historyCommitted = true;
+    }
+    set({
+      overlays: overlays.map((overlay) =>
+        overlay.id === gesture.id ? nextOverlay : overlay
+      ),
+    });
+  },
+
+  endOverlayAppearanceGesture: (token) => {
+    if (activeOverlayAppearanceGesture?.token !== token) return;
+    activeOverlayAppearanceGesture = null;
+  },
+  cancelOverlayAppearanceGesture: (token) => {
+    if (activeOverlayAppearanceGesture?.token !== token) return;
+    cancelActiveOverlayAppearanceGesture();
+  },
+  subscribeOverlayAppearanceGestureCancellation: (listener) => {
+    overlayAppearanceGestureCancellationListeners.add(listener);
+    return () => overlayAppearanceGestureCancellationListeners.delete(listener);
+  },
+
+  distributeOverlays: (axis, rect, effectiveSplitRatio) => {
     const { overlays, selectedOverlayIds } = get();
-    const selected = overlays.filter((o) => selectedOverlayIds.includes(o.id));
+    const selected = overlays.filter(
+      (o) =>
+        selectedOverlayIds.includes(o.id) &&
+        isOverlayBandVisible(o.band, effectiveSplitRatio)
+    );
     if (selected.length < 3) return; // need >= 3 to equalize interior gaps
+    const visualById = new Map(
+      selected.map((o) => [
+        o.id,
+        resolveOverlayTransformForFrame(o, rect, effectiveSplitRatio),
+      ])
+    );
     const moves = computeDistributeOverlays(
       selected.map((o) => ({
         id: o.id,
-        transform: o.transform,
+        transform: visualById.get(o.id)!,
         naturalWidth: o.naturalWidth,
         naturalHeight: o.naturalHeight,
       })),
@@ -2707,20 +3601,36 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
       rect
     );
     if (moves.size === 0) return;
+    let changed = false;
+    const next = overlays.map((o) => {
+      const moved = moves.get(o.id);
+      if (!moved) return o;
+      const transform = applyVisualTransformDeltaToPersisted(
+        o.transform,
+        visualById.get(o.id)!,
+        moved
+      );
+      if (
+        transform.x === o.transform.x &&
+        transform.y === o.transform.y &&
+        transform.scale === o.transform.scale &&
+        transform.rotation === o.transform.rotation
+      ) return o;
+      changed = true;
+      return { ...o, transform };
+    });
+    if (!changed) return;
     get().commitHistory();
-    const { splitRatio } = get();
     set({
-      overlays: overlays.map((o) => {
-        const moved = moves.get(o.id);
-        if (!moved) return o;
-        const clamped = clampOverlayToTopHalf(
-          moved,
-          o.naturalWidth,
-          o.naturalHeight,
-          rect,
-          splitRatio
+      overlays: get().overlays.map((overlay) => {
+        const moved = moves.get(overlay.id);
+        if (!moved) return overlay;
+        const transform = applyVisualTransformDeltaToPersisted(
+          overlay.transform,
+          visualById.get(overlay.id)!,
+          moved
         );
-        return { ...o, transform: clamped };
+        return { ...overlay, transform };
       }),
     });
   },
@@ -2743,10 +3653,77 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   },
 
   setSplitRatio: (ratio) => {
-    const clamped = Math.max(0.4, Math.min(0.6, ratio));
+    const clamped = clampSplitRatio(ratio);
+    if (clamped === null) return;
     if (clamped === get().splitRatio) return; // no-op drag frame -- no history
-    get().commitHistory("splitRatio"); // whole split drag = one step
+    get().commitHistory();
     set({ splitRatio: clamped });
+  },
+
+  beginSplitRatioGesture: (target) => {
+    cancelActiveOverlayTransformGesture();
+    cancelActiveCaptionGesture();
+    cancelActiveOverlayAppearanceGesture();
+    if (cancelActiveSplitRatioGesture()) {
+      signalSplitRatioGestureCancellation();
+    }
+    if (
+      target.kind === "clip" &&
+      !get().clips.some((clip) => clip.id === target.id && clip.kept)
+    ) {
+      return null;
+    }
+    const token = `split-ratio-gesture-${++splitRatioGestureCounter}`;
+    activeSplitRatioGesture = { token, target, historyCommitted: false };
+    return token;
+  },
+
+  updateSplitRatioGesture: (token, ratio) => {
+    const gesture = activeSplitRatioGesture;
+    if (!gesture || gesture.token !== token) return;
+    const clamped = clampSplitRatio(ratio);
+    if (clamped === null) return;
+
+    if (gesture.target.kind === "global") {
+      if (clamped === get().splitRatio) return;
+      if (!gesture.historyCommitted) {
+        captureHistoryEntry();
+        gesture.historyCommitted = true;
+      }
+      set({ splitRatio: clamped });
+      return;
+    }
+
+    const targetId = gesture.target.id;
+    const clips = get().clips;
+    const target = clips.find((clip) => clip.id === targetId);
+    if (!target || !target.kept) {
+      cancelActiveSplitRatioGesture();
+      signalSplitRatioGestureCancellation();
+      return;
+    }
+    const currentRatio =
+      target.splitRatio === undefined
+        ? parsePersistedSplitRatio(get().splitRatio, 0.5)
+        : clampSplitRatio(target.splitRatio) ??
+          parsePersistedSplitRatio(get().splitRatio, 0.5);
+    if (currentRatio === clamped) return;
+    if (!gesture.historyCommitted) {
+      captureHistoryEntry();
+      gesture.historyCommitted = true;
+    }
+    set({
+      clips: clips.map((clip) =>
+        clip.id === targetId ? { ...clip, splitRatio: clamped } : clip
+      ),
+    });
+  },
+
+  endSplitRatioGesture: (token) => closeSplitRatioGesture(token, false),
+  cancelSplitRatioGesture: (token) => closeSplitRatioGesture(token, true),
+  subscribeSplitRatioGestureCancellation: (listener) => {
+    splitRatioGestureCancellationListeners.add(listener);
+    return () => splitRatioGestureCancellationListeners.delete(listener);
   },
 
   setGrade: (track, gradeId) => {
@@ -2763,6 +3740,69 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     set({ words, deletedWordIndices: [], selectedWordRange: null });
     // Keep caption blocks in sync with the new transcript.
     get().rebuildCaptionBlocks();
+  },
+  applyTranscript: (input) => {
+    closeActiveHistoryGestures();
+    const state = get();
+    if (input.mode === "rebuild" && input.rebuiltClips === undefined) return;
+
+    const clips =
+      input.mode === "rebuild"
+        ? recomputeTimeline(input.rebuiltClips!)
+        : state.clips;
+    const duration =
+      input.mode === "rebuild" ? deriveDuration(clips) : state.duration;
+    const captionBlocks = buildCaptionBlocksForState({
+      words: input.words,
+      clips,
+      deletedWordIndices: [],
+      style: state.captionStyle,
+    });
+    lastCommitKey = null;
+    lastCommitAt = Date.now();
+    const past = [...state.past, captureSnapshot(state)];
+    if (past.length > HISTORY_LIMIT) past.splice(0, past.length - HISTORY_LIMIT);
+    const historyPatch = { past, future: [] as EditableSnapshot[] };
+
+    if (input.mode === "preserve-cuts") {
+      set({
+        ...historyPatch,
+        words: input.words,
+        deletedWordIndices: [],
+        selectedWordRange: null,
+        selectedCaptionBlockId: null,
+        captionsEnabled: true,
+        captionBlocks,
+      });
+      return;
+    }
+
+    let inPoint =
+      state.inPoint === null ? null : Math.max(0, Math.min(duration, state.inPoint));
+    let outPoint =
+      state.outPoint === null ? null : Math.max(0, Math.min(duration, state.outPoint));
+    if (inPoint !== null && outPoint !== null && inPoint >= outPoint) {
+      inPoint = null;
+      outPoint = null;
+    }
+    overlayDeleteStash.clear();
+    set({
+      ...historyPatch,
+      clips,
+      duration,
+      words: input.words,
+      deletedWordIndices: [],
+      selectedWordRange: null,
+      selectedCaptionBlockId: null,
+      selectedClipId: null,
+      captionsEnabled: true,
+      captionBlocks,
+      sfxTrack: null,
+      editStats: input.editStats ?? null,
+      playhead: Math.max(0, Math.min(duration, state.playhead)),
+      inPoint,
+      outPoint,
+    });
   },
 
   // --- sound effects (SFX track) --------------------------------------------
@@ -3052,10 +4092,156 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     });
   },
 
-  setBlockPosition: (id, positionYPct) => {
+  attachCaptionBlock: (id) => {
+    const block = get().captionBlocks.find((candidate) => candidate.id === id);
+    if (!block) return;
+    if (withAttachedCaptionOverride(block) === block) return;
+    get().commitHistory();
+    set({
+      captionBlocks: get().captionBlocks.map((candidate) =>
+        candidate.id === id ? withAttachedCaptionOverride(candidate) : candidate
+      ),
+    });
+  },
+
+  detachCaptionBlock: (id, positionYPct, options) => {
+    const block = get().captionBlocks.find((candidate) => candidate.id === id);
+    if (!block) return;
+    if (withDetachedCaptionOverride(block, positionYPct) === block) return;
+    get().commitHistory(
+      !options?.discrete && block.overrideStyle?.pinToSplit === false
+        ? `captionPosition:${id}`
+        : undefined
+    );
+    set({
+      captionBlocks: get().captionBlocks.map((candidate) =>
+        candidate.id === id
+          ? withDetachedCaptionOverride(candidate, positionYPct)
+          : candidate
+      ),
+    });
+  },
+
+  beginCaptionGesture: (blockId) => {
+    cancelActiveOverlayTransformGesture();
+    cancelActiveCaptionGesture();
+    const cancelledSplit = cancelActiveSplitRatioGesture();
+    if (cancelledSplit) signalSplitRatioGestureCancellation();
+    cancelActiveOverlayAppearanceGesture();
+    if (!get().captionBlocks.some((block) => block.id === blockId)) return null;
+    const token = `caption-gesture-${++captionGestureCounter}`;
+    activeCaptionGesture = { kind: "completion", token, blockId };
+    return token;
+  },
+
+  completeCaptionGesture: (token, completion) => {
+    const gesture = activeCaptionGesture;
+    if (!gesture || gesture.kind !== "completion" || gesture.token !== token) {
+      return;
+    }
+    activeCaptionGesture = null;
+    const state = get();
+    const target = state.captionBlocks.find(
+      (block) => block.id === gesture.blockId
+    );
+    if (!target) return;
+    const nextTarget =
+      completion.kind === "attach"
+        ? withAttachedCaptionOverride(target)
+        : withDetachedCaptionOverride(target, completion.positionYPct);
+    if (nextTarget === target) return;
+    const captionBlocks = state.captionBlocks.map((block) =>
+      block.id === gesture.blockId ? nextTarget : block
+    );
+    const past = [...state.past, captureSnapshot(state)];
+    if (past.length > HISTORY_LIMIT) past.splice(0, past.length - HISTORY_LIMIT);
+    lastCommitKey = null;
+    lastCommitAt = Date.now();
+    set({ captionBlocks, past, future: [] });
+  },
+
+  cancelCaptionGesture: (token) => {
+    if (activeCaptionGesture?.token !== token) return;
+    cancelActiveCaptionGesture();
+  },
+
+  beginCaptionPositionGesture: (blockId) => {
+    cancelActiveOverlayTransformGesture();
+    cancelActiveCaptionGesture();
+    const cancelledSplit = cancelActiveSplitRatioGesture();
+    if (cancelledSplit) signalSplitRatioGestureCancellation();
+    cancelActiveOverlayAppearanceGesture();
+    const state = get();
+    const target = state.captionBlocks.find((block) => block.id === blockId);
+    if (!target || resolveBlockStyle(state.captionStyle, target).pinToSplit) {
+      return null;
+    }
+    const token = `caption-position-gesture-${++captionGestureCounter}`;
+    activeCaptionGesture = {
+      kind: "position",
+      token,
+      blockId,
+      captionBlocks: state.captionBlocks,
+      past: state.past,
+      future: state.future,
+      historyCommitted: false,
+    };
+    return token;
+  },
+
+  updateCaptionPositionGesture: (token, positionYPct) => {
+    const gesture = activeCaptionGesture;
+    if (!gesture || gesture.kind !== "position" || gesture.token !== token) return;
+    const state = get();
+    const target = state.captionBlocks.find(
+      (block) => block.id === gesture.blockId
+    );
+    if (!target) {
+      cancelActiveCaptionGesture();
+      return;
+    }
+    const nextTarget = withDetachedCaptionOverride(target, positionYPct);
+    if (nextTarget === target) return;
+    if (!gesture.historyCommitted) {
+      captureHistoryEntry();
+      gesture.historyCommitted = true;
+    }
+    set({
+      captionBlocks: get().captionBlocks.map((block) =>
+        block.id === gesture.blockId ? nextTarget : block
+      ),
+    });
+  },
+
+  endCaptionPositionGesture: (token) => {
+    if (
+      activeCaptionGesture?.kind !== "position" ||
+      activeCaptionGesture.token !== token
+    ) {
+      return;
+    }
+    activeCaptionGesture = null;
+  },
+
+  cancelCaptionPositionGesture: (token) => {
+    if (
+      activeCaptionGesture?.kind !== "position" ||
+      activeCaptionGesture.token !== token
+    ) {
+      return;
+    }
+    cancelActiveCaptionGesture();
+  },
+
+  subscribeCaptionGestureCancellation: (listener) => {
+    captionGestureCancellationListeners.add(listener);
+    return () => captionGestureCancellationListeners.delete(listener);
+  },
+
+  setBlockPosition: (id, positionYPct, effectiveSplitRatio = get().splitRatio) => {
     // Per-scene position nudge -- coalesce the drag into one step per block.
     get().commitHistory(`blockPos:${id}`);
-    const { captionStyle, captionBlocks, splitRatio } = get();
+    const { captionStyle, captionBlocks } = get();
     set({
       captionBlocks: captionBlocks.map((b) => {
         if (b.id !== id) return b;
@@ -3067,7 +4253,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
         //   - unpinned block -> positionYPct is used directly.
         const eff = resolveBlockStyle(captionStyle, b);
         const patch: Partial<CaptionStyle> = eff.pinToSplit
-          ? { splitOffsetPct: positionYPct - splitRatio }
+          ? { splitOffsetPct: positionYPct - effectiveSplitRatio }
           : { positionYPct };
         return { ...b, overrideStyle: { ...b.overrideStyle, ...patch } };
       }),
@@ -3094,42 +4280,15 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   },
 
   rebuildCaptionBlocks: () => {
+    cancelActiveCaptionGesture();
     const { words, captionStyle, clips, deletedWordIndices, captionBlocks } = get();
-
-    // Preserve manual per-block customizations across the re-chunk. chunkWordsIntoBlocks
-    // re-derives everything from scratch (it drops overrideStyle / keywordIndex /
-    // textOverride), so we stash them keyed by `${clipId}:${firstWordStartMs}` and
-    // re-attach after. The clip id in the key keeps duplicated/retake footage that
-    // reuses one source span from collapsing two clips' overrides into one entry.
-    const prevOverrides = indexOverridesByFirstWordStart(captionBlocks);
-
-    const deleted = new Set(deletedWordIndices);
-
-    // Chunk PER KEPT CLIP (in output order) so duplicated/retake footage still
-    // captions -- one flat pass over all `words` would collapse two clips that
-    // reuse the same source span into a single caption run, or caption words that
-    // no kept clip actually shows. Namespacing block ids by clip id makes the
-    // per-clip `cap-<idx>` ids collision-proof across clips that share source time.
-    const kept = clips
-      .filter((c) => c.kept)
-      .sort((a, b) => a.timelineStart - b.timelineStart);
-
-    const blocks: CaptionBlock[] = [];
-    for (const c of kept) {
-      // Words this clip actually shows: not deleted, and inside its half-open
-      // source range (same containment contract as clipForSourceTime). One
-      // `.filter` per clip -- O(words) per clip, fine for typical short sizes.
-      const slice = words.filter(
-        (w, i) => !deleted.has(i) && w.start >= c.srcStart && w.start < c.srcEnd
-      );
-      if (slice.length === 0) continue;
-      const clipBlocks = chunkWordsIntoBlocks(slice, captionStyle).map((b) => ({
-        ...b,
-        id: `${c.id}--${b.id}`,
-      }));
-      reattachOverrides(clipBlocks, prevOverrides);
-      for (const b of clipBlocks) blocks.push(b);
-    }
+    const blocks = buildCaptionBlocksForState({
+      words,
+      clips,
+      deletedWordIndices,
+      style: captionStyle,
+      previousBlocks: captionBlocks,
+    });
 
     // A re-chunk mints brand-new block ids, so any held caption selection now
     // dangles -- clear it (only if a block was actually selected) so the
@@ -3361,11 +4520,13 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   },
 
   setPlayhead: (t) => {
+    if (captionGestureOwnsFrame()) return;
     const clamped = Math.max(0, Math.min(get().duration, t));
     set({ playhead: clamped });
   },
 
   play: () => {
+    if (captionGestureOwnsFrame()) return;
     // No-op if there's nothing to play. If the playhead sits at (or past) the
     // end of the region, rewind to the region start so pressing play from the
     // end restarts rather than doing nothing.
@@ -3405,9 +4566,11 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   },
 
   stepFrame: (direction) => {
+    if (captionGestureOwnsFrame()) return;
     const { playhead, duration, footageMeta } = get();
     const fps = footageMeta?.fps && footageMeta.fps > 0 ? footageMeta.fps : FALLBACK_FPS;
-    const next = Math.max(0, Math.min(duration, playhead + direction / fps));
+    const frame = Math.round(playhead * fps) + direction;
+    const next = Math.max(0, Math.min(duration, frame / fps));
     // Frame-stepping is a paused, real-time action: stop and drop any fast rate.
     set({ isPlaying: false, playhead: next, playbackRate: 1 });
   },
@@ -3423,6 +4586,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
       get().pause();
       return;
     }
+    if (captionGestureOwnsFrame()) return;
     const { duration, isPlaying, playbackRate } = get();
     if (duration <= 0) return;
 
@@ -3455,8 +4619,8 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     set({ playbackRate: nextRate });
   },
 
-  seekToStart: () => set({ playhead: 0 }),
-  seekToEnd: () => set({ playhead: get().duration }),
+  seekToStart: () => get().setPlayhead(0),
+  seekToEnd: () => get().setPlayhead(get().duration),
 
   // Marker nav -- jump the play mark to the neighbouring marker relative to the
   // CURRENT playhead. `markers` is kept t-sorted (addMarker/updateMarker sort on
@@ -3469,7 +4633,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
     const { markers, playhead, duration } = get();
     const target = markers.find((m) => m.t > playhead + 1e-4);
     if (!target) return;
-    set({ playhead: Math.max(0, Math.min(duration, target.t)) });
+    get().setPlayhead(Math.max(0, Math.min(duration, target.t)));
   },
   prevMarker: () => {
     const { markers, playhead, duration } = get();
@@ -3479,7 +4643,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
       else break; // markers are ascending -- no later one can be before us
     }
     if (!target) return;
-    set({ playhead: Math.max(0, Math.min(duration, target.t)) });
+    get().setPlayhead(Math.max(0, Math.min(duration, target.t)));
   },
 
   setInPoint: (t) => {
@@ -3506,4 +4670,5 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => ({
   clearInOut: () => set({ inPoint: null, outPoint: null }),
 
   toggleLoop: () => set({ loopPlayback: !get().loopPlayback }),
-}));
+  };
+});

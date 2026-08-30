@@ -21,7 +21,9 @@
 // ===========================================================================
 
 import { footageUrlForPath } from "./ingest";
+import { effectiveSplitRatio } from "./split-ratio";
 import { useRepurposeStore } from "./store";
+import { splitRatioAt } from "./time-map";
 import type { VideoImportPhase } from "./types";
 import {
   importVideoFile,
@@ -62,6 +64,18 @@ let activeOverlayImport: OverlayImportOperation | null = null;
 
 const OVERLAY_IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
 const OVERLAY_VIDEO_EXTENSIONS = new Set(["mov", "mp4", "m4v", "webm", "mkv"]);
+const CANONICAL_PREVIEW_RECT = { left: 0, top: 0, width: 1080, height: 1920 };
+
+function addOverlayAtCurrentFrame(
+  descriptor: Parameters<ReturnType<typeof useRepurposeStore.getState>["addOverlay"]>[0]
+): string {
+  const store = useRepurposeStore.getState();
+  const split = effectiveSplitRatio(
+    splitRatioAt(store.clips, store.playhead, store.splitRatio),
+    CANONICAL_PREVIEW_RECT.height
+  );
+  return store.addOverlay(descriptor, CANONICAL_PREVIEW_RECT, split);
+}
 
 export function classifyOverlayFile(file: File): "image" | "video" | null {
   if (file.type.startsWith("image/")) return "image";
@@ -420,7 +434,7 @@ async function ingestOverlayFileForOperation(
       srcDuration: Math.max(0, inspection.durationSec),
       atPoint,
     } as const;
-    const id = useRepurposeStore.getState().addOverlay(descriptor);
+    const id = addOverlayAtCurrentFrame(descriptor);
     assertActiveOverlayImport(operation);
     const assetId = useRepurposeStore.getState().addMediaAsset({
       kind,
@@ -461,7 +475,7 @@ async function ingestOverlayFileForOperation(
     }
 
     assertActiveOverlayImport(operation);
-    const id = useRepurposeStore.getState().addOverlay({
+    const id = addOverlayAtCurrentFrame({
       kind,
       src,
       sourcePath,

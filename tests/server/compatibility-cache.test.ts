@@ -2453,7 +2453,7 @@ describe("compatibility cache lifecycle", () => {
     await replacement.start({ originalPath: "source.mov", inspection: media() });
     await eventually(() => expect(replacement.get(fingerprint).status).toBe("ready"));
     const stoppedHeartbeatCount = maintenanceHeartbeats;
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    await eventually(async () => expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" }));
 
     const [contents, lock] = await Promise.all([
       readFile(finalPath, "utf8").catch(() => null),

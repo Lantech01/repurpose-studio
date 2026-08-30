@@ -26,7 +26,7 @@
 // from the live transform -- so a gesture never compounds its own output.
 // ===========================================================================
 
-import type { OverlayTransform } from "./types";
+import type { Overlay, OverlayTransform } from "./types";
 
 /** The preview canvas's on-screen box in CSS pixels (from getBoundingClientRect). */
 export interface PreviewRect {
@@ -775,30 +775,120 @@ export function solveSnap(
 }
 
 /**
- * HARD top-half keep-out: after any move/resize, guarantee the overlay's bottom
- * edge never crosses the split seam. If the overlay's AABB maxY exceeds
- * splitRatio, translate the whole overlay UP by exactly the overshoot so its
- * bottom lands on the seam. Only ever TRANSLATES -- scale and rotation are
- * preserved, so the media is never squashed to fit.
+ * Keep a band-bound overlay's rotated AABB on its side of the split seam.
+ * Screen overlays move up until maxY reaches the seam; Face overlays mirror the
+ * rule and move down until minY reaches it. Free overlays are unchanged.
  *
- * If the overlay is taller than the entire top band, clamping its bottom to the
- * seam will push its top edge above y=0. That top overflow is intentional and
- * allowed (it's the ghosted-overflow case renders); only the bottom is a
- * hard boundary here. Pure -- returns a corrected transform, mutates nothing.
+ * Only the seam-facing edge is constrained. Oversized media may still overflow
+ * the outer frame edge and be cropped by the compositor.
  */
-export function clampOverlayToTopHalf(
+export function clampOverlayToBand(
+  overlay: Pick<Overlay, "naturalWidth" | "naturalHeight" | "band">,
   transform: OverlayTransform,
-  naturalWidth: number,
-  naturalHeight: number,
-  rect: PreviewRect,
+  previewRect: PreviewRect,
   splitRatio: number
 ): OverlayTransform {
-  const box = overlayAABBNorm(transform, naturalWidth, naturalHeight, rect);
-  if (box.maxY > splitRatio) {
-    const overshoot = box.maxY - splitRatio;
+  if (overlay.band !== "screen" && overlay.band !== "face") return transform;
+  const split = clamp(splitRatio, 0, 1);
+  const box = overlayAABBNorm(
+    transform,
+    overlay.naturalWidth,
+    overlay.naturalHeight,
+    previewRect
+  );
+  if (overlay.band === "screen" && box.maxY > split) {
+    const overshoot = box.maxY - split;
     return { ...transform, y: transform.y - overshoot };
   }
+  if (overlay.band === "face" && box.minY < split) {
+    const overshoot = split - box.minY;
+    return { ...transform, y: transform.y + overshoot };
+  }
   return transform;
+}
+
+/** Resolve a persisted overlay transform for the current frame without mutating it. */
+export function resolveOverlayTransformForFrame(
+  overlay: Pick<Overlay, "transform" | "naturalWidth" | "naturalHeight" | "band">,
+  previewRect: PreviewRect,
+  splitRatio: number
+): OverlayTransform {
+  return clampOverlayToBand(
+    overlay,
+    overlay.transform,
+    previewRect,
+    splitRatio
+  );
+}
+
+/** Map an edit solved in visual space back onto its original persisted baseline. */
+export function applyVisualTransformDeltaToPersisted(
+  persisted: OverlayTransform,
+  startVisual: OverlayTransform,
+  desiredVisual: OverlayTransform
+): OverlayTransform {
+  const finiteDelta = (start: number, desired: number): number =>
+    Number.isFinite(start) && Number.isFinite(desired) ? desired - start : 0;
+  const scaleRatio =
+    Number.isFinite(startVisual.scale) &&
+    startVisual.scale !== 0 &&
+    Number.isFinite(desiredVisual.scale)
+      ? desiredVisual.scale / startVisual.scale
+      : Number.NaN;
+  return {
+    x: persisted.x + finiteDelta(startVisual.x, desiredVisual.x),
+    y: persisted.y + finiteDelta(startVisual.y, desiredVisual.y),
+    scale:
+      Number.isFinite(scaleRatio) && scaleRatio > 0
+        ? persisted.scale * scaleRatio
+        : persisted.scale,
+    rotation:
+      persisted.rotation +
+      finiteDelta(startVisual.rotation, desiredVisual.rotation),
+  };
+}
+
+/** Whether an overlay's assigned split band has a positive frame height. */
+export function isOverlayBandVisible(
+  band: Overlay["band"],
+  splitRatio: number
+): boolean {
+  if (band === "screen") return splitRatio > 0;
+  if (band === "face") return splitRatio < 1;
+  return true;
+}
+
+/**
+ * Resolve the overlay that owns primary chrome/actions for the current frame.
+ * Rendering never rewrites selection: an eligible stored primary wins;
+ * otherwise the first eligible id in selection order is the deterministic
+ * fallback.
+ */
+export function resolveEffectivePrimaryOverlay(
+  overlays: readonly Overlay[],
+  selectedOverlayIds: readonly string[],
+  selectedOverlayId: string | null,
+  splitRatio: number
+): Overlay | null {
+  const selected = new Set(selectedOverlayIds);
+  const byId = new Map(overlays.map((overlay) => [overlay.id, overlay]));
+  const eligible = (overlay: Overlay | undefined): overlay is Overlay =>
+    !!overlay &&
+    selected.has(overlay.id) &&
+    isOverlayBandVisible(overlay.band, splitRatio) &&
+    overlay.naturalWidth > 0 &&
+    overlay.naturalHeight > 0;
+
+  const storedPrimary = selectedOverlayId
+    ? byId.get(selectedOverlayId)
+    : undefined;
+  if (eligible(storedPrimary)) return storedPrimary;
+
+  for (const id of selectedOverlayIds) {
+    const fallback = byId.get(id);
+    if (eligible(fallback)) return fallback;
+  }
+  return null;
 }
 
 // ===========================================================================
@@ -810,9 +900,8 @@ export function clampOverlayToTopHalf(
 // transform.x / transform.y (scale + rotation are never touched), computed from
 // each overlay's rotation-aware AABB (overlayAABBNorm) so the VISUAL edges line
 // up even when a box is tilted. Editor-only, like the snap engine -- it produces
-// positions the caller persists via updateOverlayTransform; it never touches the
-// compositor/export. The caller is responsible for the top-half clamp AFTER
-// (clampOverlayToTopHalf), so an aligned/distributed overlay can't cross the seam.
+// positions the caller maps from visual space onto persisted transforms; it
+// never touches the compositor/export.
 // ===========================================================================
 
 /** Which edge/center to align the selection's AABBs to. */
@@ -827,6 +916,8 @@ export interface AlignItem {
   naturalWidth: number;
   naturalHeight: number;
 }
+
+const OVERLAY_GEOMETRY_EPSILON = 1e-12;
 
 /**
  * ALIGN: translate each item so the chosen edge/center of its AABB lands on the
@@ -878,7 +969,10 @@ export function alignOverlays(
         dy = (minY + maxY) / 2 - (box.minY + box.maxY) / 2;
         break;
     }
-    if (dx !== 0 || dy !== 0) {
+    if (
+      Math.abs(dx) > OVERLAY_GEOMETRY_EPSILON ||
+      Math.abs(dy) > OVERLAY_GEOMETRY_EPSILON
+    ) {
       out.set(it.id, {
         ...it.transform,
         x: it.transform.x + dx,
@@ -896,7 +990,7 @@ export function alignOverlays(
  * equalize). We sort by the item's min-edge on the axis, sum the interior item
  * sizes, spread the leftover span as N+1 equal gaps, and lay the interiors out
  * left-to-right (or top-to-bottom). Only the axis coordinate moves; returns a
- * map id -> new transform for the items that move. Pure -- caller clamps after.
+ * map id -> new visual transform for the items that move.
  */
 export function distributeOverlays(
   items: AlignItem[],
@@ -931,7 +1025,7 @@ export function distributeOverlays(
   for (const b of interior) {
     const targetMin = cursor;
     const delta = targetMin - b.min; // pure translation of this item on the axis
-    if (delta !== 0) {
+    if (Math.abs(delta) > OVERLAY_GEOMETRY_EPSILON) {
       out.set(b.it.id, {
         ...b.it.transform,
         x: axis === "h" ? b.it.transform.x + delta : b.it.transform.x,

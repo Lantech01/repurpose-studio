@@ -55,6 +55,8 @@ import { drawCaptions, type CaptionStyle, type CaptionBlock } from "./captions";
 import { loadCaptionFonts } from "./caption-fonts";
 import { footageUrlForPath } from "./ingest";
 import { overlayUrlForPath } from "./overlay-ingest";
+import { effectiveSplitRatio } from "./split-ratio";
+import { resolveOverlayAppearanceAt } from "./overlay-effects";
 import type { Clip, FootageMeta, MusicTrack, Overlay, SfxTrack } from "./types";
 
 /**
@@ -938,7 +940,10 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
     // loop uses with the SAME output `time`, so the exported seam is identical
     // to what Manthan framed per scene (a tucked-up face on one scene, more room
     // on the next). `splitRatio` is the global default fallback.
-    const frameSplit = splitRatioAt(clips, time, splitRatio);
+    const frameSplit = effectiveSplitRatio(
+      splitRatioAt(clips, time, splitRatio),
+      OUT_HEIGHT
+    );
 
     // FREE-FLOATING OVERLAYS -- resolve every overlay active at this output frame
     // into an OverlayDraw the compositor draws ON TOP of the base composite,
@@ -948,8 +953,15 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
     // ready yet (missing bitmap / no decoded video frame) is skipped this frame
     // -- never a black rectangle (no-blank-first-frame convention).
     const overlayDraws: OverlayDraw[] = [];
+    const outputRect = {
+      left: 0,
+      top: 0,
+      width: OUT_WIDTH,
+      height: OUT_HEIGHT,
+    };
     for (const o of overlaysByZ) {
       if (!overlayActiveAt(o, i)) continue;
+      const appearance = resolveOverlayAppearanceAt(o, time, outputRect, frameSplit);
       if (o.kind === "image") {
         const bitmap = overlayBitmaps.get(o.id);
         if (!bitmap) continue;
@@ -957,7 +969,11 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
           source: bitmap,
           naturalWidth: bitmap.width,
           naturalHeight: bitmap.height,
-          transform: { ...o.transform, opacity: o.opacity },
+          transform: {
+            ...appearance.transform,
+            opacity: o.opacity * appearance.opacityMultiplier,
+          },
+          cornerRadius: appearance.cornerRadius,
           band: o.band,
         });
       } else {
@@ -967,7 +983,11 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
           source: df.source,
           naturalWidth: df.width,
           naturalHeight: df.height,
-          transform: { ...o.transform, opacity: o.opacity },
+          transform: {
+            ...appearance.transform,
+            opacity: o.opacity * appearance.opacityMultiplier,
+          },
+          cornerRadius: appearance.cornerRadius,
           band: o.band,
         });
       }

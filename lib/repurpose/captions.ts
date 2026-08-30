@@ -1161,6 +1161,643 @@ export interface DrawCaptionsOptions {
    * split handle as it's dragged. Falls back to positionYPct when absent.
    */
   splitRatio?: number;
+  /** Preview-only absolute block position. Export and persistence omit this. */
+  transientPosition?: {
+    blockId: string;
+    positionYPct: number;
+  };
+}
+
+export interface CaptionVisualBounds {
+  readonly left: number;
+  readonly top: number;
+  readonly right: number;
+  readonly bottom: number;
+}
+
+export interface CaptionLayout {
+  readonly activeBlockId: string;
+  readonly activeBlock: CaptionBlock;
+  readonly style: CaptionStyle;
+  readonly requestedAnchorY: number;
+  readonly anchorY: number;
+  readonly rawVisualBounds: CaptionVisualBounds;
+  readonly visualBounds: CaptionVisualBounds;
+  readonly anchorRange: {
+    readonly min: number;
+    readonly max: number;
+  };
+  readonly blockScale: number;
+  readonly blockAlpha: number;
+  readonly attachedTargetAnchorY: number | null;
+}
+
+interface VisualBounds {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+function scaledVisualBounds(
+  bounds: VisualBounds,
+  originX: number,
+  originY: number,
+  scaleX: number,
+  scaleY = scaleX
+): VisualBounds {
+  const left = originX + (bounds.left - originX) * scaleX;
+  const right = originX + (bounds.right - originX) * scaleX;
+  const top = originY + (bounds.top - originY) * scaleY;
+  const bottom = originY + (bounds.bottom - originY) * scaleY;
+  return {
+    left: Math.min(left, right),
+    top: Math.min(top, bottom),
+    right: Math.max(left, right),
+    bottom: Math.max(top, bottom),
+  };
+}
+
+function textVisualBounds(
+  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+  text: string,
+  x: number,
+  y: number,
+  sizePx: number,
+  spacing: number
+): VisualBounds {
+  const bounds: VisualBounds = {
+    left: Infinity,
+    top: Infinity,
+    right: -Infinity,
+    bottom: -Infinity,
+  };
+  const include = (value: string, atX: number) => {
+    const metrics = ctx.measureText(value);
+    const left = Number.isFinite(metrics.actualBoundingBoxLeft)
+      ? atX - metrics.actualBoundingBoxLeft
+      : atX;
+    const right = Number.isFinite(metrics.actualBoundingBoxRight)
+      ? atX + metrics.actualBoundingBoxRight
+      : atX + metrics.width;
+    bounds.left = Math.min(bounds.left, left);
+    bounds.top = Math.min(
+      bounds.top,
+      y - (metrics.actualBoundingBoxAscent || sizePx * 0.72)
+    );
+    bounds.right = Math.max(bounds.right, right);
+    bounds.bottom = Math.max(
+      bounds.bottom,
+      y + (metrics.actualBoundingBoxDescent || sizePx * 0.2)
+    );
+  };
+  if (spacing === 0) {
+    include(text, x);
+  } else {
+    let cursor = x;
+    for (const character of text) {
+      include(character, cursor);
+      cursor += ctx.measureText(character).width + spacing;
+    }
+  }
+  return bounds;
+}
+
+function spriteVisualBounds(
+  grid: number[][],
+  cx: number,
+  cy: number,
+  boxW: number,
+  boxH: number
+): VisualBounds | null {
+  const px = Math.min(boxW / CLAWD_COLS, boxH / CLAWD_ROWS);
+  let minRow = Infinity;
+  let maxRow = -Infinity;
+  let minColumn = Infinity;
+  let maxColumn = -Infinity;
+  for (let row = 0; row < grid.length; row++) {
+    for (let column = 0; column < grid[row].length; column++) {
+      if (grid[row][column] === 0) continue;
+      minRow = Math.min(minRow, row);
+      maxRow = Math.max(maxRow, row);
+      minColumn = Math.min(minColumn, column);
+      maxColumn = Math.max(maxColumn, column);
+    }
+  }
+  if (!Number.isFinite(minRow)) return null;
+  const ox = cx - (CLAWD_COLS * px) / 2;
+  const oy = cy - (CLAWD_ROWS * px) / 2;
+  const overlap = px * 0.06;
+  return {
+    left: ox + minColumn * px - overlap,
+    top: oy + minRow * px - overlap,
+    right: ox + (maxColumn + 1) * px + overlap,
+    bottom: oy + (maxRow + 1) * px + overlap,
+  };
+}
+
+function captionVisualBounds(
+  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+  active: CaptionBlock,
+  blockIndex: number,
+  style: CaptionStyle,
+  lines: LaidLine[],
+  srcT: number,
+  sizePx: number,
+  width: number,
+  baselineY: number,
+  blockScale: number,
+  blockAlpha: number
+): VisualBounds | null {
+  if (blockAlpha <= 0) return null;
+
+  const lineHeight = style.lineHeightMul * sizePx;
+  const padX = style.boxPadXPct * sizePx;
+  const padY = style.boxPadYPct * sizePx;
+  const strokePx = style.strokeWidthPct * sizePx;
+  const spacing = style.letterSpacingPct * sizePx;
+  const bounds: VisualBounds = {
+    left: Infinity,
+    top: Infinity,
+    right: -Infinity,
+    bottom: -Infinity,
+  };
+  const include = (
+    candidate: VisualBounds,
+    localOrigin?: { x: number; y: number },
+    localScaleX = 1,
+    localScaleY = localScaleX
+  ) => {
+    const locallyScaled =
+      localOrigin === undefined || (localScaleX === 1 && localScaleY === 1)
+        ? candidate
+        : scaledVisualBounds(
+            candidate,
+            localOrigin.x,
+            localOrigin.y,
+            localScaleX,
+            localScaleY
+          );
+    const blockScaled = scaledVisualBounds(
+      locallyScaled,
+      width / 2,
+      baselineY,
+      blockScale
+    );
+    bounds.left = Math.min(bounds.left, blockScaled.left);
+    bounds.top = Math.min(bounds.top, blockScaled.top);
+    bounds.right = Math.max(bounds.right, blockScaled.right);
+    bounds.bottom = Math.max(bounds.bottom, blockScaled.bottom);
+  };
+  const includeText = (
+    text: string,
+    x: number,
+    y: number,
+    outset: number,
+    localOrigin?: { x: number; y: number },
+    localScale = 1
+  ) => {
+    const textBounds = textVisualBounds(ctx, text, x, y, sizePx, spacing);
+    include(
+      {
+        left: textBounds.left - outset,
+        top: textBounds.top - outset,
+        right: textBounds.right + outset,
+        bottom: textBounds.bottom + outset,
+      },
+      localOrigin,
+      localScale
+    );
+  };
+
+  const isTypewriter = style.template === "typewriter";
+  const isLineBox = isTypewriter || style.template === "clean-minimal";
+  for (const line of lines) {
+    if (isLineBox && style.boxColor) {
+      const left = (width - line.width) / 2 - padX;
+      const top = line.y - lineHeight * 0.8 - padY;
+      include({
+        left,
+        top,
+        right: left + line.width + padX * 2,
+        bottom: top + lineHeight + padY * 2,
+      });
+    }
+
+    for (const laidWord of line.words) {
+      const word = active.words[laidWord.wordIndex];
+      const isActive = srcT >= word.start && srcT <= word.end;
+      if (isTypewriter && srcT < word.start) continue;
+      const wordScale = isActive
+        ? activePopScale(style.activePop ?? 0, srcT - word.start)
+        : 1;
+      const wordOrigin = {
+        x: laidWord.x + laidWord.width / 2,
+        y: line.y - sizePx * 0.36,
+      };
+
+      if (style.boxColor && style.template === "highlight-box" && isActive) {
+        const left = laidWord.x - padX;
+        const top = line.y - lineHeight * 0.8 - padY;
+        include(
+          {
+            left,
+            top,
+            right: left + laidWord.width + padX * 2,
+            bottom: top + lineHeight + padY * 2,
+          },
+          wordOrigin,
+          wordScale
+        );
+      }
+
+      const emoji = isEmoji(laidWord.text);
+      if (style.glowColor && isActive && !emoji) {
+        includeText(
+          laidWord.text,
+          laidWord.x,
+          line.y,
+          sizePx * 0.21,
+          wordOrigin,
+          wordScale
+        );
+      }
+      if (style.shadowColor && !emoji) {
+        includeText(
+          laidWord.text,
+          laidWord.x + sizePx * 0.03,
+          line.y + sizePx * 0.04,
+          0,
+          wordOrigin,
+          wordScale
+        );
+      }
+      if (style.strokeColor && strokePx > 0 && !emoji) {
+        includeText(
+          laidWord.text,
+          laidWord.x,
+          line.y,
+          strokePx,
+          wordOrigin,
+          wordScale
+        );
+      }
+
+      if (isTypewriter && isActive && !emoji) {
+        const chars = [...laidWord.text];
+        const duration = Math.max(1e-3, word.end - word.start);
+        const revealed = Math.min(
+          chars.length,
+          Math.floor(chars.length * clamp01((srcT - word.start) / duration) + 1e-6)
+        );
+        let cursor = laidWord.x;
+        for (let index = 0; index < revealed; index++) {
+          includeText(chars[index], cursor, line.y, 0, wordOrigin, wordScale);
+          cursor += ctx.measureText(chars[index]).width + spacing;
+        }
+        const blockElapsed = srcT - active.start;
+        const blink =
+          Math.floor(blockElapsed / (style.animDurationMs / 1000)) % 2 === 0;
+        if (blink) {
+          includeText(
+            "|",
+            cursor + spacing * 0.4,
+            line.y,
+            0,
+            wordOrigin,
+            wordScale
+          );
+        }
+      } else {
+        includeText(
+          laidWord.text,
+          laidWord.x,
+          line.y,
+          0,
+          wordOrigin,
+          wordScale
+        );
+      }
+    }
+  }
+
+  if (style.template === "clawd-peek" && lines[0]?.words.length) {
+    const line = lines[0];
+    let activeIndex = -1;
+    let lastIndex = 0;
+    for (let index = 0; index < line.words.length; index++) {
+      const word = active.words[line.words[index].wordIndex];
+      if (srcT >= word.start && srcT <= word.end) {
+        activeIndex = index;
+        break;
+      }
+      if (srcT > word.end) lastIndex = index;
+    }
+    const restIndex = activeIndex >= 0 ? activeIndex : lastIndex;
+    const word = active.words[line.words[restIndex].wordIndex];
+    const rise = 0.13;
+    const up = Math.min(
+      clamp01((srcT - word.start) / rise),
+      clamp01((word.end - srcT) / rise)
+    );
+    const peek = activeIndex >= 0 ? up : 0.18;
+    const boxH = sizePx * 0.98;
+    const boxW = boxH * (CLAWD_COLS / CLAWD_ROWS);
+    const capTop = line.y - sizePx * 0.92;
+    const hiddenY = capTop + boxH * 0.55;
+    const peekedY = capTop - boxH * 0.42;
+    const cy = hiddenY + (peekedY - hiddenY) * easings.easeOutBack(clamp01(peek));
+    const cx = line.words[restIndex].x + line.words[restIndex].width / 2;
+    const sprite = spriteVisualBounds(
+      clawdGridForBlock(active, blockIndex),
+      cx,
+      cy,
+      boxW,
+      boxH
+    );
+    if (sprite) include(sprite);
+  }
+
+  if (style.template === "clawd-hop" && lines[0]) {
+    const line = lines[0];
+    const hop = clawdHopState(line, active, srcT);
+    if (hop) {
+      const boxH = sizePx * 0.82;
+      const boxW = boxH * (CLAWD_COLS / CLAWD_ROWS);
+      const capTop = line.y - sizePx * 0.92;
+      const cy =
+        capTop - sizePx * 0.14 - boxH / 2 - hop.lift * sizePx * 0.55;
+      const sprite = spriteVisualBounds(
+        clawdGridForBlock(active, blockIndex),
+        hop.centerX,
+        cy,
+        boxW,
+        boxH
+      );
+      if (sprite) {
+        const baseY = cy + boxH / 2;
+        include(
+          sprite,
+          { x: hop.centerX, y: baseY },
+          1 + 0.16 * hop.squash,
+          1 - 0.16 * hop.squash
+        );
+      }
+    }
+  }
+
+  if (
+    style.template === "underline-hold" &&
+    lines[0]?.words.length &&
+    style.underlineColor
+  ) {
+    const line = lines[0];
+    const underlineY = line.y + sizePx * 0.16;
+    const outset = Math.max(
+      style.underlineRailColor ? sizePx * 0.045 : 0,
+      sizePx * 0.065
+    );
+    const first = line.words[0];
+    const last = line.words[line.words.length - 1];
+    include({
+      left: first.x - outset,
+      top: underlineY - outset,
+      right: last.x + last.width + outset,
+      bottom: underlineY + outset,
+    });
+  }
+
+  return Number.isFinite(bounds.left) ? bounds : null;
+}
+
+interface CaptionRenderDetails {
+  readonly lines: readonly LaidLine[];
+  readonly sizePx: number;
+  readonly blockIndex: number;
+  readonly translateX: number;
+  readonly translateY: number;
+  readonly srcT: number;
+  readonly width: number;
+}
+
+const CAPTION_RENDER_DETAILS = Symbol("captionRenderDetails");
+
+interface InternalCaptionLayout extends CaptionLayout {
+  readonly [CAPTION_RENDER_DETAILS]: CaptionRenderDetails;
+}
+
+function freezeCaptionRenderDetails(
+  details: CaptionRenderDetails
+): CaptionRenderDetails {
+  for (const line of details.lines) {
+    for (const word of line.words) Object.freeze(word);
+    Object.freeze(line.words);
+    Object.freeze(line);
+  }
+  Object.freeze(details.lines);
+  return Object.freeze(details);
+}
+
+function translatedVisualBounds(
+  bounds: VisualBounds,
+  translateX: number,
+  translateY: number
+): VisualBounds {
+  return {
+    left: bounds.left + translateX,
+    top: bounds.top + translateY,
+    right: bounds.right + translateX,
+    bottom: bounds.bottom + translateY,
+  };
+}
+
+function clampedCaptionAnchor(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
+  if (typeof value !== "object" || value === null || seen.has(value)) return value;
+  seen.add(value);
+  for (const key of Reflect.ownKeys(value)) {
+    deepFreeze((value as Record<PropertyKey, unknown>)[key], seen);
+  }
+  return Object.freeze(value);
+}
+
+function immutableSnapshot<T>(value: T): T {
+  return deepFreeze(structuredClone(value));
+}
+
+/** Resolve active caption geometry without painting or mutating authoring data. */
+export function resolveCaptionLayout(
+  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+  opts: DrawCaptionsOptions
+): CaptionLayout | null {
+  const {
+    style: globalStyle,
+    blocks,
+    srcT,
+    width,
+    height,
+    splitRatio,
+    transientPosition,
+  } = opts;
+  const sourceActive = activeCaptionBlockAt(blocks, srcT);
+  if (!sourceActive || srcT === null) return null;
+
+  const active = immutableSnapshot(sourceActive);
+  const globalStyleSnapshot = immutableSnapshot(globalStyle);
+  const style = deepFreeze(resolveBlockStyle(globalStyleSnapshot, active));
+  const transientAnchor =
+    transientPosition?.blockId === active.id &&
+    Number.isFinite(transientPosition.positionYPct)
+      ? transientPosition.positionYPct * height
+      : null;
+  const requestedAnchorY =
+    transientAnchor ??
+    (style.pinToSplit && typeof splitRatio === "number"
+      ? (splitRatio + style.splitOffsetPct) * height
+      : style.positionYPct * height);
+  const nominalSizePx = style.sizePct * width;
+  const blockElapsed = srcT - active.start;
+  const blockScale = entranceScale(style.anim, blockElapsed, style.animDurationMs);
+  const blockAlpha = entranceAlpha(style.anim, blockElapsed, style.animDurationMs);
+  const blockIndex = blocks.indexOf(sourceActive);
+
+  ctx.save();
+  try {
+    ctx.textBaseline = "alphabetic";
+    ctx.textAlign = "left";
+    const setFont = (px: number) => {
+      ctx.font = captionFontString(style.font, style.weight, px);
+    };
+    setFont(nominalSizePx);
+    (ctx as CanvasRenderingContext2D).lineJoin = "round";
+    (ctx as CanvasRenderingContext2D).miterLimit = 2;
+
+    let measured = layoutBlock(
+      ctx,
+      active,
+      style,
+      nominalSizePx,
+      width,
+      requestedAnchorY,
+      setFont
+    );
+    let { lines, sizePx } = measured;
+    let rawVisualBounds = captionVisualBounds(
+      ctx,
+      active,
+      blockIndex,
+      style,
+      lines,
+      srcT,
+      sizePx,
+      width,
+      requestedAnchorY,
+      blockScale,
+      blockAlpha
+    );
+
+    for (let pass = 0; pass < 8 && rawVisualBounds; pass++) {
+      const visualWidth = rawVisualBounds.right - rawVisualBounds.left;
+      if (visualWidth <= width + 1e-6) break;
+      const proportionalSize = sizePx * ((width - 2e-6) / visualWidth);
+      const nextRenderedPixelSize = Math.round(sizePx) - 0.501;
+      measured = layoutBlock(
+        ctx,
+        active,
+        style,
+        Math.max(1, Math.min(proportionalSize, nextRenderedPixelSize)),
+        width,
+        requestedAnchorY,
+        setFont
+      );
+      lines = measured.lines;
+      sizePx = measured.sizePx;
+      rawVisualBounds = captionVisualBounds(
+        ctx,
+        active,
+        blockIndex,
+        style,
+        lines,
+        srcT,
+        sizePx,
+        width,
+        requestedAnchorY,
+        blockScale,
+        blockAlpha
+      );
+    }
+    if (!rawVisualBounds) return null;
+
+    const translateX =
+      rawVisualBounds.left < 0
+        ? -rawVisualBounds.left
+        : rawVisualBounds.right > width
+          ? width - rawVisualBounds.right
+          : 0;
+    const anchorRange = {
+      min: requestedAnchorY - rawVisualBounds.top,
+      max: height - (rawVisualBounds.bottom - requestedAnchorY),
+    };
+    const anchorY = clampedCaptionAnchor(
+      requestedAnchorY,
+      anchorRange.min,
+      anchorRange.max
+    );
+    const translateY = anchorY - requestedAnchorY;
+    const candidateOverride = active.overrideStyle
+      ? (Object.fromEntries(
+          Object.entries(active.overrideStyle).filter(
+            ([key]) =>
+              key !== "positionYPct" &&
+              key !== "splitOffsetPct" &&
+              key !== "pinToSplit"
+          )
+        ) as Partial<CaptionStyle>)
+      : {};
+    const candidateStyle = resolveBlockStyle(globalStyle, {
+      ...active,
+      overrideStyle: { ...candidateOverride, pinToSplit: true },
+    });
+    const attachedTargetAnchorY =
+      typeof splitRatio === "number"
+        ? clampedCaptionAnchor(
+            (splitRatio + candidateStyle.splitOffsetPct) * height,
+            anchorRange.min,
+            anchorRange.max
+          )
+        : null;
+    const renderDetails = freezeCaptionRenderDetails({
+      lines,
+      sizePx,
+      blockIndex,
+      translateX,
+      translateY,
+      srcT,
+      width,
+    });
+    const layout: InternalCaptionLayout = {
+      activeBlockId: active.id,
+      activeBlock: active,
+      style,
+      requestedAnchorY,
+      anchorY,
+      rawVisualBounds: Object.freeze(rawVisualBounds),
+      visualBounds: Object.freeze(
+        translatedVisualBounds(rawVisualBounds, translateX, translateY)
+      ),
+      anchorRange: Object.freeze(anchorRange),
+      blockScale,
+      blockAlpha,
+      attachedTargetAnchorY,
+      [CAPTION_RENDER_DETAILS]: renderDetails,
+    };
+    return Object.freeze(layout);
+  } finally {
+    ctx.restore();
+  }
 }
 
 /**
@@ -1172,88 +1809,41 @@ export interface DrawCaptionsOptions {
 export function drawCaptions(
   ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
   opts: DrawCaptionsOptions
-): void {
-  const { style: globalStyle, blocks, srcT, width, height, splitRatio } = opts;
-  if (srcT === null || blocks.length === 0) return;
-
-  // Find the active block. A small lead/lag window keeps a block visible through
-  // its entrance/exit animation even a hair before/after its word timings.
-  // Prefer a STRICT [start, end] containment match so back-to-back blocks
-  // (gap <= LEAD) resolve to the one actually being spoken -- otherwise a prior
-  // block's exit-lead would over-hold and eat the next block's entrance. Fall
-  // back to the padded LEAD window only when NO block strictly contains srcT.
-  const LEAD = 0.05;
-  let active: CaptionBlock | null = null;
-  for (const b of blocks) {
-    if (srcT >= b.start && srcT <= b.end) {
-      active = b;
-      break;
-    }
-  }
-  if (!active) {
-    for (const b of blocks) {
-      if (srcT >= b.start - LEAD && srcT <= b.end + LEAD) {
-        active = b;
-        break;
-      }
-    }
-  }
-  if (!active) return;
-
-  const style = resolveBlockStyle(globalStyle, active);
-  const nominalSizePx = style.sizePct * width;
-  // Pin to the split seam when asked (and we know where it is) so captions
-  // track the split handle as it's dragged; else use the absolute anchor.
-  const baselineY =
-    style.pinToSplit && typeof splitRatio === "number"
-      ? (splitRatio + style.splitOffsetPct) * height
-      : style.positionYPct * height;
+): CaptionLayout | null {
+  const layout = resolveCaptionLayout(ctx, opts);
+  if (!layout) return null;
+  const details = (layout as InternalCaptionLayout)[CAPTION_RENDER_DETAILS];
+  if (!details) return null;
+  const { srcT, width } = details;
+  const { activeBlock: active, style, requestedAnchorY, blockScale, blockAlpha } =
+    layout;
+  const { lines, sizePx, blockIndex, translateX, translateY } = details;
 
   ctx.save();
   ctx.textBaseline = "alphabetic";
   ctx.textAlign = "left";
-  const setFont = (px: number) => {
-    ctx.font = captionFontString(style.font, style.weight, px);
-  };
-  setFont(nominalSizePx);
+  ctx.font = captionFontString(style.font, style.weight, sizePx);
   (ctx as CanvasRenderingContext2D).lineJoin = "round";
   (ctx as CanvasRenderingContext2D).miterLimit = 2;
-
-  // Lay out + AUTO-FIT: layoutBlock shrinks the font if the block would overflow
-  // the safe zone and returns the effective size. All size-derived metrics below
-  // (stroke, line height, box padding, glow, mascot) use this fitted `sizePx` so
-  // everything scales together. The common case (fits) returns the nominal size
-  // unchanged, so unaffected captions look exactly as before. ctx.font is left at
-  // the fitted size by layoutBlock.
-  const { lines, sizePx } = layoutBlock(
-    ctx,
-    active,
-    style,
-    nominalSizePx,
-    width,
-    baselineY,
-    setFont
-  );
-
-  // Block-level entrance (Beast/Word-Pop pop the whole phrase together).
   const blockElapsed = srcT - active.start;
-  const blockScale = entranceScale(style.anim, blockElapsed, style.animDurationMs);
-  const blockAlpha = entranceAlpha(style.anim, blockElapsed, style.animDurationMs);
   ctx.globalAlpha = blockAlpha;
-
-  // Scale the whole block about the baseline center for pop/spring entrances.
-  if (blockScale !== 1) {
-    const cx = width / 2;
-    ctx.translate(cx, baselineY);
-    ctx.scale(blockScale, blockScale);
-    ctx.translate(-cx, -baselineY);
-  }
 
   const strokePx = style.strokeWidthPct * sizePx;
   const lineHeight = style.lineHeightMul * sizePx;
   const padX = style.boxPadXPct * sizePx;
   const padY = style.boxPadYPct * sizePx;
   const radius = style.boxRadiusPct * lineHeight;
+  if (translateX !== 0 || translateY !== 0) {
+    ctx.translate(translateX, translateY);
+  }
+
+  // Scale the whole block about the baseline center for pop/spring entrances.
+  if (blockScale !== 1) {
+    const cx = width / 2;
+    ctx.translate(cx, requestedAnchorY);
+    ctx.scale(blockScale, blockScale);
+    ctx.translate(-cx, -requestedAnchorY);
+  }
 
   const isTypewriter = style.template === "typewriter";
   const isCleanMinimal = style.template === "clean-minimal";
@@ -1301,7 +1891,7 @@ export function drawCaptions(
 
       ctx.save();
       ctx.globalAlpha = blockAlpha;
-      const grid = clawdGridForBlock(active, blocks.indexOf(active));
+      const grid = clawdGridForBlock(active, blockIndex);
       drawClawdSprite(ctx, grid, cx, cy, boxW, boxH);
       ctx.restore();
     }
@@ -1541,7 +2131,7 @@ export function drawCaptions(
         ctx.scale(sx, sy);
         ctx.translate(-cx, -baseY);
       }
-      const grid = clawdGridForBlock(active, blocks.indexOf(active));
+      const grid = clawdGridForBlock(active, blockIndex);
       drawClawdSprite(ctx, grid, cx, cy, boxW, boxH);
       ctx.restore();
     }
@@ -1589,6 +2179,7 @@ export function drawCaptions(
   }
 
   ctx.restore();
+  return layout;
 }
 
 // ---------------------------------------------------------------------------

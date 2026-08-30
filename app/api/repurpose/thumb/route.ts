@@ -19,6 +19,10 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import { PROJECTS_DIR, isValidProjectId, readProject } from "@/lib/repurpose/projects";
+import {
+  effectiveSplitRatio,
+  parsePersistedSplitRatio,
+} from "@/lib/repurpose/split-ratio";
 import type { Clip } from "@/lib/repurpose/types";
 
 export const runtime = "nodejs";
@@ -79,10 +83,6 @@ async function renderThumb(id: string): Promise<string | null> {
   if (!project) return null;
 
   const { footageMeta, clips, splitRatio } = project.snapshot;
-  const facePath = resolveFootagePath(footageMeta?.faceCamPath);
-  if (!facePath) return null;
-  const screenPath = resolveFootagePath(footageMeta?.screenPath);
-
   const first = (clips ?? []).find(
     (c: Clip) => c.kept && c.kind === "take" && c.srcEnd > c.srcStart,
   );
@@ -91,27 +91,49 @@ async function renderThumb(id: string): Promise<string | null> {
   // Sample a beat into the clip so the frame isn't a cut-boundary blur, and use
   // the first clip's own split override when it carries one.
   const t = Math.min(first.srcStart + 1, (first.srcStart + first.srcEnd) / 2);
-  const split = Math.min(0.6, Math.max(0.4, first.splitRatio ?? splitRatio ?? 0.5));
+  const globalSplit = parsePersistedSplitRatio(splitRatio, 0.5);
+  const split = effectiveSplitRatio(
+    parsePersistedSplitRatio(first.splitRatio, globalSplit),
+    THUMB_SIZE,
+  );
 
   const topH = Math.round(THUMB_SIZE * split);
   const botH = THUMB_SIZE - topH;
+  const facePath = resolveFootagePath(footageMeta?.faceCamPath);
+  const screenPath = resolveFootagePath(footageMeta?.screenPath);
+  if ((botH > 0 && !facePath) || (topH > 0 && !screenPath)) return null;
 
   const out = thumbPath(id);
   fs.mkdirSync(THUMBS_DIR, { recursive: true });
 
-  const args: string[] = ["-y", "-ss", t.toFixed(3), "-i", facePath];
+  const args: string[] = ["-y"];
   let filter: string;
-  if (screenPath) {
-    args.push("-ss", t.toFixed(3), "-i", screenPath);
+  if (topH === 0) {
+    args.push("-ss", t.toFixed(3), "-i", facePath!);
+    filter = bandFilter("0:v", THUMB_SIZE, THUMB_SIZE, "center", "out");
+  } else if (botH === 0) {
+    args.push("-ss", t.toFixed(3), "-i", screenPath!);
+    filter = bandFilter("0:v", THUMB_SIZE, THUMB_SIZE, "bottom", "out");
+  } else {
+    args.push("-ss", t.toFixed(3), "-i", facePath!);
+    args.push("-ss", t.toFixed(3), "-i", screenPath!);
     filter = [
       bandFilter("1:v", THUMB_SIZE, topH, "bottom", "top"),
       bandFilter("0:v", THUMB_SIZE, botH, "center", "bot"),
-      "[top][bot]vstack",
+      "[top][bot]vstack[out]",
     ].join(";");
-  } else {
-    filter = `[0:v]scale=${THUMB_SIZE}:${THUMB_SIZE}:force_original_aspect_ratio=increase,crop=${THUMB_SIZE}:${THUMB_SIZE}`;
   }
-  args.push("-filter_complex", filter, "-frames:v", "1", "-q:v", "4", out);
+  args.push(
+    "-filter_complex",
+    filter,
+    "-map",
+    "[out]",
+    "-frames:v",
+    "1",
+    "-q:v",
+    "4",
+    out,
+  );
 
   try {
     await execFileAsync("ffmpeg", args, { timeout: 30_000 });

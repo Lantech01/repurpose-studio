@@ -31,13 +31,14 @@ import {
 } from "@/app/repurpose-studio/_components/useProjectPersistence";
 import { useRepurposeStore } from "@/lib/repurpose/store";
 import type { MediaInspection } from "@/lib/repurpose/media-types";
-import type {
-  Clip,
-  FootageMeta,
-  MediaAsset,
-  Overlay,
-  ProjectSnapshot,
-  VideoSourceRecord,
+import {
+  VIDEO_TIMELINE_CLIP_ID,
+  type Clip,
+  type FootageMeta,
+  type MediaAsset,
+  type Overlay,
+  type ProjectSnapshot,
+  type VideoSourceRecord,
 } from "@/lib/repurpose/types";
 
 const clip: Clip = {
@@ -187,6 +188,28 @@ function videoOverlay(
     zIndex: 0,
     opacity: 1,
     muted: true,
+    ...overrides,
+  };
+}
+
+function legacyImageOverlay(
+  id: string,
+  overrides: Partial<Overlay> = {}
+): Overlay {
+  return {
+    id,
+    kind: "image",
+    src: `/media/${id}.png`,
+    naturalWidth: 800,
+    naturalHeight: 600,
+    timelineStart: 0,
+    timelineEnd: 4,
+    srcStart: 0,
+    srcDuration: 0,
+    transform: { x: 0.5, y: 0.25, scale: 1, rotation: 0 },
+    zIndex: 0,
+    opacity: 1,
+    band: "screen",
     ...overrides,
   };
 }
@@ -449,6 +472,155 @@ describe("pure project media restoration", () => {
 });
 
 describe("project media reconciliation", () => {
+  test("round-trips normalized overlay appearance without changing authored effects", async () => {
+    const legacy: Overlay = {
+      id: "overlay-legacy-appearance",
+      kind: "image",
+      src: "/legacy.png",
+      naturalWidth: 800,
+      naturalHeight: 600,
+      timelineStart: 0,
+      timelineEnd: 4,
+      srcStart: 0,
+      srcDuration: 0,
+      transform: { x: 0.5, y: 0.25, scale: 1, rotation: 0 },
+      zIndex: 0,
+      opacity: 1,
+    };
+    const authored: Overlay = {
+      ...legacy,
+      id: "overlay-authored-appearance",
+      zIndex: 1,
+      entranceEffect: { type: "slide", durationSec: 0.6, direction: "right" },
+      exitEffect: { type: "pop", durationSec: 1.1 },
+      cornerRadius: 0.2,
+    };
+    let persisted = snapshot({ overlays: [legacy, authored] });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).startsWith("/api/repurpose/projects/") && !init?.method) {
+          return jsonResponse({
+            project: {
+              id: "task-6-project",
+              name: "Task 6 project",
+              createdAt: "2026-08-24T00:00:00.000Z",
+              snapshot: persisted,
+            },
+          });
+        }
+        if (String(input) === "/api/repurpose/projects" && init?.method === "POST") {
+          const body = JSON.parse(String(init.body)) as ControlledSaveBody;
+          persisted = body.snapshot;
+          return jsonResponse({
+            project: {
+              id: "task-6-project",
+              name: "Task 6 project",
+              createdAt: "2026-08-24T00:00:00.000Z",
+              saveRevision: body.saveRevision,
+              saveWriterId: body.writerId,
+            },
+          });
+        }
+        throw new Error(`Unexpected request: ${String(input)}`);
+      })
+    );
+
+    const firstMount = await loadProject();
+    useRepurposeStore
+      .getState()
+      .setOverlayCornerRadius("overlay-authored-appearance", 0.3);
+    await waitFor(() =>
+      expect(persisted.overlays?.[1]?.cornerRadius).toBe(0.3)
+    );
+    expect(persisted.overlays).toMatchObject([
+      {
+        entranceEffect: { type: "none", durationSec: 0.35 },
+        exitEffect: { type: "none", durationSec: 0.35 },
+        cornerRadius: 0,
+      },
+      {
+        entranceEffect: { type: "slide", durationSec: 0.6, direction: "right" },
+        exitEffect: { type: "pop", durationSec: 1.1 },
+        cornerRadius: 0.3,
+      },
+    ]);
+    firstMount.unmount();
+    useRepurposeStore.setState(useRepurposeStore.getInitialState(), true);
+
+    const reopened = await loadProject();
+    expect(useRepurposeStore.getState().overlays).toMatchObject(
+      persisted.overlays ?? []
+    );
+    reopened.unmount();
+  });
+
+  test.each([0, 1])(
+    "round-trips global and per-clip split endpoint %s without schema changes",
+    async (endpoint) => {
+      let persisted = snapshot({
+        footageMeta: null,
+        splitRatio: endpoint,
+        clips: [
+          { ...clip, splitRatio: endpoint },
+          {
+            ...clip,
+            id: "clip-opposite",
+            srcStart: 5,
+            srcEnd: 10,
+            timelineStart: 5,
+            timelineEnd: 10,
+            splitRatio: 1 - endpoint,
+          },
+        ],
+      });
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input).startsWith("/api/repurpose/projects/") && !init?.method) {
+            return jsonResponse({
+              project: {
+                id: "task-6-project",
+                name: "Task 6 project",
+                createdAt: "2026-08-24T00:00:00.000Z",
+                snapshot: persisted,
+              },
+            });
+          }
+          if (String(input) === "/api/repurpose/projects" && init?.method === "POST") {
+            const body = JSON.parse(String(init.body)) as ControlledSaveBody;
+            persisted = body.snapshot;
+            return jsonResponse({
+              project: {
+                id: "task-6-project",
+                name: "Task 6 project",
+                createdAt: "2026-08-24T00:00:00.000Z",
+                saveRevision: body.saveRevision,
+                saveWriterId: body.writerId,
+              },
+            });
+          }
+          throw new Error(`Unexpected request: ${String(input)}`);
+        })
+      );
+
+      const firstMount = await loadProject();
+      useRepurposeStore.setState({ splitRatio: endpoint });
+      await waitFor(() => expect(persisted.splitRatio).toBe(endpoint));
+      firstMount.unmount();
+      useRepurposeStore.setState(useRepurposeStore.getInitialState(), true);
+
+      const reopened = await loadProject();
+      expect(useRepurposeStore.getState().splitRatio).toBe(endpoint);
+      expect(useRepurposeStore.getState().clips.map((entry) => entry.splitRatio)).toEqual([
+        endpoint,
+        1 - endpoint,
+      ]);
+      expect(persisted).not.toHaveProperty("splitMode");
+      reopened.unmount();
+    }
+  );
+
   test("retains and checks footage, media-bin, and overlay source records before ready", async () => {
     const face = source("C:\\originals\\face.mov", "C:\\masters\\face.mp4");
     const screen = source("C:\\originals\\screen.mp4");
@@ -999,6 +1171,121 @@ describe("project media reconciliation", () => {
     expect(replaceMock).not.toHaveBeenCalled();
   });
 
+  test("creates a transcript-free project only after both sources and prefers the Screen filename", async () => {
+    type CreatePost = ControlledSaveBody & {
+      id: string;
+      name: string;
+      mode?: "create";
+    };
+    const posts: CreatePost[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url !== "/api/repurpose/projects" || init?.method !== "POST") {
+          throw new Error(`Unexpected request: ${url}`);
+        }
+        const body = JSON.parse(String(init.body)) as CreatePost;
+        posts.push(body);
+        return jsonResponse({
+          project: {
+            id: body.id,
+            name: body.name,
+            createdAt: "2026-08-27T00:00:00.000Z",
+            saveRevision: body.saveRevision,
+            saveWriterId: body.writerId,
+          },
+        });
+      })
+    );
+    const rendered = renderHook(() =>
+      useProjectPersistence("new-transcript-free")
+    );
+    await waitFor(() => expect(rendered.result.current.ready).toBe(true));
+    const face = source("C:\\media\\Face Camera.mov");
+    const screenSource = source("C:\\media\\screen.mp4", undefined, {
+      originalName: "Launch/\u0000 Demo.final.mp4",
+    });
+
+    act(() => {
+      useRepurposeStore.getState().setFootageMeta({
+        ...footage(face),
+        screenPath: "",
+        screenSource: undefined,
+      });
+    });
+    await act(async () => Promise.resolve());
+    expect(posts).toHaveLength(0);
+
+    act(() => {
+      useRepurposeStore.getState().setFootageMeta(footage(face, screenSource));
+    });
+    await waitFor(() => expect(posts.length).toBeGreaterThan(0));
+
+    expect(posts[0]).toMatchObject({
+      mode: "create",
+      name: "Launch Demo.final",
+      snapshot: {
+        clips: [{ id: VIDEO_TIMELINE_CLIP_ID, srcEnd: 5, timelineEnd: 5 }],
+        duration: 5,
+        words: [],
+        footageMeta: {
+          faceCamSource: { originalName: "Face Camera.mov" },
+          screenSource: { originalName: "Launch/\u0000 Demo.final.mp4" },
+        },
+      },
+    });
+    expect(posts[0].id).toMatch(/^launch-demo-final-\d{1,2}-[a-z]{3}-\d{2}$/);
+    expect(replaceMock).toHaveBeenCalledWith(
+      `/repurpose-studio/${posts[0].id}`
+    );
+    rendered.unmount();
+  });
+
+  test("falls back to the Face filename after both sources are ready", async () => {
+    const posts: Array<ControlledSaveBody & { id: string; name: string }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url !== "/api/repurpose/projects" || init?.method !== "POST") {
+          throw new Error(`Unexpected request: ${url}`);
+        }
+        const body = JSON.parse(String(init.body)) as ControlledSaveBody & {
+          id: string;
+          name: string;
+        };
+        posts.push(body);
+        return jsonResponse({
+          project: {
+            id: body.id,
+            name: body.name,
+            createdAt: "2026-08-27T00:00:00.000Z",
+            saveRevision: body.saveRevision,
+            saveWriterId: body.writerId,
+          },
+        });
+      })
+    );
+    const rendered = renderHook(() =>
+      useProjectPersistence("new-face-title-fallback")
+    );
+    await waitFor(() => expect(rendered.result.current.ready).toBe(true));
+    const face = source("C:\\media\\Face Camera.mov");
+    const screenSource = source("C:\\media\\screen.mp4", undefined, {
+      originalName: "\u0000.mp4",
+    });
+
+    act(() => {
+      useRepurposeStore.getState().setFootageMeta(footage(face, screenSource));
+    });
+    await waitFor(() => expect(posts.length).toBeGreaterThan(0));
+
+    expect(posts[0].name).toBe("Face Camera");
+    expect(posts[0].snapshot.clips[0]?.id).toBe(VIDEO_TIMELINE_CLIP_ID);
+    rendered.unmount();
+  });
+
   test("autosaves media-only changes for an existing project without clips or footage", async () => {
     const imagePath = "C:\\media\\still.png";
     const imageSrc = `/api/repurpose/asset?path=${encodeURIComponent(imagePath)}`;
@@ -1068,6 +1355,256 @@ describe("project media reconciliation", () => {
       overlays: [{ id: imageOverlay.id, opacity: 0.5 }],
     });
     rendered.unmount();
+  });
+
+  test("autosaves an applied transcript without transient coordination state", async () => {
+    const projectPosts: ControlledSaveBody[] = [];
+    installProjectFetch(
+      snapshot({
+        words: [{ text: "old", start: 0, end: 1 }],
+        captionsEnabled: false,
+        captionBlocks: [],
+      }),
+      (input, init) => {
+        const url = String(input);
+        if (url === "/api/repurpose/projects" && init?.method === "POST") {
+          const body = JSON.parse(String(init.body)) as ControlledSaveBody;
+          projectPosts.push(body);
+          return jsonResponse({
+            project: {
+              id: "task-6-project",
+              name: "Task 6 project",
+              createdAt: "2026-08-24T00:00:00.000Z",
+              saveRevision: body.saveRevision,
+              saveWriterId: body.writerId,
+            },
+          });
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      }
+    );
+    const rendered = await loadProject();
+    const appliedWords = [
+      { text: "nova", start: 0, end: 0.5 },
+      { text: "legenda", start: 0.5, end: 1 },
+    ];
+
+    act(() =>
+      useRepurposeStore.getState().applyTranscript({
+        words: appliedWords,
+        mode: "rebuild",
+        rebuiltClips: [{ ...clip, id: "transcript-rebuild" }],
+      })
+    );
+
+    await waitFor(() => expect(projectPosts).toHaveLength(1));
+    expect(projectPosts[0].snapshot).toMatchObject({
+      clips: [{ id: "transcript-rebuild" }],
+      words: appliedWords,
+      captionsEnabled: true,
+      captionBlocks: [
+        expect.objectContaining({
+          id: expect.stringMatching(/^transcript-rebuild--cap-/),
+          words: appliedWords,
+        }),
+      ],
+    });
+    expect(projectPosts[0].snapshot.captionBlocks?.[0]).not.toHaveProperty(
+      "textOverride"
+    );
+    for (const transient of [
+      "pendingCandidate",
+      "dialogOpen",
+      "observerId",
+      "progress",
+      "cacheKey",
+    ]) {
+      expect(projectPosts[0].snapshot).not.toHaveProperty(transient);
+    }
+    rendered.unmount();
+  });
+
+  test("saves and reopens attached and detached caption placement with text and style", async () => {
+    const words = [
+      { text: "first", start: 0, end: 0.5 },
+      { text: "second", start: 0.5, end: 1 },
+    ];
+    let persistedSnapshot = snapshot({
+      words,
+      captionsEnabled: true,
+      captionBlocks: [
+        {
+          id: "first-caption",
+          words: [words[0]],
+          start: 0,
+          end: 0.5,
+          textOverride: ["FIRST"],
+          overrideStyle: { fill: "#123456", pinToSplit: true },
+        },
+        {
+          id: "second-caption",
+          words: [words[1]],
+          start: 0.5,
+          end: 1,
+          textOverride: ["SECOND"],
+          overrideStyle: {
+            activeFill: "#abcdef",
+            pinToSplit: false,
+            positionYPct: 0.76,
+          },
+        },
+      ],
+    });
+    let savedSnapshot: ProjectSnapshot | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.startsWith("/api/repurpose/projects/") && !init?.method) {
+          return jsonResponse({
+            project: {
+              id: "task-6-project",
+              name: "Task 6 project",
+              createdAt: "2026-08-24T00:00:00.000Z",
+              snapshot: persistedSnapshot,
+            },
+          });
+        }
+        if (url === "/api/repurpose/projects" && init?.method === "POST") {
+          const body = JSON.parse(String(init.body)) as ControlledSaveBody;
+          savedSnapshot = body.snapshot;
+          persistedSnapshot = body.snapshot;
+          return jsonResponse({
+            project: {
+              id: "task-6-project",
+              name: "Task 6 project",
+              createdAt: "2026-08-24T00:00:00.000Z",
+              saveRevision: body.saveRevision,
+              saveWriterId: body.writerId,
+            },
+          });
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      })
+    );
+    const firstMount = await loadProject();
+
+    act(() => {
+      useRepurposeStore
+        .getState()
+        .detachCaptionBlock("first-caption", 0.34);
+      useRepurposeStore.getState().attachCaptionBlock("second-caption");
+    });
+
+    await waitFor(() => expect(savedSnapshot).not.toBeNull());
+    expect(savedSnapshot!.captionBlocks).toEqual([
+      expect.objectContaining({
+        textOverride: ["FIRST"],
+        overrideStyle: {
+          fill: "#123456",
+          pinToSplit: false,
+          positionYPct: 0.34,
+        },
+      }),
+      expect.objectContaining({
+        textOverride: ["SECOND"],
+        overrideStyle: { activeFill: "#abcdef", pinToSplit: true },
+      }),
+    ]);
+    firstMount.unmount();
+    useRepurposeStore.setState(useRepurposeStore.getInitialState(), true);
+
+    const reopened = await loadProject();
+
+    expect(useRepurposeStore.getState().captionBlocks).toEqual(
+      savedSnapshot!.captionBlocks
+    );
+    reopened.unmount();
+  });
+
+  test("reopens the exact serialized snapshot produced after applying a transcript", async () => {
+    const oldWords = [{ text: "old", start: 0, end: 1 }];
+    let persistedSnapshot = snapshot({
+      words: oldWords,
+      captionsEnabled: false,
+      captionBlocks: [
+        {
+          id: "stale-block",
+          words: oldWords,
+          start: 0,
+          end: 1,
+          textOverride: ["stale"],
+          overrideStyle: { fill: "#ff0000" },
+        },
+      ],
+    });
+    let serializedSnapshot: ProjectSnapshot | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.startsWith("/api/repurpose/projects/") && !init?.method) {
+          return jsonResponse({
+            project: {
+              id: "task-6-project",
+              name: "Task 6 project",
+              createdAt: "2026-08-24T00:00:00.000Z",
+              snapshot: persistedSnapshot,
+            },
+          });
+        }
+        if (url === "/api/repurpose/projects" && init?.method === "POST") {
+          const body = JSON.parse(String(init.body)) as ControlledSaveBody;
+          serializedSnapshot = body.snapshot;
+          persistedSnapshot = body.snapshot;
+          return jsonResponse({
+            project: {
+              id: "task-6-project",
+              name: "Task 6 project",
+              createdAt: "2026-08-24T00:00:00.000Z",
+              saveRevision: body.saveRevision,
+              saveWriterId: body.writerId,
+            },
+          });
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      })
+    );
+    const firstMount = await loadProject();
+    const appliedWords = [
+      { text: "nova", start: 0, end: 0.5 },
+      { text: "legenda", start: 0.5, end: 1 },
+    ];
+
+    act(() =>
+      useRepurposeStore.getState().applyTranscript({
+        words: appliedWords,
+        mode: "rebuild",
+        rebuiltClips: [{ ...clip, id: "round-trip-transcript" }],
+      })
+    );
+    await waitFor(() => expect(serializedSnapshot).not.toBeNull());
+    const exactSavedSnapshot = serializedSnapshot!;
+    expect(exactSavedSnapshot.captionBlocks?.[0]).not.toHaveProperty("textOverride");
+    expect(exactSavedSnapshot.captionBlocks?.[0]).not.toHaveProperty("overrideStyle");
+    firstMount.unmount();
+    useRepurposeStore.setState(useRepurposeStore.getInitialState(), true);
+
+    const reopened = await loadProject();
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      clips: [
+        expect.objectContaining({
+          id: "round-trip-transcript",
+          srcStart: 0,
+          srcEnd: 5,
+        }),
+      ],
+      words: appliedWords,
+      captionsEnabled: true,
+      captionBlocks: exactSavedSnapshot.captionBlocks,
+    });
+    reopened.unmount();
   });
 
   test("flushes project A's captured debounce entry when the route switches to project B", async () => {
@@ -3839,6 +4376,273 @@ describe("project media reconciliation", () => {
     await waitFor(() => expect(rendered.result.current.ready).toBe(true));
     expect(rendered.result.current.loadError).toBeNull();
     expect(useRepurposeStore.getState().splitRatio).toBe(0.67);
+  });
+
+  test.each([
+    ["empty object", {} as Overlay],
+    ["array entry", [] as unknown as Overlay],
+    [
+      "invalid identity",
+      {
+        ...legacyImageOverlay("identity"),
+        id: "",
+        kind: "audio",
+        src: 42,
+      } as unknown as Overlay,
+    ],
+    [
+      "invalid intrinsic dimensions",
+      legacyImageOverlay("dimensions", {
+        naturalWidth: 0,
+        naturalHeight: Number.POSITIVE_INFINITY,
+      }),
+    ],
+    [
+      "malformed transform",
+      legacyImageOverlay("transform", {
+        transform: {
+          x: Number.NaN,
+          y: 0.25,
+          scale: 0,
+          rotation: Number.POSITIVE_INFINITY,
+        },
+      }),
+    ],
+    [
+      "non-finite timeline",
+      legacyImageOverlay("timeline", {
+        timelineEnd: Number.POSITIVE_INFINITY,
+      }),
+    ],
+    [
+      "invalid source timing",
+      legacyImageOverlay("source", { srcStart: -1, srcDuration: Number.NaN }),
+    ],
+    ["invalid z-index", legacyImageOverlay("z-index", { zIndex: 0.5 })],
+    ["invalid opacity", legacyImageOverlay("opacity", { opacity: 1.1 })],
+    [
+      "invalid band",
+      legacyImageOverlay("band", { band: "invalid" as Overlay["band"] }),
+    ],
+    [
+      "non-string source path",
+      legacyImageOverlay("source-path", {
+        sourcePath: 42 as unknown as string,
+      }),
+    ],
+    [
+      "false muted flag",
+      { ...legacyImageOverlay("muted-false"), muted: false } as unknown as Overlay,
+    ],
+    [
+      "string muted flag",
+      { ...legacyImageOverlay("muted-string"), muted: "true" } as unknown as Overlay,
+    ],
+    [
+      "empty video source",
+      {
+        ...legacyImageOverlay("video-source-empty", {
+          kind: "video",
+          srcDuration: 4,
+          muted: true,
+        }),
+        videoSource: {},
+      } as unknown as Overlay,
+    ],
+    [
+      "invalid video source paths",
+      {
+        ...legacyImageOverlay("video-source-paths", {
+          kind: "video",
+          srcDuration: 4,
+          muted: true,
+        }),
+        videoSource: {
+          ...source("C:\\originals\\source.mp4"),
+          workingPath: 42,
+          previewPath: false,
+        },
+      } as unknown as Overlay,
+    ],
+    [
+      "non-finite video source duration",
+      {
+        ...legacyImageOverlay("video-source-duration", {
+          kind: "video",
+          srcDuration: 4,
+          muted: true,
+        }),
+        videoSource: {
+          ...source("C:\\originals\\source.mp4"),
+          inspection: {
+            ...inspection(),
+            durationSec: Number.NaN,
+          },
+        },
+      } as unknown as Overlay,
+    ],
+    [
+      "invalid video source frame metadata",
+      {
+        ...legacyImageOverlay("video-source-frame", {
+          kind: "video",
+          srcDuration: 4,
+          muted: true,
+        }),
+        videoSource: {
+          ...source("C:\\originals\\source.mp4"),
+          inspection: {
+            ...inspection(),
+            video: {
+              ...inspection().video,
+              width: 0,
+              fps: Number.POSITIVE_INFINITY,
+            },
+          },
+        },
+      } as unknown as Overlay,
+    ],
+    [
+      "invalid video source audio metadata",
+      {
+        ...legacyImageOverlay("video-source-audio", {
+          kind: "video",
+          srcDuration: 4,
+          muted: true,
+        }),
+        videoSource: {
+          ...source("C:\\originals\\source.mp4"),
+          inspection: {
+            ...inspection(),
+            audio: {
+              codec: "aac",
+              channels: 2,
+              sampleRate: Number.NaN,
+            },
+          },
+        },
+      } as unknown as Overlay,
+    ],
+  ])(
+    "rejects a persisted overlay with %s and recovers without autosaving",
+    async (label, malformedOverlay) => {
+      let loads = 0;
+      const posts: unknown[] = [];
+      const projectId = `malformed-overlay-${String(label).replaceAll(" ", "-")}`;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input);
+          if (url.endsWith(`/${projectId}`)) {
+            loads++;
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                project: {
+                  id: projectId,
+                  name: "Overlay validation",
+                  createdAt: "2026-08-24T00:00:00.000Z",
+                  saveRevision: 2,
+                  saveWriterId: "writer-serveraaa",
+                  snapshot:
+                    loads === 1
+                      ? snapshot({
+                          footageMeta: null,
+                          overlays: [malformedOverlay],
+                        })
+                      : snapshot({
+                          footageMeta: null,
+                          splitRatio: 0.68,
+                          overlays: [legacyImageOverlay("valid-legacy")],
+                        }),
+                },
+              }),
+            } as Response;
+          }
+          if (url === "/api/repurpose/projects" && init?.method === "POST") {
+            posts.push(JSON.parse(String(init.body)));
+            return jsonResponse({ project: {} });
+          }
+          throw new Error(`Unexpected request: ${url}`);
+        })
+      );
+      const rendered = renderHook(() => useProjectPersistence(projectId));
+
+      await waitFor(() =>
+        expect(rendered.result.current.loadError).toEqual(expect.any(String))
+      );
+      expect(rendered.result.current.ready).toBe(false);
+      expect(useRepurposeStore.getState()).toMatchObject({
+        overlays: [],
+        hydrating: false,
+      });
+      expect(posts).toEqual([]);
+
+      act(() => rendered.result.current.retryLoad());
+      await waitFor(() => expect(rendered.result.current.ready).toBe(true));
+      expect(rendered.result.current.loadError).toBeNull();
+      expect(useRepurposeStore.getState().overlays).toMatchObject([
+        {
+          id: "valid-legacy",
+          entranceEffect: { type: "none", durationSec: 0.35 },
+          exitEffect: { type: "none", durationSec: 0.35 },
+          cornerRadius: 0,
+        },
+      ]);
+      expect(useRepurposeStore.getState().splitRatio).toBe(0.68);
+      expect(posts).toEqual([]);
+    }
+  );
+
+  test("accepts a valid legacy overlay without destructive autosave", async () => {
+    const posts: unknown[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/valid-legacy-overlay")) {
+          return jsonResponse({
+            project: {
+              id: "valid-legacy-overlay",
+              name: "Valid legacy overlay",
+              createdAt: "2026-08-24T00:00:00.000Z",
+              saveRevision: 2,
+              saveWriterId: "writer-serveraaa",
+              snapshot: snapshot({
+                footageMeta: null,
+              overlays: [
+                legacyImageOverlay("valid-legacy-image"),
+                legacyImageOverlay("valid-legacy-video", {
+                  kind: "video",
+                  src: "/media/valid-legacy-video.mp4",
+                  srcDuration: 4,
+                  zIndex: 1,
+                }),
+              ],
+              }),
+            },
+          });
+        }
+        if (url === "/api/repurpose/projects" && init?.method === "POST") {
+          posts.push(JSON.parse(String(init.body)));
+          return jsonResponse({ project: {} });
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      })
+    );
+
+    const rendered = renderHook(() =>
+      useProjectPersistence("valid-legacy-overlay")
+    );
+    await waitFor(() => expect(rendered.result.current.ready).toBe(true));
+
+    expect(rendered.result.current.loadError).toBeNull();
+    expect(useRepurposeStore.getState().overlays).toMatchObject([
+      { id: "valid-legacy-image", cornerRadius: 0 },
+      { id: "valid-legacy-video", cornerRadius: 0 },
+    ]);
+    expect(posts).toEqual([]);
   });
 
   test("retries a failed autosave with backoff without another store mutation", async () => {

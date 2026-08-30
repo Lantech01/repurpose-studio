@@ -39,7 +39,11 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { useRepurposeStore, reseedIdCounters } from "@/lib/repurpose/store";
+import {
+  normalizeCaptionBlockPlacement,
+  useRepurposeStore,
+  reseedIdCounters,
+} from "@/lib/repurpose/store";
 import { prespawnWorker, disposeWarmWorker } from "@/lib/export/workerBridge";
 import type {
   Clip,
@@ -70,7 +74,14 @@ import {
 } from "@/lib/repurpose/video-import-client";
 import { ensureVideoProxy } from "@/lib/repurpose/video-proxy-client";
 import { probeBrowserVideo } from "@/lib/repurpose/native-media-probe";
-import { datedSlug, deriveShortTitle } from "./naming";
+import { normalizeTranscriptWords } from "@/lib/repurpose/transcript-ingest";
+import {
+  clampSplitRatio,
+  parsePersistedSplitRatio,
+} from "@/lib/repurpose/split-ratio";
+import { normalizeOverlayAppearance } from "@/lib/repurpose/overlay-effects";
+import type { CaptionBlock, CaptionStyle } from "@/lib/repurpose/captions";
+import { datedSlug, deriveProjectTitle } from "./naming";
 
 /** Debounce window (ms) for autosave writes -- collapses a drag/trim storm to one POST. */
 const SAVE_DEBOUNCE_MS = 500;
@@ -143,22 +154,32 @@ export function restoreMediaAsset(asset: MediaAsset): MediaAsset {
 }
 
 function restoreOverlay(overlay: Overlay): Overlay {
-  if (overlay.kind !== "video") return overlay;
-  if (overlay.videoSource) {
+  if (!isStructurallyValidOverlay(overlay)) {
+    throw new TypeError("Invalid persisted overlay");
+  }
+  const appearance = normalizeOverlayAppearance(overlay);
+  const normalized: Overlay = {
+    ...overlay,
+    entranceEffect: { ...appearance.entranceEffect },
+    exitEffect: { ...appearance.exitEffect },
+    cornerRadius: appearance.cornerRadius,
+  };
+  if (normalized.kind !== "video") return normalized;
+  if (normalized.videoSource) {
     return {
-      ...overlay,
-      src: videoUrlForWorkingSource(overlay.videoSource),
-      sourcePath: overlay.videoSource.workingPath,
+      ...normalized,
+      src: videoUrlForWorkingSource(normalized.videoSource),
+      sourcePath: normalized.videoSource.workingPath,
     };
   }
-  const legacyPath = overlay.sourcePath ?? footagePathFromUrl(overlay.src);
+  const legacyPath = normalized.sourcePath ?? footagePathFromUrl(normalized.src);
   return legacyPath
     ? {
-        ...overlay,
+        ...normalized,
         src: footageUrlForPath(legacyPath),
         sourcePath: legacyPath,
       }
-    : overlay;
+    : normalized;
 }
 
 /** Build a snapshot (the persisted slice) from the current store state. */
@@ -859,13 +880,38 @@ async function reconcileHydratedMedia(signal: AbortSignal): Promise<{
  */
 function hydrateSnapshot(snapshot: ProjectSnapshot): boolean {
   const store = useRepurposeStore.getState();
+  let restoredWords: ProjectSnapshot["words"];
+  let persistedWordsValid = true;
+  if (snapshot.words !== undefined) {
+    try {
+      restoredWords = normalizeTranscriptWords(snapshot.words, { allowEmpty: true });
+    } catch {
+      restoredWords = [];
+      persistedWordsValid = false;
+    }
+  }
+  const restoredCaptionBlocks = persistedWordsValid
+    ? normalizeCaptionBlocks(snapshot.captionBlocks)
+    : { blocks: [] as CaptionBlock[], repaired: false };
 
   // MIGRATION: fold any legacy flat framing onto the clips, then upgrade any
   // dead-default (amount-0) Smart transitions to the new snappy 5% push so every
   // cut in an old project gains visible motion.
+  const normalizedClips = snapshot.clips.map((clip) => {
+    if (clip.splitRatio === undefined) return clip;
+    const splitRatio =
+      typeof clip.splitRatio === "number"
+        ? clampSplitRatio(clip.splitRatio)
+        : null;
+    if (splitRatio !== null) {
+      return splitRatio === clip.splitRatio ? clip : { ...clip, splitRatio };
+    }
+    const { splitRatio: _invalidSplitRatio, ...rest } = clip;
+    return rest as Clip;
+  });
   const migratedClips = migrateScreenZoomDefault(
     migrateFaceFramingSync(
-      migrateSmartTransitions(migrateLegacyFraming(snapshot.clips, snapshot))
+      migrateSmartTransitions(migrateLegacyFraming(normalizedClips, snapshot))
     )
   );
 
@@ -913,29 +959,37 @@ function hydrateSnapshot(snapshot: ProjectSnapshot): boolean {
   // Restore the plain, non-derived slices. Transient UI state stays at defaults;
   // footage goes through its action below so valid paths re-enter `loading`.
   useRepurposeStore.setState({
-    splitRatio: snapshot.splitRatio,
+    splitRatio: parsePersistedSplitRatio(snapshot.splitRatio, 0.5),
     screenGrade: snapshot.screenGrade,
     faceGrade: snapshot.faceGrade,
     playhead: snapshot.playhead,
     inPoint: snapshot.inPoint,
     outPoint: snapshot.outPoint,
     loopPlayback: snapshot.loopPlayback,
-    ...(snapshot.words !== undefined ? { words: snapshot.words } : {}),
-    ...(snapshot.captionsEnabled !== undefined
-      ? { captionsEnabled: snapshot.captionsEnabled }
-      : {}),
+    ...(restoredWords !== undefined ? { words: restoredWords } : {}),
+    ...(!persistedWordsValid
+      ? { captionsEnabled: false }
+      : snapshot.captionsEnabled !== undefined
+        ? { captionsEnabled: snapshot.captionsEnabled }
+        : {}),
     ...(snapshot.captionStyle !== undefined
       ? { captionStyle: snapshot.captionStyle }
       : {}),
-    ...(snapshot.captionBlocks !== undefined
-      ? { captionBlocks: snapshot.captionBlocks }
-      : {}),
+    ...(!persistedWordsValid
+      ? { captionBlocks: [] }
+      : snapshot.captionBlocks !== undefined
+        ? { captionBlocks: restoredCaptionBlocks.blocks }
+        : {}),
     ...(snapshot.snapEnabled !== undefined
       ? { snapEnabled: snapshot.snapEnabled }
       : {}),
     ...(snapshot.markers !== undefined ? { markers: snapshot.markers } : {}),
     ...(snapshot.deletedWordIndices !== undefined
-      ? { deletedWordIndices: snapshot.deletedWordIndices }
+      ? {
+          deletedWordIndices: persistedWordsValid
+            ? snapshot.deletedWordIndices
+            : [],
+        }
       : {}),
     ...(restoredOverlays !== undefined ? { overlays: restoredOverlays } : {}),
     ...(restoredSfxTrack !== undefined ? { sfxTrack: restoredSfxTrack } : {}),
@@ -955,7 +1009,10 @@ function hydrateSnapshot(snapshot: ProjectSnapshot): boolean {
 
   // SELF-HEAL captions: words present but no blocks -> chunk them now.
   const after = useRepurposeStore.getState();
-  if (after.words.length > 0 && after.captionBlocks.length === 0) {
+  if (
+    after.words.length > 0 &&
+    (after.captionBlocks.length === 0 || restoredCaptionBlocks.repaired)
+  ) {
     after.rebuildCaptionBlocks();
   }
 
@@ -996,6 +1053,238 @@ function cloneProjectSnapshot(snapshot: ProjectSnapshot): ProjectSnapshot {
   return JSON.parse(JSON.stringify(snapshot)) as ProjectSnapshot;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+const CAPTION_OVERRIDE_NUMBER_FIELDS = new Set<keyof CaptionStyle>([
+  "weight",
+  "sizePct",
+  "letterSpacingPct",
+  "lineHeightMul",
+  "strokeWidthPct",
+  "activePop",
+  "boxRadiusPct",
+  "boxPadXPct",
+  "boxPadYPct",
+  "splitOffsetPct",
+  "positionYPct",
+  "maxWordsPerLine",
+  "maxCharsPerLine",
+  "maxLines",
+  "animDurationMs",
+]);
+const CAPTION_OVERRIDE_BOOLEAN_FIELDS = new Set<keyof CaptionStyle>([
+  "uppercase",
+  "pinToSplit",
+]);
+
+function normalizeCaptionOverride(
+  value: unknown
+): { overrideStyle?: Partial<CaptionStyle>; repaired: boolean } | null {
+  if (value === undefined) return { repaired: false };
+  if (!isRecord(value)) return null;
+  const overrideStyle: Record<string, unknown> = {};
+  let repaired = false;
+  for (const [key, field] of Object.entries(value)) {
+    if (CAPTION_OVERRIDE_NUMBER_FIELDS.has(key as keyof CaptionStyle)) {
+      if (isFiniteNumber(field)) overrideStyle[key] = field;
+      else repaired = true;
+      continue;
+    }
+    if (CAPTION_OVERRIDE_BOOLEAN_FIELDS.has(key as keyof CaptionStyle)) {
+      if (typeof field === "boolean") overrideStyle[key] = field;
+      else repaired = true;
+      continue;
+    }
+    if (typeof field === "string") overrideStyle[key] = field;
+    else repaired = true;
+  }
+  return {
+    overrideStyle: overrideStyle as Partial<CaptionStyle>,
+    repaired,
+  };
+}
+
+function normalizeCaptionBlock(
+  value: unknown
+): { block: CaptionBlock; repaired: boolean } | null {
+  if (!isRecord(value) || typeof value.id !== "string" || !value.id.trim()) {
+    return null;
+  }
+  let words: CaptionBlock["words"];
+  try {
+    words = normalizeTranscriptWords(value.words, { allowEmpty: false });
+  } catch {
+    return null;
+  }
+  const override = normalizeCaptionOverride(value.overrideStyle);
+  if (!override) return null;
+
+  const start = words[0].start;
+  const end = words[words.length - 1].end;
+  let repaired = override.repaired || value.start !== start || value.end !== end;
+  const block: CaptionBlock = { id: value.id, words, start, end };
+  if (override.overrideStyle !== undefined) {
+    block.overrideStyle = override.overrideStyle;
+  }
+  if (value.keywordIndex !== undefined) {
+    if (
+      typeof value.keywordIndex === "number" &&
+      Number.isInteger(value.keywordIndex) &&
+      value.keywordIndex >= -1 &&
+      value.keywordIndex < words.length
+    ) {
+      block.keywordIndex = value.keywordIndex;
+    } else {
+      repaired = true;
+    }
+  }
+  if (value.textOverride !== undefined) {
+    if (
+      Array.isArray(value.textOverride) &&
+      value.textOverride.length === words.length &&
+      value.textOverride.every((entry) => typeof entry === "string")
+    ) {
+      block.textOverride = [...value.textOverride] as string[];
+    } else {
+      repaired = true;
+    }
+  }
+  return {
+    block: normalizeCaptionBlockPlacement(block),
+    repaired,
+  };
+}
+
+function normalizeCaptionBlocks(value: unknown): {
+  blocks: CaptionBlock[];
+  repaired: boolean;
+} {
+  if (value === undefined) return { blocks: [], repaired: false };
+  if (!Array.isArray(value)) return { blocks: [], repaired: true };
+  const blocks: CaptionBlock[] = [];
+  let repaired = false;
+  for (const entry of value) {
+    const normalized = normalizeCaptionBlock(entry);
+    if (!normalized) {
+      repaired = true;
+      continue;
+    }
+    blocks.push(normalized.block);
+    repaired ||= normalized.repaired;
+  }
+  return { blocks, repaired };
+}
+
+function isStructurallyValidVideoSource(value: unknown): boolean {
+  if (!isRecord(value) || !isRecord(value.inspection)) return false;
+  const inspection = value.inspection;
+  if (!isRecord(inspection.video)) return false;
+  const video = inspection.video;
+  const audio = inspection.audio;
+  const validAudio =
+    audio === null ||
+    (isRecord(audio) &&
+      typeof audio.codec === "string" &&
+      isFiniteNumber(audio.channels) &&
+      Number.isInteger(audio.channels) &&
+      audio.channels > 0 &&
+      isFiniteNumber(audio.sampleRate) &&
+      audio.sampleRate > 0 &&
+      (audio.durationSec === undefined ||
+        (isFiniteNumber(audio.durationSec) && audio.durationSec >= 0)));
+
+  return (
+    typeof value.originalPath === "string" &&
+    value.originalPath.trim().length > 0 &&
+    typeof value.workingPath === "string" &&
+    value.workingPath.trim().length > 0 &&
+    (value.previewPath === undefined || typeof value.previewPath === "string") &&
+    typeof value.originalName === "string" &&
+    value.originalName.trim().length > 0 &&
+    typeof value.nativeCompatible === "boolean" &&
+    (value.compatibilityStatus === "native" ||
+      value.compatibilityStatus === "converted") &&
+    typeof inspection.fingerprint === "string" &&
+    typeof inspection.container === "string" &&
+    typeof inspection.extension === "string" &&
+    isFiniteNumber(inspection.size) &&
+    inspection.size >= 0 &&
+    isFiniteNumber(inspection.durationSec) &&
+    inspection.durationSec >= 0 &&
+    typeof video.codec === "string" &&
+    typeof video.codecTag === "string" &&
+    typeof video.profile === "string" &&
+    typeof video.pixelFormat === "string" &&
+    isFiniteNumber(video.width) &&
+    video.width > 0 &&
+    isFiniteNumber(video.height) &&
+    video.height > 0 &&
+    isFiniteNumber(video.fps) &&
+    video.fps > 0 &&
+    (video.rotationDeg === undefined || isFiniteNumber(video.rotationDeg)) &&
+    validAudio
+  );
+}
+
+function isStructurallyValidOverlay(value: unknown): value is Overlay {
+  if (!isRecord(value)) return false;
+  const overlay = value;
+  const transform = overlay.transform;
+  if (!isRecord(transform)) return false;
+  const band = overlay.band;
+  const videoSource = overlay.videoSource;
+  const validVideoSource =
+    videoSource === undefined ||
+    (overlay.kind === "video" && isStructurallyValidVideoSource(videoSource));
+  const validMuted =
+    overlay.muted === undefined ||
+    (overlay.kind === "video" && overlay.muted === true);
+
+  return (
+    typeof overlay.id === "string" &&
+    overlay.id.trim().length > 0 &&
+    (overlay.kind === "image" || overlay.kind === "video") &&
+    typeof overlay.src === "string" &&
+    overlay.src.trim().length > 0 &&
+    (overlay.sourcePath === undefined || typeof overlay.sourcePath === "string") &&
+    validMuted &&
+    validVideoSource &&
+    isFiniteNumber(overlay.naturalWidth) &&
+    overlay.naturalWidth > 0 &&
+    isFiniteNumber(overlay.naturalHeight) &&
+    overlay.naturalHeight > 0 &&
+    isFiniteNumber(transform.x) &&
+    isFiniteNumber(transform.y) &&
+    isFiniteNumber(transform.scale) &&
+    transform.scale > 0 &&
+    isFiniteNumber(transform.rotation) &&
+    isFiniteNumber(overlay.timelineStart) &&
+    overlay.timelineStart >= 0 &&
+    isFiniteNumber(overlay.timelineEnd) &&
+    overlay.timelineEnd > overlay.timelineStart &&
+    isFiniteNumber(overlay.srcStart) &&
+    overlay.srcStart >= 0 &&
+    isFiniteNumber(overlay.srcDuration) &&
+    overlay.srcDuration >= 0 &&
+    isFiniteNumber(overlay.zIndex) &&
+    Number.isInteger(overlay.zIndex) &&
+    overlay.zIndex >= 0 &&
+    isFiniteNumber(overlay.opacity) &&
+    overlay.opacity >= 0 &&
+    overlay.opacity <= 1 &&
+    (band === undefined ||
+      band === "screen" ||
+      band === "face" ||
+      band === "free")
+  );
+}
+
 function isStructurallyValidSnapshot(value: unknown): value is ProjectSnapshot {
   if (!value || typeof value !== "object") return false;
   const snapshot = value as Partial<ProjectSnapshot>;
@@ -1023,12 +1312,17 @@ function isStructurallyValidSnapshot(value: unknown): value is ProjectSnapshot {
   ) {
     return false;
   }
+  if (
+    snapshot.overlays !== undefined &&
+    (!Array.isArray(snapshot.overlays) ||
+      snapshot.overlays.some((overlay) => !isStructurallyValidOverlay(overlay)))
+  ) {
+    return false;
+  }
   const optionalArrays = [
     snapshot.words,
-    snapshot.captionBlocks,
     snapshot.markers,
     snapshot.deletedWordIndices,
-    snapshot.overlays,
     snapshot.mediaAssets,
   ];
   return optionalArrays.every(
@@ -1873,7 +2167,7 @@ export function useProjectPersistence(projectId: string): {
             JSON.stringify({
               footageMeta: found.snapshot.footageMeta ?? null,
               mediaAssets: found.snapshot.mediaAssets ?? [],
-              overlays: found.snapshot.overlays ?? [],
+              overlays: (found.snapshot.overlays ?? []).map(restoreOverlay),
             }) !==
             JSON.stringify({
               footageMeta: current.footageMeta,
@@ -2091,7 +2385,7 @@ export function useProjectPersistence(projectId: string): {
       return false;
     }
     const s = useRepurposeStore.getState();
-    const name = deriveShortTitle(s.words);
+    const name = deriveProjectTitle(s.words, s.footageMeta, s.clips);
     // No derivable title yet -> defer; a later store change retries.
     if (!name) return false;
     const expectedMountOwnership = mountOwnershipRef.current;
@@ -2465,7 +2759,8 @@ export function useProjectPersistence(projectId: string): {
     };
 
     const attemptCreate = async () => {
-      if (!deriveShortTitle(useRepurposeStore.getState().words)) return;
+      const state = useRepurposeStore.getState();
+      if (!deriveProjectTitle(state.words, state.footageMeta, state.clips)) return;
       const createdByThisAttempt = await createProjectFromStore();
       if (!active) return;
       if (createdByThisAttempt) {

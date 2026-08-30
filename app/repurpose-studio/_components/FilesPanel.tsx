@@ -29,6 +29,8 @@ import {
 } from "@phosphor-icons/react";
 import { useRepurposeStore } from "@/lib/repurpose/store";
 import { overlayUrlForPath } from "@/lib/repurpose/overlay-ingest";
+import { effectiveSplitRatio } from "@/lib/repurpose/split-ratio";
+import { splitRatioAt } from "@/lib/repurpose/time-map";
 import {
   importVideoFile,
   VideoImportError,
@@ -130,6 +132,7 @@ function kindLabel(kind: "image" | "video" | "audio"): string {
 const IMAGE_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
 const VIDEO_EXT = new Set(["mp4", "mov", "m4v", "webm", "mkv"]);
 const AUDIO_EXT = new Set(["mp3", "wav", "m4a", "aac", "ogg"]);
+const CANONICAL_PREVIEW_RECT = { left: 0, top: 0, width: 1080, height: 1920 };
 
 /** Classify by file extension alone (the fallback when MIME is empty). */
 function kindFromExt(nameOrPath: string): "image" | "video" | "audio" | null {
@@ -549,17 +552,26 @@ export function FilesPanel() {
           gain: 1,
         });
       } else {
-        const atTime = useRepurposeStore.getState().playhead;
-        addOverlay({
-          kind: asset.kind,
-          src: asset.src,
-          sourcePath: asset.sourcePath,
-          videoSource: asset.videoSource,
-          naturalWidth: asset.naturalWidth ?? 1,
-          naturalHeight: asset.naturalHeight ?? 1,
-          atTime,
-          srcDuration: asset.kind === "video" ? asset.srcDuration : undefined,
-        });
+        const state = useRepurposeStore.getState();
+        const atTime = state.playhead;
+        const frameSplit = effectiveSplitRatio(
+          splitRatioAt(state.clips, atTime, state.splitRatio),
+          CANONICAL_PREVIEW_RECT.height
+        );
+        addOverlay(
+          {
+            kind: asset.kind,
+            src: asset.src,
+            sourcePath: asset.sourcePath,
+            videoSource: asset.videoSource,
+            naturalWidth: asset.naturalWidth ?? 1,
+            naturalHeight: asset.naturalHeight ?? 1,
+            atTime,
+            srcDuration: asset.kind === "video" ? asset.srcDuration : undefined,
+          },
+          CANONICAL_PREVIEW_RECT,
+          frameSplit
+        );
       }
 
       // Flash an inline "Added" confirmation on the placed row for ~1s.

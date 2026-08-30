@@ -62,12 +62,6 @@ export const DEFAULT_SMART_TRANSITION: ClipTransition = {
  */
 export const CONTINUOUS_TAKE_GAP = 0.4;
 
-/** Shape of the `<base>.words.json` written by scripts/repurpose/transcribe-raw.mjs. */
-export interface RawWordsFile {
-  text: string;
-  words: Word[];
-}
-
 /** Everything needed to assemble a Short's clip timeline from raw footage. */
 export interface IngestInput {
   /** Raw face-cam word-level transcript (with retakes). */
@@ -285,7 +279,10 @@ export function computeEditStats(
  * final transcript or no viable window -- i.e. the full-cut fallback, where a
  * "short savings" number would be meaningless).
  */
-export function buildShortWithStats(input: IngestInput): {
+export function buildShortWithStats(
+  input: IngestInput,
+  options: { maxSourceDuration?: number } = {}
+): {
   clips: Clip[];
   stats: EditStats | null;
 } {
@@ -310,9 +307,18 @@ export function buildShortWithStats(input: IngestInput): {
     return { clips: buildShortClips(input), stats: null };
   }
 
+  const selectedClips =
+    options.maxSourceDuration === undefined
+      ? short.clips
+      : short.clips.flatMap((clip) => {
+          const srcStart = Math.max(0, clip.srcStart);
+          const srcEnd = Math.min(clip.srcEnd, options.maxSourceDuration!);
+          return srcEnd > srcStart ? [{ ...clip, srcStart, srcEnd }] : [];
+        });
+
   return {
-    clips: shortClipsToClips(short.clips),
-    stats: computeEditStats(segments, silences, short.clips),
+    clips: shortClipsToClips(selectedClips),
+    stats: computeEditStats(segments, silences, selectedClips),
   };
 }
 
@@ -361,7 +367,6 @@ export function footageUrlForPath(ref: string): string {
   }
   return ref;
 }
-
 /** Recover a raw local path from a persisted video endpoint URL or OS path. */
 export function footagePathFromUrl(ref: string | undefined): string | null {
   if (!ref || ref.startsWith("blob:")) return null;
@@ -427,27 +432,4 @@ export function makeFootageMeta(params: {
     height: params.height ?? 1080,
     durationSec: params.durationSec ?? lastEnd,
   };
-}
-
-/** Parse and validate a loaded words.json blob. Throws on malformed input. */
-export function parseRawWordsFile(json: unknown): RawWordsFile {
-  if (typeof json !== "object" || json === null) {
-    throw new Error("words.json: expected a JSON object");
-  }
-  const obj = json as Record<string, unknown>;
-  const words = obj.words;
-  if (!Array.isArray(words)) {
-    throw new Error("words.json: missing `words` array");
-  }
-  const parsed: Word[] = words.map((w, i) => {
-    if (typeof w !== "object" || w === null) {
-      throw new Error(`words.json: word ${i} is not an object`);
-    }
-    const rec = w as Record<string, unknown>;
-    if (typeof rec.text !== "string" || typeof rec.start !== "number" || typeof rec.end !== "number") {
-      throw new Error(`words.json: word ${i} missing text/start/end`);
-    }
-    return { text: rec.text, start: rec.start, end: rec.end };
-  });
-  return { text: typeof obj.text === "string" ? obj.text : "", words: parsed };
 }

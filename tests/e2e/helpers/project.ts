@@ -184,7 +184,8 @@ async function waitForReadyCount(page: Page, count: number): Promise<void> {
 
 export async function createProjectWithFootage(
   page: Page,
-  videoFixture: string
+  screenFixture: string,
+  faceFixture = screenFixture
 ): Promise<string> {
   await page.goto("/repurpose-studio");
   await expect(page.locator(".animate-pulse")).toHaveCount(0, { timeout: 30_000 });
@@ -205,9 +206,9 @@ export async function createProjectWithFootage(
     })
     .not.toMatch(/^new-/);
 
-  await chooseFileFromButton(page, "Screen", videoFixture);
+  await chooseFileFromButton(page, "Screen", screenFixture);
   await waitForReadyCount(page, 1);
-  await chooseFileFromButton(page, "Face", videoFixture);
+  await chooseFileFromButton(page, "Face", faceFixture);
   await waitForReadyCount(page, 2);
   await expect(page.getByRole("button", { name: "Play", exact: true })).toBeEnabled({
     timeout: 30_000,
@@ -354,6 +355,52 @@ export async function reloadAndReopenProject(
   });
   await verifyPlayPause(page);
   await seekForwardFromStart(page);
+}
+
+export async function seedProjectSnapshot<T extends object>(
+  page: Page,
+  projectId: string,
+  update: (snapshot: T) => T
+): Promise<T> {
+  await page.goto("/repurpose-studio");
+  await expect(page).toHaveURL(/\/repurpose-studio$/);
+
+  const currentResponse = await page.request.get(
+    `/api/repurpose/projects/${projectId}`
+  );
+  expect(currentResponse.ok()).toBe(true);
+  const { project } = (await currentResponse.json()) as {
+    project: {
+      name: string;
+      createdAt: string;
+      durationSec: number;
+      saveRevision: number;
+      snapshot: T;
+    };
+  };
+  const snapshot = update(structuredClone(project.snapshot));
+  const saveResponse = await page.request.post("/api/repurpose/projects", {
+    data: {
+      id: projectId,
+      name: project.name,
+      createdAt: project.createdAt,
+      durationSec:
+        typeof (snapshot as { duration?: unknown }).duration === "number"
+          ? (snapshot as { duration: number }).duration
+          : project.durationSec,
+      snapshot,
+      writerId: "task8-e2e-seed",
+      baseRevision: project.saveRevision,
+      saveRevision: project.saveRevision + 1,
+    },
+  });
+  expect(saveResponse.ok(), await saveResponse.text()).toBe(true);
+
+  await page.goto(`/repurpose-studio/${projectId}`);
+  await expect(page.getByRole("button", { name: "Play", exact: true })).toBeEnabled({
+    timeout: 30_000,
+  });
+  return snapshot;
 }
 
 export async function cleanupProject(page: Page, projectId: string): Promise<void> {

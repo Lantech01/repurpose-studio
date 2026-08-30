@@ -1,9 +1,9 @@
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { TransportBar } from "@/app/repurpose-studio/_components/TransportBar";
 import { useRepurposeStore } from "@/lib/repurpose/store";
-import type { Clip, FootageMeta } from "@/lib/repurpose/types";
+import type { Clip, FootageMeta, Overlay } from "@/lib/repurpose/types";
 
 const footageMeta: FootageMeta = {
   faceCamPath: "/media/face.mp4",
@@ -162,6 +162,234 @@ describe("playback guards", () => {
 });
 
 describe("TransportBar", () => {
+  test.each([
+    { label: "endpoint fallback", playhead: 0.5, expectedId: "visible-face" },
+    { label: "transition stored primary", playhead: 1.2, expectedId: "stored-screen" },
+    { label: "no visible selection", playhead: 0.5, expectedId: null },
+  ] as const)(
+    "copies attributes from the settled effective primary at a $label",
+    ({ playhead, expectedId }) => {
+      const transitionClips: Clip[] = [
+        {
+          ...clip,
+          id: "outgoing",
+          srcEnd: 1,
+          timelineEnd: 1,
+          splitRatio: 0,
+          occurrences: [{ start: 0, end: 1 }],
+        },
+        {
+          ...clip,
+          id: "incoming",
+          srcStart: 1,
+          timelineStart: 1,
+          timelineEnd: 2,
+          splitRatio: 1,
+          transitionIn: {
+            type: "zoom-settle",
+            durationSec: 0.4,
+            amount: 0.025,
+            easing: "natural",
+          },
+        },
+      ];
+      const stored: Overlay = {
+        id: "stored-screen",
+        kind: "image",
+        src: "/stored.png",
+        naturalWidth: 400,
+        naturalHeight: 300,
+        timelineStart: 0,
+        timelineEnd: 2,
+        srcStart: 0,
+        srcDuration: 0,
+        transform: { x: 0.8, y: 0.2, scale: 0.4, rotation: 10 },
+        zIndex: 1,
+        opacity: 0.8,
+        band: "screen",
+      };
+      const visible: Overlay = {
+        ...stored,
+        id: "visible-face",
+        src: "/visible.png",
+        transform: { x: 0.2, y: 0.8, scale: 0.3, rotation: -10 },
+        opacity: 0.3,
+        band: "face",
+      };
+      const selectedIds = expectedId === null ? [stored.id] : [visible.id, stored.id];
+      useRepurposeStore.setState({
+        clips: transitionClips,
+        duration: 2,
+        playhead,
+        overlays: [stored, visible],
+        selectedOverlayId: stored.id,
+        selectedOverlayIds: selectedIds,
+      });
+      render(<TransportBar />);
+
+      const event = new KeyboardEvent("keydown", {
+        code: "KeyC",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      fireEvent(window, event);
+
+      expect(event.defaultPrevented).toBe(expectedId !== null);
+      if (expectedId === null) {
+        expect(useRepurposeStore.getState().attributeClipboard).toBeNull();
+      } else {
+        const expected = expectedId === stored.id ? stored : visible;
+        expect(useRepurposeStore.getState().attributeClipboard).toEqual({
+          kind: "overlay",
+          transform: expected.transform,
+          opacity: expected.opacity,
+          entranceEffect: { type: "none", durationSec: 0.35 },
+          exitEffect: { type: "none", durationSec: 0.35 },
+          cornerRadius: 0,
+        });
+      }
+      expect(useRepurposeStore.getState().selectedOverlayId).toBe(stored.id);
+      expect(useRepurposeStore.getState().selectedOverlayIds).toEqual(selectedIds);
+    }
+  );
+
+  test.each([
+    {
+      label: "per-scene endpoint",
+      clips: [{ ...clip, splitRatio: 0 }],
+      playhead: 0.5,
+    },
+    {
+      label: "incoming transition endpoint",
+      clips: [
+        {
+          ...clip,
+          id: "outgoing",
+          srcEnd: 1,
+          timelineEnd: 1,
+          splitRatio: 0,
+          occurrences: [{ start: 0, end: 1 }],
+        },
+        {
+          ...clip,
+          id: "incoming",
+          srcStart: 1,
+          timelineStart: 1,
+          splitRatio: 1,
+          transitionIn: {
+            type: "zoom-settle" as const,
+            durationSec: 0.4,
+            amount: 0.025,
+            easing: "natural" as const,
+          },
+        },
+      ],
+      playhead: 1,
+    },
+  ])(
+    "uses the frame-effective split for paste at a $label",
+    ({ clips, playhead }) => {
+      const hidden: Overlay = {
+        id: "hidden-screen",
+        kind: "image",
+        src: "/hidden.png",
+        naturalWidth: 400,
+        naturalHeight: 300,
+        timelineStart: 0,
+        timelineEnd: 5,
+        srcStart: 0,
+        srcDuration: 0,
+        transform: { x: 0.5, y: 0.2, scale: 0.4, rotation: 0 },
+        zIndex: 0,
+        opacity: 1,
+        band: "screen",
+      };
+      useRepurposeStore.getState().setClips(clips);
+      useRepurposeStore.setState({
+        splitRatio: 1,
+        playhead,
+        overlays: [hidden],
+        selectedOverlayId: hidden.id,
+        selectedOverlayIds: [hidden.id],
+        attributeClipboard: {
+          kind: "overlay",
+          transform: { x: 0.8, y: 0.7, scale: 0.7, rotation: 25 },
+          opacity: 0.4,
+          entranceEffect: { type: "none", durationSec: 0.35 },
+          exitEffect: { type: "none", durationSec: 0.35 },
+          cornerRadius: 0,
+        },
+        past: [],
+      });
+      render(<TransportBar />);
+
+      const event = new KeyboardEvent("keydown", {
+        code: "KeyV",
+        ctrlKey: true,
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      fireEvent(window, event);
+
+      expect(useRepurposeStore.getState().overlays[0].transform).toEqual(
+        hidden.transform
+      );
+      expect(useRepurposeStore.getState().past).toHaveLength(0);
+      expect(event.defaultPrevented).toBe(false);
+    }
+  );
+
+  test("guides a blank project to choose both source videos before Play", () => {
+    render(createElement(TransportBar));
+
+    const playButton = screen.getByRole("button", { name: "Play" });
+    expect(playButton).toBeDisabled();
+    expect(playButton).toHaveAccessibleDescription(
+      "Choose both source videos before playing."
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Choose both source videos before playing."
+    );
+  });
+
+  test("reports media loading and errors before a missing timeline", () => {
+    const store = useRepurposeStore.getState();
+    store.setFootageMeta(footageMeta);
+
+    render(createElement(TransportBar));
+
+    expect(screen.getByRole("button", { name: "Play" })).toHaveAccessibleDescription(
+      "Media is still loading."
+    );
+
+    act(() => {
+      useRepurposeStore
+        .getState()
+        .setMediaReadiness("error", "Preview media failed to load.");
+    });
+
+    expect(screen.getByRole("button", { name: "Play" })).toHaveAccessibleDescription(
+      "Preview media failed to load."
+    );
+  });
+
+  test("reports duration only after both sources are ready", () => {
+    const store = useRepurposeStore.getState();
+    store.setFootageMeta(footageMeta);
+    store.setMediaReadiness("ready");
+
+    render(createElement(TransportBar));
+
+    expect(screen.getByRole("button", { name: "Play" })).toHaveAccessibleDescription(
+      "This project has no playable duration."
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "This project has no playable duration."
+    );
+  });
+
   test("disables Play and describes an incomplete footage source", () => {
     const store = useRepurposeStore.getState();
     store.setClips([clip]);

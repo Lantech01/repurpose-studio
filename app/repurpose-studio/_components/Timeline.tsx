@@ -17,7 +17,14 @@ import {
   X,
 } from "@phosphor-icons/react";
 import { useRepurposeStore } from "@/lib/repurpose/store";
-import { sourceToTimelineTime, timelineToSourceTime } from "@/lib/repurpose/time-map";
+import { DEFAULT_HEIGHT } from "@/lib/repurpose/compositor";
+import {
+  sourceToTimelineTime,
+  splitRatioAt,
+  timelineToSourceTime,
+} from "@/lib/repurpose/time-map";
+import { resolveEffectivePrimaryOverlay } from "@/lib/repurpose/overlay-geometry";
+import { effectiveSplitRatio } from "@/lib/repurpose/split-ratio";
 import type { Clip, Overlay } from "@/lib/repurpose/types";
 import {
   ingestOverlayFiles,
@@ -262,7 +269,6 @@ export function Timeline({
   const moveOverlay = useRepurposeStore((s) => s.moveOverlay);
   const trimOverlay = useRepurposeStore((s) => s.trimOverlay);
   const removeOverlay = useRepurposeStore((s) => s.removeOverlay);
-  const duplicateOverlay = useRepurposeStore((s) => s.duplicateOverlay);
   const selectOverlay = useRepurposeStore((s) => s.selectOverlay);
 
   // UI-owned poster-frame cache (keyed by overlay id, re-derived on reload).
@@ -947,17 +953,26 @@ export function Timeline({
       // selectedClipId in the store (mutual exclusion), so an overlay-delete and
       // a clip-delete can never both fire. This early-return is the one-line
       // guard keeping the two Delete / Cmd+D paths disjoint even if a stray clip
-      // id lingered -- a selected overlay is a media layer, never a scene, so its
-      // Delete removes the overlay and its Cmd+D duplicates the overlay.
-      if (selectedOverlayId) {
-        if (e.key === "Delete" || e.key === "Backspace") {
+      // id lingered -- a selected overlay is a media layer, never a scene.
+      // PreviewCanvas owns its Cmd+D because only it has live frame geometry.
+      const isDelete = e.key === "Delete" || e.key === "Backspace";
+      if (isDelete) {
+        const state = useRepurposeStore.getState();
+        const hasOverlaySelection =
+          state.selectedOverlayId !== null || state.selectedOverlayIds.length > 0;
+        if (hasOverlaySelection) {
+          const primary = resolveEffectivePrimaryOverlay(
+            state.overlays,
+            state.selectedOverlayIds,
+            state.selectedOverlayId,
+            effectiveSplitRatio(
+              splitRatioAt(state.clips, state.playhead, state.splitRatio),
+              DEFAULT_HEIGHT
+            )
+          );
+          if (!primary) return;
           e.preventDefault();
-          removeOverlay(selectedOverlayId);
-          return;
-        }
-        if ((e.metaKey || e.ctrlKey) && e.code === "KeyD") {
-          e.preventDefault();
-          duplicateOverlay(selectedOverlayId);
+          removeOverlay(primary.id);
           return;
         }
         // Any other key falls through to the Z-zoom shortcuts below.
@@ -997,13 +1012,11 @@ export function Timeline({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [
     selectedClipId,
-    selectedOverlayId,
     selectedWordRange,
     deleteWords,
     deleteClip,
     duplicateClip,
     removeOverlay,
-    duplicateOverlay,
     fitToWindow,
     zoomToSelection,
   ]);

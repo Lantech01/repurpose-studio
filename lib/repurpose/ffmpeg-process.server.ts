@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 
 import type { MediaInspection } from "@/lib/repurpose/media-types";
 
@@ -23,7 +23,7 @@ export interface ProcessResult {
 
 export interface SpawnedProcess {
   completion: Promise<ProcessResult>;
-  kill: () => void;
+  kill: () => void | Promise<void>;
 }
 
 export interface ProcessAdapter {
@@ -32,6 +32,132 @@ export interface ProcessAdapter {
     args: string[],
     options?: { onStdout?: (chunk: string) => void },
   ) => SpawnedProcess;
+}
+
+type OwnedChild = Pick<ChildProcess, "pid" | "exitCode" | "kill" | "once" | "removeListener">;
+
+interface TerminationOptions {
+  graceMs?: number;
+  setTimer?: typeof setTimeout;
+  clearTimer?: typeof clearTimeout;
+  killProcessGroup?: typeof process.kill;
+}
+
+function waitForChildClose(child: OwnedChild): Promise<void> {
+  if (child.exitCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const closed = () => resolve();
+    child.once("close", closed);
+    if (child.exitCode !== null) {
+      child.removeListener("close", closed);
+      resolve();
+    }
+  });
+}
+
+function appendCause(primary: unknown, secondary: unknown): unknown {
+  if (primary instanceof Error) {
+    primary.cause = primary.cause === undefined
+      ? secondary
+      : new AggregateError([primary.cause, secondary], "Multiple process termination failures");
+  }
+  return primary;
+}
+
+export async function terminateOwnedProcessTree(
+  child: OwnedChild,
+  platform: NodeJS.Platform = process.platform,
+  spawnProcess: typeof spawn = spawn,
+  options: TerminationOptions = {},
+): Promise<void> {
+  const childClosed = waitForChildClose(child);
+  const pid = child.pid;
+  if (!Number.isSafeInteger(pid) || !pid || pid < 1) {
+    child.kill("SIGKILL");
+    await childClosed;
+    return;
+  }
+  const graceMs = options.graceMs ?? 2_000;
+  const setTimer = options.setTimer ?? setTimeout;
+  const clearTimer = options.clearTimer ?? clearTimeout;
+  if (platform === "win32") {
+    let killer: ReturnType<typeof spawn>;
+    try {
+      killer = spawnProcess(
+        "taskkill",
+        ["/PID", String(pid), "/T", "/F"],
+        { windowsHide: true, shell: false, stdio: "ignore" },
+      );
+    } catch (error) {
+      child.kill("SIGKILL");
+      await childClosed;
+      throw error;
+    }
+
+    let taskkillError: unknown;
+    const taskkillCompleted = new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = (error?: unknown) => {
+        if (settled) return;
+        settled = true;
+        taskkillError = error;
+        resolve();
+      };
+      killer.once("error", finish);
+      killer.once("close", (code) => finish(code === 0 ? undefined : new Error(`taskkill exited with code ${code ?? -1}`)));
+    });
+    let escalationError: unknown;
+    const escalation = setTimer(() => {
+      try {
+        killer.kill("SIGKILL");
+      } catch (error) {
+        escalationError = error;
+      }
+      try {
+        child.kill("SIGKILL");
+      } catch (error) {
+        escalationError = escalationError ? appendCause(escalationError, error) : error;
+      }
+    }, graceMs);
+    await taskkillCompleted;
+    if (taskkillError) {
+      try {
+        child.kill("SIGKILL");
+      } catch (error) {
+        taskkillError = appendCause(taskkillError, error);
+      }
+    }
+    await childClosed;
+    clearTimer(escalation);
+    if (taskkillError) throw taskkillError;
+    if (escalationError) throw escalationError;
+    return;
+  }
+
+  const killProcessGroup = options.killProcessGroup ?? process.kill;
+  let terminationError: unknown;
+  try {
+    killProcessGroup(-pid, "SIGTERM");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") terminationError = error;
+    try {
+      child.kill("SIGTERM");
+    } catch (fallbackError) {
+      terminationError = terminationError ? appendCause(terminationError, fallbackError) : fallbackError;
+    }
+  }
+  const escalation = setTimer(() => {
+    try {
+      killProcessGroup(-pid, "SIGKILL");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+        terminationError = terminationError ? appendCause(terminationError, error) : error;
+      }
+    }
+  }, graceMs);
+  await childClosed;
+  clearTimer(escalation);
+  if (terminationError) throw terminationError;
 }
 
 export interface CompatibilityEncodeRequest {
@@ -70,17 +196,35 @@ const ENCODER_ARGUMENTS: Record<CompatibilityEncoder, readonly string[]> = {
   libx264: ["-preset", "medium", "-crf", "18"],
 };
 
-function nodeProcessAdapter(): ProcessAdapter {
+export function createNodeProcessAdapter(options: {
+  platform?: NodeJS.Platform;
+  spawnProcess?: typeof spawn;
+} = {}): ProcessAdapter {
+  const platform = options.platform ?? process.platform;
+  const spawnProcess = options.spawnProcess ?? spawn;
   return {
     run(executable, args, options = {}) {
       let child: ReturnType<typeof spawn> | undefined;
       let stdout = "";
       let stderr = "";
+      let callbackFailed = false;
+      let callbackError: unknown;
+      let processError: unknown;
+      let termination: Promise<void> | undefined;
+      const terminate = () => {
+        if (!child || child.exitCode !== null) return Promise.resolve();
+        if (!termination) {
+          termination = terminateOwnedProcessTree(child, platform, spawnProcess);
+          void termination.catch(() => undefined);
+        }
+        return termination;
+      };
       const completion = new Promise<ProcessResult>((resolve, reject) => {
         try {
-          child = spawn(executable, args, {
+          child = spawnProcess(executable, args, {
             windowsHide: true,
             shell: false,
+            detached: platform !== "win32",
             stdio: ["ignore", "pipe", "pipe"],
           });
         } catch (error) {
@@ -91,17 +235,36 @@ function nodeProcessAdapter(): ProcessAdapter {
         child.stderr?.setEncoding("utf8");
         child.stdout?.on("data", (chunk: string) => {
           stdout = boundProcessDiagnostic(stdout, chunk);
-          options.onStdout?.(chunk);
+          try {
+            options.onStdout?.(chunk);
+          } catch (error) {
+            if (callbackFailed) return;
+            callbackFailed = true;
+            callbackError = error;
+            void terminate();
+          }
         });
         child.stderr?.on("data", (chunk: string) => { stderr = boundProcessDiagnostic(stderr, chunk); });
-        child.once("error", reject);
-        child.once("close", (code) => resolve({ code: code ?? -1, stdout, stderr }));
+        child.once("error", (error) => { processError ??= error; });
+        child.once("close", (code) => {
+          void (async () => {
+            try {
+              await termination;
+            } catch (error) {
+              const primary = callbackError ?? processError;
+              if (primary) reject(appendCause(primary, error));
+              else reject(error);
+              return;
+            }
+            if (callbackError) reject(callbackError);
+            else if (processError) reject(processError);
+            else resolve({ code: code ?? -1, stdout, stderr });
+          })();
+        });
       });
       return {
         completion,
-        kill: () => {
-          if (child && child.exitCode === null && !child.killed) child.kill();
-        },
+        kill: terminate,
       };
     },
   };
@@ -162,7 +325,7 @@ export function createFfmpegProcessRunner(options: {
   ffmpegPath?: string;
   platform?: NodeJS.Platform;
 } = {}): CompatibilityEncoderRunner {
-  const adapter = options.adapter ?? nodeProcessAdapter();
+  const adapter = options.adapter ?? createNodeProcessAdapter({ platform: options.platform });
   const executable = options.ffmpegPath ?? "ffmpeg";
   const platform = options.platform ?? process.platform;
   let discovered: Set<string> | undefined;

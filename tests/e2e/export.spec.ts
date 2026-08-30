@@ -1,4 +1,11 @@
-import { expect, test, type Page, type TestInfo } from "@playwright/test";
+import {
+  expect,
+  test,
+  type BrowserContext,
+  type Locator,
+  type Page,
+  type TestInfo,
+} from "@playwright/test";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -15,7 +22,9 @@ import {
   collectBrowserErrors,
   createProjectWithFootage,
   currentDurableProjectId,
+  seedProjectSnapshot,
 } from "./helpers/project";
+import type { Overlay, ProjectSnapshot } from "@/lib/repurpose/types";
 
 test.setTimeout(300_000);
 const EXPORT_FPS = 30;
@@ -32,6 +41,40 @@ interface PixelParity {
   captionBandMae: number;
   fullLargeDiffRatio: number;
   captionBandLargeDiffRatio: number;
+  previewVisual?: VisualStats;
+  exportVisual?: VisualStats;
+  previewSamples?: number[][];
+  exportSamples?: number[][];
+}
+
+interface VisualStats {
+  count: number;
+  meanDelta: number;
+  left: number | null;
+  right: number | null;
+  top: number | null;
+  bottom: number | null;
+  centerX: number | null;
+  centerY: number | null;
+}
+
+interface PixelAnalysis {
+  baseColor: [number, number, number];
+  region: { left: number; top: number; right: number; bottom: number };
+  points?: Array<{ x: number; y: number }>;
+  threshold?: number;
+}
+
+interface NormalizedRegion {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+interface ColorRegionCounts {
+  preview: number[];
+  export: number[];
 }
 
 async function playheadValue(page: Page): Promise<number> {
@@ -43,14 +86,38 @@ async function playheadValue(page: Page): Promise<number> {
 async function capturePreviewParityFrame(
   page: Page,
   frame: number,
-  fps = 30
+  fps = 30,
+  expectedSplitPct?: number
 ): Promise<PreviewParityFrame> {
-  await page.getByRole("button", { name: "Go to start", exact: true }).click();
-  for (let index = 0; index < frame; index += 1) {
+  let currentFrame = Math.round((await playheadValue(page)) * fps);
+  if (currentFrame > frame) {
+    await page.getByRole("button", { name: "Go to start", exact: true }).click();
+    currentFrame = 0;
+  }
+  let remaining = frame - currentFrame;
+  while (remaining >= fps) {
+    await page.keyboard.press("Shift+ArrowRight");
+    remaining -= fps;
+  }
+  for (let index = 0; index < remaining; index += 1) {
     await page.keyboard.press("ArrowRight");
   }
   const time = frame / fps;
   await expect.poll(() => playheadValue(page)).toBeCloseTo(time, 2);
+  if (expectedSplitPct !== undefined) {
+    const divider = page.getByRole("separator", {
+      name: "Adjust screen and face split",
+    });
+    await expect
+      .poll(async () => Number(await divider.getAttribute("aria-valuenow")))
+      .toBeCloseTo(expectedSplitPct, 1);
+  }
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+      )
+  );
   await page.evaluate(() => {
     delete (window as typeof window & { __previewParityState?: unknown }).__previewParityState;
   });
@@ -101,10 +168,11 @@ async function capturePreviewParityFrame(
 async function comparePreviewToExport(
   video: ReturnType<Page["locator"]>,
   preview: PreviewParityFrame,
-  fps = 30
+  fps = 30,
+  analysis?: PixelAnalysis
 ): Promise<PixelParity> {
   return video.evaluate(
-    async (element: HTMLVideoElement, { previewDataUrl, seekTime }) => {
+    async (element: HTMLVideoElement, { previewDataUrl, seekTime, analysis }) => {
       element.currentTime = seekTime;
       await new Promise<void>((resolve, reject) => {
         element.addEventListener("seeked", () => resolve(), { once: true });
@@ -115,8 +183,8 @@ async function comparePreviewToExport(
       const previewImage = new Image();
       previewImage.src = previewDataUrl;
       await previewImage.decode();
-      const width = element.videoWidth;
-      const height = element.videoHeight;
+      const width = Math.min(540, element.videoWidth);
+      const height = Math.round((element.videoHeight / element.videoWidth) * width);
       const makeCanvas = () => {
         const canvas = document.createElement("canvas");
         canvas.width = width;
@@ -161,12 +229,63 @@ async function comparePreviewToExport(
           }
         }
       }
+      const visualStats = (pixels: Uint8ClampedArray): VisualStats | undefined => {
+        if (!analysis) return undefined;
+        const threshold = analysis.threshold ?? 35;
+        const x0 = Math.max(0, Math.floor(analysis.region.left * width));
+        const x1 = Math.min(width, Math.ceil(analysis.region.right * width));
+        const y0 = Math.max(0, Math.floor(analysis.region.top * height));
+        const y1 = Math.min(height, Math.ceil(analysis.region.bottom * height));
+        let count = 0;
+        let deltaSum = 0;
+        let left = width;
+        let right = -1;
+        let top = height;
+        let bottom = -1;
+        for (let y = y0; y < y1; y += 1) {
+          for (let x = x0; x < x1; x += 1) {
+            const offset = (y * width + x) * 4;
+            const delta = Math.max(
+              Math.abs(pixels[offset] - analysis.baseColor[0]),
+              Math.abs(pixels[offset + 1] - analysis.baseColor[1]),
+              Math.abs(pixels[offset + 2] - analysis.baseColor[2])
+            );
+            if (delta <= threshold) continue;
+            count += 1;
+            deltaSum += delta;
+            left = Math.min(left, x);
+            right = Math.max(right, x);
+            top = Math.min(top, y);
+            bottom = Math.max(bottom, y);
+          }
+        }
+        return {
+          count,
+          meanDelta: count > 0 ? deltaSum / count : 0,
+          left: count > 0 ? left : null,
+          right: count > 0 ? right : null,
+          top: count > 0 ? top : null,
+          bottom: count > 0 ? bottom : null,
+          centerX: count > 0 ? (left + right) / 2 : null,
+          centerY: count > 0 ? (top + bottom) / 2 : null,
+        };
+      };
+      const samples = (pixels: Uint8ClampedArray): number[][] | undefined =>
+        analysis?.points?.map(({ x, y }) => {
+          const px = Math.max(0, Math.min(width - 1, Math.round(x * width)));
+          const py = Math.max(0, Math.min(height - 1, Math.round(y * height)));
+          return [...pixels.slice((py * width + px) * 4, (py * width + px) * 4 + 4)];
+        });
       return {
         exportTime: element.currentTime,
         fullMae: fullSum / fullCount,
         captionBandMae: bandSum / bandCount,
         fullLargeDiffRatio: fullLarge / fullCount,
         captionBandLargeDiffRatio: bandLarge / bandCount,
+        previewVisual: visualStats(left),
+        exportVisual: visualStats(right),
+        previewSamples: samples(left),
+        exportSamples: samples(right),
       };
     },
     {
@@ -174,6 +293,76 @@ async function comparePreviewToExport(
       // Seek halfway through the encoded frame so Chrome cannot select the
       // preceding frame at an exact timestamp boundary.
       seekTime: (preview.frame + 0.5) / fps,
+      analysis,
+    }
+  );
+}
+
+async function countColorInRegions(
+  video: Locator,
+  preview: PreviewParityFrame,
+  target: [number, number, number],
+  regions: NormalizedRegion[],
+  tolerance = 55,
+  fps = EXPORT_FPS
+): Promise<ColorRegionCounts> {
+  return video.evaluate(
+    async (element: HTMLVideoElement, input) => {
+      element.currentTime = (input.frame + 0.5) / input.fps;
+      await new Promise<void>((resolve, reject) => {
+        element.addEventListener("seeked", () => resolve(), { once: true });
+        element.addEventListener("error", () => reject(element.error), { once: true });
+      });
+      element.pause();
+
+      const previewImage = new Image();
+      previewImage.src = input.previewDataUrl;
+      await previewImage.decode();
+      const width = Math.min(540, element.videoWidth);
+      const height = Math.round((element.videoHeight / element.videoWidth) * width);
+      const pixelsFor = (source: CanvasImageSource) => {
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        if (!context) throw new Error("2D canvas is unavailable");
+        context.drawImage(source, 0, 0, width, height);
+        return context.getImageData(0, 0, width, height).data;
+      };
+      const count = (pixels: Uint8ClampedArray, region: NormalizedRegion) => {
+        const x0 = Math.max(0, Math.floor(region.left * width));
+        const x1 = Math.min(width, Math.ceil(region.right * width));
+        const y0 = Math.max(0, Math.floor(region.top * height));
+        const y1 = Math.min(height, Math.ceil(region.bottom * height));
+        let matches = 0;
+        for (let y = y0; y < y1; y += 1) {
+          for (let x = x0; x < x1; x += 1) {
+            const offset = (y * width + x) * 4;
+            if (
+              Math.abs(pixels[offset] - input.target[0]) <= input.tolerance &&
+              Math.abs(pixels[offset + 1] - input.target[1]) <= input.tolerance &&
+              Math.abs(pixels[offset + 2] - input.target[2]) <= input.tolerance
+            ) {
+              matches += 1;
+            }
+          }
+        }
+        return matches;
+      };
+      const previewPixels = pixelsFor(previewImage);
+      const exportPixels = pixelsFor(element);
+      return {
+        preview: input.regions.map((region) => count(previewPixels, region)),
+        export: input.regions.map((region) => count(exportPixels, region)),
+      };
+    },
+    {
+      previewDataUrl: preview.dataUrl,
+      frame: preview.frame,
+      fps,
+      target,
+      regions,
+      tolerance,
     }
   );
 }
@@ -181,10 +370,16 @@ async function comparePreviewToExport(
 async function saveExport(
   page: Page,
   testInfo: TestInfo,
-  artifactName: string
+  artifactName: string,
+  options: { programmaticClick?: boolean } = {}
 ): Promise<string> {
   const downloadPromise = page.waitForEvent("download", { timeout: 180_000 });
-  await page.getByRole("button", { name: "Export MP4", exact: true }).click();
+  const exportButton = page.getByRole("button", { name: "Export MP4", exact: true });
+  if (options.programmaticClick) {
+    await exportButton.evaluate((button: HTMLButtonElement) => button.click());
+  } else {
+    await exportButton.click();
+  }
   const download = await downloadPromise;
   const outputPath = testInfo.outputPath(artifactName);
   await download.saveAs(outputPath);
@@ -193,6 +388,15 @@ async function saveExport(
   });
   await expect(page.getByRole("alert").filter({ hasText: "Export failed" })).toHaveCount(0);
   return outputPath;
+}
+
+async function readProjectSnapshot(page: Page, projectId: string): Promise<ProjectSnapshot> {
+  const response = await page.request.get(`/api/repurpose/projects/${projectId}`);
+  expect(response.ok()).toBe(true);
+  const body = (await response.json()) as {
+    project: { snapshot: ProjectSnapshot };
+  };
+  return body.project.snapshot;
 }
 
 async function chooseFiles(
@@ -206,18 +410,83 @@ async function chooseFiles(
   await chooser.setFiles(files);
 }
 
-async function assertExportMetadata(filePath: string): Promise<void> {
+async function assertExportMetadata(
+  filePath: string,
+  expected: { width: number; height: number; duration: number } = {
+    width: 1080,
+    height: 1920,
+    duration: 3,
+  }
+): Promise<void> {
   const probe = await probeMedia(filePath);
   const video = probe.streams.find((stream) => stream.codec_type === "video");
   const audio = probe.streams.filter((stream) => stream.codec_type === "audio");
   expect(video).toBeDefined();
   expect(video!.codec_name).toBe("h264");
-  expect(video).toMatchObject({ width: 1080, height: 1920 });
+  expect(video).toMatchObject({ width: expected.width, height: expected.height });
   expect(audio.length).toBeGreaterThanOrEqual(1);
   const fps = frameRate(video!);
-  expect(Math.abs(mediaDuration(probe) - 3)).toBeLessThanOrEqual(
+  expect(Math.abs(mediaDuration(probe) - expected.duration)).toBeLessThanOrEqual(
     Math.max(0.5, 2 / fps)
   );
+}
+
+async function openExportedVideo(
+  context: BrowserContext,
+  filePath: string,
+  routeName: string
+): Promise<{ player: Page; video: Locator }> {
+  const bytes = await readFile(filePath);
+  const routePath = `/__${routeName}.mp4`;
+  await context.route(`**${routePath}`, async (route) => {
+    const range = route.request().headers().range?.match(/^bytes=(\d*)-(\d*)$/);
+    if (range) {
+      const suffixLength = range[1] === "" ? Number(range[2]) : undefined;
+      const start =
+        suffixLength === undefined
+          ? Number(range[1])
+          : Math.max(0, bytes.length - suffixLength);
+      const end =
+        suffixLength === undefined && range[2] !== ""
+          ? Math.min(Number(range[2]), bytes.length - 1)
+          : bytes.length - 1;
+      await route.fulfill({
+        status: 206,
+        contentType: "video/mp4",
+        headers: {
+          "Accept-Ranges": "bytes",
+          "Content-Length": String(end - start + 1),
+          "Content-Range": `bytes ${start}-${end}/${bytes.length}`,
+        },
+        body: bytes.subarray(start, end + 1),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "video/mp4",
+      headers: {
+        "Accept-Ranges": "bytes",
+        "Content-Length": String(bytes.length),
+      },
+      body: bytes,
+    });
+  });
+
+  const player = await context.newPage();
+  await player.goto("/repurpose-studio");
+  await player.setContent(`<video src="${routePath}" preload="auto" playsinline></video>`);
+  const video = player.locator("video");
+  await video.evaluate(async (element: HTMLVideoElement) => {
+    if (element.readyState < HTMLMediaElement.HAVE_METADATA) {
+      await new Promise<void>((resolve, reject) => {
+        element.addEventListener("loadedmetadata", () => resolve(), { once: true });
+        element.addEventListener("error", () => reject(element.error), { once: true });
+      });
+    }
+    element.pause();
+  });
+  return { player, video };
 }
 
 test("exports a three-second layered 1080p MP4 with narration, music, and timed SFX", async ({
@@ -241,10 +510,6 @@ test("exports a three-second layered 1080p MP4 with narration, music, and timed 
     const controlPath = await saveExport(page, testInfo, "control-base.mp4");
 
     const captionsHeading = page.getByRole("heading", { name: "Captions", exact: true });
-    await captionsHeading
-      .locator("..")
-      .getByRole("button", { name: "Off", exact: true })
-      .click();
     await expect(
       captionsHeading.locator("..").getByRole("button", { name: "On", exact: true })
     ).toHaveAttribute("aria-pressed", "true");
@@ -452,6 +717,511 @@ test("exports a three-second layered 1080p MP4 with narration, music, and timed 
     await expect(page.getByRole("status", { name: "Export warning" })).toHaveCount(0);
     browserErrors.assertEmpty();
   } finally {
+    projectId ??= currentDurableProjectId(page);
+    if (projectId) await cleanupProject(page, projectId);
+  }
+});
+
+test("matches authored overlay effects in preview, 1080p, and 4K at pixel boundaries", async ({
+  page,
+  context,
+}, testInfo) => {
+  test.setTimeout(600_000);
+  page.setDefaultTimeout(20_000);
+  const browserErrors = collectBrowserErrors(page);
+  let projectId: string | undefined;
+  const players: Page[] = [];
+  try {
+    const overlaySourceAudio = await analyzeAudio(
+      path.join(GENERATED_FIXTURES, "overlay.mp4"),
+      0.55
+    );
+    expect(overlaySourceAudio.hz220).toBeGreaterThan(0.1);
+    expect(overlaySourceAudio.hz220).toBeGreaterThan(overlaySourceAudio.hz440 * 20);
+
+    await page.addInitScript(() => {
+      Object.defineProperty(window, "showSaveFilePicker", {
+        configurable: true,
+        value: undefined,
+      });
+    });
+    projectId = await createProjectWithFootage(
+      page,
+      path.join(GENERATED_FIXTURES, "split-screen-red.mp4"),
+      path.join(GENERATED_FIXTURES, "split-face-blue-aac.mp4")
+    );
+
+    const baseSnapshot = await seedProjectSnapshot<ProjectSnapshot>(
+      page,
+      projectId,
+      (snapshot) => {
+        const source = snapshot.clips[0];
+        const sourceStart = source.srcStart;
+        snapshot.clips = [
+          {
+            ...source,
+            id: `${source.id}-face-endpoint`,
+            srcStart: sourceStart,
+            srcEnd: sourceStart + 0.5,
+            timelineStart: 0,
+            timelineEnd: 0.5,
+            splitRatio: 0,
+            transitionIn: undefined,
+          },
+          {
+            ...source,
+            id: `${source.id}-screen-endpoint`,
+            srcStart: sourceStart + 0.5,
+            srcEnd: sourceStart + 1.1,
+            timelineStart: 0.5,
+            timelineEnd: 1.1,
+            splitRatio: 1,
+            transitionIn: undefined,
+          },
+        ];
+        snapshot.duration = 1.1;
+        snapshot.playhead = 0;
+        snapshot.inPoint = null;
+        snapshot.outPoint = null;
+        const captionWords = [
+          {
+            text: "DETACHED",
+            start: sourceStart,
+            end: sourceStart + 1.1,
+          },
+        ];
+        snapshot.words = captionWords;
+        snapshot.captionsEnabled = true;
+        snapshot.captionStyle = {
+          ...snapshot.captionStyle!,
+          fill: "#00FF00",
+          activeFill: "#00FF00",
+          strokeColor: "#003300",
+          strokeWidthPct: 0.08,
+          shadowColor: "",
+          boxColor: "",
+          glowColor: "",
+          sizePct: 0.1,
+          uppercase: true,
+          anim: "none",
+        };
+        snapshot.captionBlocks = [
+          {
+            id: "task8-detached-caption",
+            words: captionWords,
+            start: sourceStart,
+            end: sourceStart + 1.1,
+            overrideStyle: { pinToSplit: false, positionYPct: 0.76 },
+          },
+        ];
+        snapshot.overlays = [];
+        snapshot.musicTrack = null;
+        snapshot.sfxTrack = null;
+        return snapshot;
+      }
+    );
+    expect(baseSnapshot.clips.map((clip) => clip.splitRatio)).toEqual([0, 1]);
+    expect(baseSnapshot.captionBlocks).toEqual([
+      expect.objectContaining({
+        id: "task8-detached-caption",
+        overrideStyle: { pinToSplit: false, positionYPct: 0.76 },
+      }),
+    ]);
+
+    const controlPath = await saveExport(
+      page,
+      testInfo,
+      "appearance-control-1080p.mp4"
+    );
+    await chooseFiles(page, "Add media (image / video)", [
+      path.join(GENERATED_FIXTURES, "overlay.png"),
+      path.join(GENERATED_FIXTURES, "overlay.mp4"),
+    ]);
+    const imported = await expect
+      .poll(
+        async () => {
+          const response = await page.request.get(
+            `/api/repurpose/projects/${projectId}`
+          );
+          if (!response.ok()) return null;
+          const body = (await response.json()) as {
+            project?: { snapshot?: ProjectSnapshot };
+          };
+          const overlays = body.project?.snapshot?.overlays;
+          return overlays?.length === 2 ? overlays : null;
+        },
+        { timeout: 60_000, intervals: [250, 500, 1_000] }
+      )
+      .not.toBeNull();
+    void imported;
+    await expect
+      .poll(
+        async () => {
+          const response = await page.request.get(
+            `/api/repurpose/projects/${projectId}`
+          );
+          const body = (await response.json()) as {
+            project?: { snapshot?: ProjectSnapshot };
+          };
+          return body.project?.snapshot?.overlays?.find(
+            (overlay) => overlay.kind === "video"
+          )?.videoSource?.previewPath;
+        },
+        { timeout: 60_000, intervals: [250, 500, 1_000] }
+      )
+      .toContain("quality=proxy");
+    const importedResponse = await page.request.get(
+      `/api/repurpose/projects/${projectId}`
+    );
+    const importedBody = (await importedResponse.json()) as {
+      project: { snapshot: ProjectSnapshot };
+    };
+    const importedImage = importedBody.project.snapshot.overlays?.find(
+      (overlay) => overlay.kind === "image"
+    );
+    const importedVideo = importedBody.project.snapshot.overlays?.find(
+      (overlay) => overlay.kind === "video"
+    );
+    expect(importedImage).toBeDefined();
+    expect(importedVideo).toBeDefined();
+    expect(importedVideo?.muted).toBe(true);
+    expect(importedVideo?.videoSource?.previewPath).toBeTruthy();
+    expect(importedVideo?.src).toContain(
+      encodeURIComponent(importedVideo!.videoSource!.workingPath)
+    );
+    expect(importedVideo?.src).not.toContain(
+      encodeURIComponent(importedVideo!.videoSource!.previewPath!)
+    );
+    const proxyResponse = await page.request.get(
+      importedVideo!.videoSource!.previewPath!
+    );
+    expect(proxyResponse.ok()).toBe(true);
+    const proxyPath = testInfo.outputPath("overlay-positive-control-proxy.mp4");
+    await writeFile(proxyPath, await proxyResponse.body());
+    const overlayProxyAudio = await analyzeAudio(proxyPath, 0.55);
+    expect(overlayProxyAudio.hz220).toBeGreaterThan(0.1);
+    expect(overlayProxyAudio.hz220).toBeGreaterThan(overlayProxyAudio.hz440 * 20);
+
+    const seededSnapshot = await seedProjectSnapshot<ProjectSnapshot>(
+      page,
+      projectId,
+      (snapshot) => {
+        const faceSlide: Overlay = {
+          ...importedImage!,
+          id: "task8-face-slide",
+          timelineStart: 0,
+          timelineEnd: 0.5,
+          transform: { x: 0.35, y: 0.5, scale: 0.35, rotation: 0 },
+          band: "face",
+          zIndex: 1,
+          opacity: 1,
+          entranceEffect: { type: "slide", durationSec: 0.2, direction: "left" },
+          exitEffect: { type: "fade", durationSec: 0.2 },
+          cornerRadius: 0.5,
+        };
+        const screenPop: Overlay = {
+          ...importedVideo!,
+          id: "task8-screen-pop",
+          timelineStart: 0.5,
+          timelineEnd: 1,
+          srcStart: 0.5,
+          transform: { x: 0.5, y: 0.5, scale: 0.32, rotation: -17 },
+          band: "screen",
+          zIndex: 2,
+          opacity: 1,
+          muted: true,
+          entranceEffect: { type: "pop", durationSec: 0.2 },
+          exitEffect: { type: "slide", durationSec: 0.2, direction: "right" },
+          cornerRadius: 0.16,
+        };
+        const freeOversized: Overlay = {
+          ...importedImage!,
+          id: "task8-free-oversized",
+          timelineStart: 0,
+          timelineEnd: 1.1,
+          transform: { x: 0.82, y: -0.03, scale: 1.1, rotation: 37 },
+          band: "free",
+          zIndex: 0,
+          opacity: 1,
+          entranceEffect: { type: "none", durationSec: 0.35 },
+          exitEffect: { type: "none", durationSec: 0.35 },
+          cornerRadius: 0.5,
+        };
+        snapshot.overlays = [freeOversized, faceSlide, screenPop];
+        snapshot.playhead = 0;
+        return snapshot;
+      }
+    );
+    expect(seededSnapshot.overlays?.map((overlay) => overlay.band)).toEqual([
+      "free",
+      "face",
+      "screen",
+    ]);
+    expect(JSON.stringify(seededSnapshot)).not.toMatch(/gesture|transient/i);
+    const overlayPreviewVideo = page.locator(
+      'video[data-overlay-id="task8-screen-pop"]'
+    );
+    await expect(overlayPreviewVideo).toHaveCount(1);
+    await expect(overlayPreviewVideo).toHaveAttribute(
+      "data-overlay-src",
+      /quality=proxy/
+    );
+    expect(
+      await overlayPreviewVideo.evaluate((video: HTMLVideoElement) => video.muted)
+    ).toBe(true);
+
+    const frameNumbers = [0, 3, 9, 12, 15, 18, 21, 27, 30];
+    const previewFrames: PreviewParityFrame[] = [];
+    for (const frame of frameNumbers) {
+      previewFrames.push(
+        await capturePreviewParityFrame(page, frame, EXPORT_FPS, frame < 15 ? 0 : 100)
+      );
+    }
+
+    const detachedCaptionFrame = previewFrames.find(({ frame }) => frame === 9)!;
+    await capturePreviewParityFrame(page, detachedCaptionFrame.frame, EXPORT_FPS, 0);
+    const captionHandle = page.getByRole("slider", { name: "Move active caption" });
+    await expect(captionHandle).toBeVisible();
+    const persistedCaptionBox = await captionHandle.boundingBox();
+    const previewBox = await page.locator("#preview-panel canvas").first().boundingBox();
+    expect(persistedCaptionBox).not.toBeNull();
+    expect(previewBox).not.toBeNull();
+    await page.waitForTimeout(1_000);
+    const beforeTransientExport = await readProjectSnapshot(page, projectId);
+    expect(beforeTransientExport.captionBlocks).toEqual(seededSnapshot.captionBlocks);
+
+    await page.evaluate(() => {
+      const state = window as typeof window & { __task8PointerId?: number };
+      delete state.__task8PointerId;
+      window.addEventListener(
+        "pointerdown",
+        (event) => {
+          state.__task8PointerId = event.pointerId;
+        },
+        { capture: true, once: true }
+      );
+    });
+    const captionStart = {
+      x: persistedCaptionBox!.x + persistedCaptionBox!.width / 2,
+      y: persistedCaptionBox!.y + persistedCaptionBox!.height / 2,
+    };
+    await page.mouse.move(captionStart.x, captionStart.y);
+    await page.mouse.down();
+    await page.mouse.move(captionStart.x, previewBox!.y + 20, { steps: 8 });
+    const transientCaptionBox = await captionHandle.boundingBox();
+    expect(transientCaptionBox).not.toBeNull();
+    expect(transientCaptionBox!.y).toBeLessThan(persistedCaptionBox!.y - 100);
+    expect(await readProjectSnapshot(page, projectId)).toEqual(beforeTransientExport);
+
+    const export1080Path = await saveExport(
+      page,
+      testInfo,
+      "appearance-transient-1080p.mp4",
+      { programmaticClick: true }
+    );
+    const afterTransientExport = await readProjectSnapshot(page, projectId);
+    expect(afterTransientExport).toEqual(beforeTransientExport);
+    expect((await captionHandle.boundingBox())?.y).toBeCloseTo(transientCaptionBox!.y, 1);
+    console.log(
+      "TASK8_CAPTION_TRANSIENT",
+      JSON.stringify({
+        persistedY: persistedCaptionBox!.y,
+        transientY: transientCaptionBox!.y,
+        snapshotUnchanged: true,
+        exportedPosition: "persisted-detached",
+      })
+    );
+    await page.evaluate(() => {
+      const state = window as typeof window & { __task8PointerId?: number };
+      if (state.__task8PointerId === undefined) {
+        throw new Error("Caption pointer id was not captured");
+      }
+      window.dispatchEvent(
+        new PointerEvent("pointercancel", {
+          bubbles: true,
+          pointerId: state.__task8PointerId,
+        })
+      );
+      delete state.__task8PointerId;
+    });
+    await page.mouse.up();
+    await expect
+      .poll(async () => (await captionHandle.boundingBox())?.y ?? Number.NaN)
+      .toBeCloseTo(persistedCaptionBox!.y, 1);
+    expect(await readProjectSnapshot(page, projectId)).toEqual(beforeTransientExport);
+
+    await page.getByRole("button", { name: "4K", exact: true }).click();
+    await expect(page.getByRole("button", { name: "4K", exact: true })).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+    const export4kPath = await saveExport(page, testInfo, "appearance-4k.mp4");
+
+    await assertExportMetadata(controlPath, {
+      width: 1080,
+      height: 1920,
+      duration: 1.1,
+    });
+    await assertExportMetadata(export1080Path, {
+      width: 1080,
+      height: 1920,
+      duration: 1.1,
+    });
+    await assertExportMetadata(export4kPath, {
+      width: 2160,
+      height: 3840,
+      duration: 1.1,
+    });
+
+    const opened1080 = await openExportedVideo(
+      context,
+      export1080Path,
+      "task8-appearance-1080p"
+    );
+    const opened4k = await openExportedVideo(
+      context,
+      export4kPath,
+      "task8-appearance-4k"
+    );
+    players.push(opened1080.player, opened4k.player);
+    const metricsByResolution = new Map<string, PixelParity[]>();
+    for (const [resolution, video] of [
+      ["1080p", opened1080.video],
+      ["4k", opened4k.video],
+    ] as const) {
+      const metrics: PixelParity[] = [];
+      for (const preview of previewFrames) {
+        const faceFrame = preview.frame < 15;
+        const freeOnlyFrame = preview.frame === 0 || preview.frame === 15;
+        metrics.push(
+          await comparePreviewToExport(video, preview, EXPORT_FPS, {
+            baseColor: faceFrame ? [36, 80, 164] : [229, 57, 53],
+            region: freeOnlyFrame
+              ? { left: 0.35, top: 0, right: 1, bottom: 0.35 }
+              : faceFrame
+                ? { left: 0, top: 0.32, right: 0.7, bottom: 0.68 }
+                : { left: 0.18, top: 0.3, right: 0.9, bottom: 0.7 },
+            threshold: freeOnlyFrame ? 30 : 35,
+            ...(preview.frame === 9
+              ? {
+                  points: [
+                    { x: 0.18, y: 0.445 },
+                    { x: 0.35, y: 0.5 },
+                  ],
+                }
+              : {}),
+          })
+        );
+      }
+      metricsByResolution.set(resolution, metrics);
+      console.log(`TASK8_${resolution.toUpperCase()}_PIXELS`, JSON.stringify(metrics));
+      for (const [index, metric] of metrics.entries()) {
+        expect(metric.exportTime).toBeCloseTo(
+          (previewFrames[index].frame + 0.5) / EXPORT_FPS,
+          2
+        );
+        expect(metric.fullMae).toBeLessThan(12);
+        expect(metric.fullLargeDiffRatio).toBeLessThan(0.02);
+        expect(metric.captionBandMae).toBeLessThan(12);
+        expect(metric.captionBandLargeDiffRatio).toBeLessThan(0.02);
+      }
+    }
+
+    const visualWidth = (stats: VisualStats | undefined) =>
+      stats?.left == null || stats.right == null ? 0 : stats.right - stats.left + 1;
+    const visualHeight = (stats: VisualStats | undefined) =>
+      stats?.top == null || stats.bottom == null ? 0 : stats.bottom - stats.top + 1;
+    const colorDelta = (sample: number[] | undefined, base: number[]) =>
+      sample ? Math.max(...base.map((value, index) => Math.abs(sample[index] - value))) : 0;
+    for (const metrics of metricsByResolution.values()) {
+      for (const surface of ["previewVisual", "exportVisual"] as const) {
+        expect(metrics[0][surface]?.count ?? 0).toBeGreaterThan(2_000);
+        expect(visualWidth(metrics[0][surface])).toBeGreaterThan(120);
+        expect(visualHeight(metrics[0][surface])).toBeGreaterThan(60);
+        expect(metrics[1][surface]?.count ?? 0).toBeGreaterThan(500);
+        expect(metrics[1][surface]?.centerX ?? Infinity).toBeLessThan(
+          (metrics[2][surface]?.centerX ?? 0) - 35
+        );
+        expect(metrics[1][surface]?.meanDelta ?? Infinity).toBeLessThan(
+          metrics[2][surface]?.meanDelta ?? 0
+        );
+        expect(metrics[3][surface]?.meanDelta ?? Infinity).toBeLessThan(
+          metrics[2][surface]?.meanDelta ?? 0
+        );
+        expect(metrics[4][surface]?.count ?? 0).toBeGreaterThan(2_000);
+        expect(visualWidth(metrics[4][surface])).toBeGreaterThan(120);
+        expect(visualHeight(metrics[4][surface])).toBeGreaterThan(60);
+        expect(visualWidth(metrics[5][surface])).toBeGreaterThan(
+          visualWidth(metrics[6][surface]) + 4
+        );
+        expect(metrics[7][surface]?.centerX ?? 0).toBeGreaterThan(
+          (metrics[6][surface]?.centerX ?? Infinity) + 20
+        );
+        expect(metrics[8][surface]?.count ?? 0).toBeLessThan(100);
+      }
+      const settled = metrics[2];
+      expect(colorDelta(settled.previewSamples?.[0], [36, 80, 164])).toBeLessThan(20);
+      expect(colorDelta(settled.exportSamples?.[0], [36, 80, 164])).toBeLessThan(20);
+      expect(colorDelta(settled.previewSamples?.[1], [36, 80, 164])).toBeGreaterThan(80);
+      expect(colorDelta(settled.exportSamples?.[1], [36, 80, 164])).toBeGreaterThan(80);
+    }
+
+    for (const [resolution, video] of [
+      ["1080p", opened1080.video],
+      ["4k", opened4k.video],
+    ] as const) {
+      const counts = await countColorInRegions(
+        video,
+        detachedCaptionFrame,
+        [0, 255, 0],
+        [
+          { left: 0.1, top: 0.66, right: 0.9, bottom: 0.86 },
+          { left: 0.1, top: 0, right: 0.9, bottom: 0.18 },
+        ]
+      );
+      console.log(`TASK8_${resolution.toUpperCase()}_DETACHED_CAPTION`, JSON.stringify(counts));
+      expect(counts.preview[0]).toBeGreaterThan(400);
+      expect(counts.export[0]).toBeGreaterThan(400);
+      expect(counts.preview[1]).toBeLessThan(20);
+      expect(counts.export[1]).toBeLessThan(20);
+    }
+
+    const [controlAudio, audio1080, audio4k] = await Promise.all([
+      analyzeAudio(controlPath, 0.55),
+      analyzeAudio(export1080Path, 0.55),
+      analyzeAudio(export4kPath, 0.55),
+    ]);
+    console.log(
+      "TASK8_OVERLAY_AUDIO",
+      JSON.stringify({
+        overlaySource: overlaySourceAudio,
+        overlayProxy: overlayProxyAudio,
+        control: controlAudio,
+        export1080: audio1080,
+        export4k: audio4k,
+      })
+    );
+    for (const candidate of [audio1080, audio4k]) {
+      expect(candidate.hz440 / controlAudio.hz440).toBeGreaterThan(0.9);
+      expect(candidate.hz440 / controlAudio.hz440).toBeLessThan(1.1);
+      expect(candidate.fullRms / controlAudio.fullRms).toBeGreaterThan(0.9);
+      expect(candidate.fullRms / controlAudio.fullRms).toBeLessThan(1.1);
+      expect(candidate.hz220).toBeLessThan(candidate.hz440 * 0.1);
+      expect(candidate.hz220).toBeLessThan(overlaySourceAudio.hz220 * 0.01);
+      expect(candidate.hz220).toBeLessThan(overlayProxyAudio.hz220 * 0.01);
+    }
+
+    const afterExportResponse = await page.request.get(
+      `/api/repurpose/projects/${projectId}`
+    );
+    const afterExport = (await afterExportResponse.json()) as {
+      project: { snapshot: ProjectSnapshot };
+    };
+    expect(afterExport.project.snapshot.overlays).toEqual(seededSnapshot.overlays);
+    expect(JSON.stringify(afterExport.project.snapshot)).not.toMatch(/gesture|transient/i);
+    browserErrors.assertEmpty();
+  } finally {
+    for (const player of players) await player.close().catch(() => undefined);
     projectId ??= currentDurableProjectId(page);
     if (projectId) await cleanupProject(page, projectId);
   }

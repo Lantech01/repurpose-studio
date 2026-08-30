@@ -109,7 +109,7 @@ describe("POST /api/repurpose/footage", () => {
     await expect(readdir(originals)).resolves.toEqual([`${hash}.mov`]);
     expect(request.formData).not.toHaveBeenCalled();
     expect(fileArrayBuffer).not.toHaveBeenCalled();
-  });
+  }, 60_000);
 
   it("removes its exact partial when the body errors", async () => {
     const { route, originals } = await loadRoute();

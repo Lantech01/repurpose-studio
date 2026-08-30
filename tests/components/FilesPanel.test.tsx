@@ -17,12 +17,13 @@ vi.mock("@/lib/repurpose/video-proxy-client", () => ({
 }));
 
 import { FilesPanel } from "@/app/repurpose-studio/_components/FilesPanel";
+import { overlayAABBNorm } from "@/lib/repurpose/overlay-geometry";
 import { useRepurposeStore } from "@/lib/repurpose/store";
 import {
   VideoImportError,
   type ImportVideoOptions,
 } from "@/lib/repurpose/video-import-client";
-import type { VideoSourceRecord } from "@/lib/repurpose/types";
+import type { Clip, VideoSourceRecord } from "@/lib/repurpose/types";
 
 const source: VideoSourceRecord = {
   originalPath: "C:\\media\\library.mov",
@@ -68,6 +69,43 @@ afterEach(() => {
 });
 
 describe("FilesPanel video imports", () => {
+  it("places media against the active scene endpoint instead of the opposing global split", () => {
+    const clip: Clip = {
+      id: "face-full",
+      kind: "take",
+      label: "Face full",
+      srcStart: 0,
+      srcEnd: 4,
+      timelineStart: 0,
+      timelineEnd: 4,
+      kept: true,
+      isKeeperTake: true,
+      occurrences: [{ start: 0, end: 4 }],
+      keeperIndex: 0,
+      splitRatio: 0,
+    };
+    useRepurposeStore.setState({ clips: [clip], duration: 4, playhead: 2, splitRatio: 1 });
+    useRepurposeStore.getState().addMediaAsset({
+      kind: "image",
+      name: "scene-overlay.png",
+      src: "/scene-overlay.png",
+      naturalWidth: 400,
+      naturalHeight: 300,
+    });
+    render(<FilesPanel />);
+
+    fireEvent.click(screen.getByText("scene-overlay.png").closest("button")!);
+
+    const added = useRepurposeStore.getState().overlays[0];
+    const box = overlayAABBNorm(
+      added.transform,
+      added.naturalWidth,
+      added.naturalHeight,
+      { left: 0, top: 0, width: 1080, height: 1920 }
+    );
+    expect(box.maxY).toBeCloseTo(0, 10);
+  });
+
   it("starts a background proxy after compatibility import and updates only nested previewPath", async () => {
     const ready = { ...source, previewPath: "/preview/library.mp4" };
     importVideoFileMock.mockResolvedValue(source);

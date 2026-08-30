@@ -87,3 +87,106 @@ describe("resolveAllowedVideoPath", () => {
     await expect(policy.resolveAllowedVideoPath(textFile)).resolves.toBeNull();
   });
 });
+
+describe("resolveImportedOriginalVideoPath", () => {
+  const hash = "a".repeat(64);
+
+  async function originalsPolicy() {
+    const loaded = await loadPolicy();
+    const originals = path.join(
+      loaded.home,
+      "Downloads",
+      "repurpose-footage",
+      "originals"
+    );
+    await mkdir(originals, { recursive: true });
+    expect(loaded.policy.REPURPOSE_ORIGINALS_DIR).toBe(originals);
+    return { ...loaded, originals };
+  }
+
+  it.each([".mp4", ".mov", ".m4v", ".webm", ".mkv", ".MP4"])(
+    "accepts a direct lowercase-hash original with supported extension %s",
+    async (extension) => {
+      const { originals, policy } = await originalsPolicy();
+      const file = path.join(originals, `${hash}${extension}`);
+      await writeFile(file, "video");
+
+      await expect(policy.resolveImportedOriginalVideoPath(file)).resolves.toBe(
+        await import("node:fs/promises").then(({ realpath }) => realpath(file))
+      );
+    }
+  );
+
+  it.each([
+    `${"A".repeat(64)}.mp4`,
+    `${"a".repeat(63)}.mp4`,
+    `${"g".repeat(64)}.mp4`,
+    `prefix-${hash}.mp4`,
+  ])("rejects malformed or case-wrong hashes: %s", async (name) => {
+    const { originals, policy } = await originalsPolicy();
+    const file = path.join(originals, name);
+    await writeFile(file, "video");
+    await expect(policy.resolveImportedOriginalVideoPath(file)).resolves.toBeNull();
+  });
+
+  it("rejects nested originals and arbitrary Downloads videos", async () => {
+    const { home, originals, policy } = await originalsPolicy();
+    const nested = path.join(originals, "nested");
+    await mkdir(nested);
+    const nestedFile = path.join(nested, `${hash}.mp4`);
+    const arbitrary = path.join(home, "Downloads", `${hash}.mp4`);
+    await Promise.all([writeFile(nestedFile, "video"), writeFile(arbitrary, "video")]);
+
+    await expect(policy.resolveImportedOriginalVideoPath(nestedFile)).resolves.toBeNull();
+    await expect(policy.resolveImportedOriginalVideoPath(arbitrary)).resolves.toBeNull();
+  });
+
+  it("rejects directories, unsupported extensions, relative paths, and traversal", async () => {
+    const { originals, policy } = await originalsPolicy();
+    const directory = path.join(originals, `${hash}.mp4`);
+    const unsupported = path.join(originals, `${hash}.avi`);
+    await mkdir(directory);
+    await writeFile(unsupported, "video");
+
+    await expect(policy.resolveImportedOriginalVideoPath(directory)).resolves.toBeNull();
+    await expect(policy.resolveImportedOriginalVideoPath(unsupported)).resolves.toBeNull();
+    await expect(policy.resolveImportedOriginalVideoPath(`${hash}.mp4`)).resolves.toBeNull();
+    await expect(
+      policy.resolveImportedOriginalVideoPath(
+        path.join(originals, "..", `${hash}.mp4`)
+      )
+    ).resolves.toBeNull();
+  });
+
+  it("rejects a symlink or junction that escapes the real originals directory", async () => {
+    const { root, originals, policy } = await originalsPolicy();
+    const outside = path.join(root, `${hash}.mp4`);
+    const linkedDirectory = path.join(originals, "linked");
+    await writeFile(outside, "private");
+    await symlink(root, linkedDirectory, "junction");
+
+    await expect(
+      policy.resolveImportedOriginalVideoPath(path.join(linkedDirectory, `${hash}.mp4`))
+    ).resolves.toBeNull();
+  });
+
+  it("inspects the canonical target when the requested source is substituted during resolution", async () => {
+    const { originals, policy } = await originalsPolicy();
+    const requested = path.join(originals, `${hash}.mp4`);
+    const canonical = path.join(originals, `${"b".repeat(64)}.mp4`);
+    await Promise.all([writeFile(requested, "old"), writeFile(canonical, "replacement")]);
+    const fs = await import("node:fs/promises");
+    const adapter = {
+      realpath: vi.fn(async (candidate: string) =>
+        candidate === requested ? canonical : fs.realpath(candidate)
+      ),
+      stat: vi.fn((candidate: string) => fs.stat(candidate)),
+    };
+
+    await expect(
+      policy.resolveImportedOriginalVideoPath(requested, adapter)
+    ).resolves.toBe(canonical);
+    expect(adapter.stat).toHaveBeenCalledOnce();
+    expect(adapter.stat).toHaveBeenCalledWith(canonical);
+  });
+});
