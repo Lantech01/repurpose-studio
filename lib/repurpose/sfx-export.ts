@@ -123,6 +123,30 @@ export async function prepareSfxForExport(
   return prepared;
 }
 
+export function sumPcmChannels(
+  outputChannels: readonly Float32Array[],
+  sourceChannels: readonly Float32Array[],
+  writeStart: number
+): void {
+  if (sourceChannels.length === 0 || !Number.isSafeInteger(writeStart) || writeStart < 0) return;
+  for (let channel = 0; channel < outputChannels.length; channel += 1) {
+    const output = outputChannels[channel];
+    const source = sourceChannels[Math.min(channel, sourceChannels.length - 1)];
+    const frames = Math.min(source.length, output.length - writeStart);
+    for (let frame = 0; frame < frames; frame += 1) {
+      output[writeStart + frame] += source[frame];
+    }
+  }
+}
+
+export function clampPcmChannels(channels: readonly Float32Array[]): void {
+  for (const channel of channels) {
+    for (let frame = 0; frame < channel.length; frame += 1) {
+      channel[frame] = Math.max(-1, Math.min(1, channel[frame]));
+    }
+  }
+}
+
 export function mixSfxClipsPcm(
   outputChannels: readonly Float32Array[],
   outputSampleRate: number,
@@ -155,11 +179,6 @@ export function mixSfxClipsPcm(
         output[outputStart + frame] +=
           sample * sourceBaseGain * clip.gain * Math.min(fadeIn, fadeOut);
       }
-    }
-  }
-  for (const output of outputChannels) {
-    for (let frame = 0; frame < output.length; frame += 1) {
-      output[frame] = Math.max(-1, Math.min(1, output[frame]));
     }
   }
 }

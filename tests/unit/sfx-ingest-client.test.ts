@@ -4,6 +4,7 @@ import {
   classifySfxFile,
   createSfxImportOwner,
   importSfxFile,
+  isAudioLikeFile,
   registerSfxImportOwner,
   releaseSfxImportOwner,
 } from "@/lib/repurpose/sfx-ingest-client";
@@ -36,6 +37,14 @@ describe("project-owned SFX import", () => {
     ["spoof.m4a", "audio/wav"],
   ])("rejects extension/MIME spoof %s (%s)", (name, type) => {
     expect(classifySfxFile(new File(["x"], name, { type }))).toBe(false);
+  });
+
+  it.each([
+    ["unsupported.ogg", ""],
+    ["unsupported.aac", "application/octet-stream"],
+    ["unknown.bin", "audio/ogg"],
+  ])("routes audio-like file %s (%s) to strict SFX validation", (name, type) => {
+    expect(isAudioLikeFile(new File(["x"], name, { type }))).toBe(true);
   });
 
   it("rejects unsupported files before upload", async () => {

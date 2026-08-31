@@ -12,6 +12,7 @@ import { loadResolvedSfxAudio } from "@/lib/repurpose/sfx-audio";
 import { importSfxFile, type SfxImportOwner } from "@/lib/repurpose/sfx-ingest-client";
 import type { SfxAsset, SfxClipSource } from "@/lib/repurpose/types";
 import { SFX_DRAG_MIME, type SfxDragPayload } from "@/lib/repurpose/sfx-drag";
+import { focusSfxTimelineTarget } from "./sfx-focus";
 
 function dragPayload(event: React.DragEvent, payload: SfxDragPayload): void {
   event.dataTransfer.effectAllowed = "copy";
@@ -170,6 +171,31 @@ export function SfxPanel({ projectId, sfxImportOwner }: { projectId: string; sfx
     if (id) useRepurposeStore.getState().selectSfxClip(id);
   };
 
+  const replace = (id: string, name: string, source: SfxClipSource) => {
+    const state = useRepurposeStore.getState();
+    state.replaceSfxClipSource(id, { name, source });
+    state.selectSfxClip(id);
+    focusSfxTimelineTarget(id);
+  };
+
+  const duplicate = (id: string) => {
+    const state = useRepurposeStore.getState();
+    const duplicateId = state.duplicateSfxClip(id);
+    if (!duplicateId) return;
+    state.selectSfxClip(duplicateId);
+    focusSfxTimelineTarget(duplicateId);
+  };
+
+  const remove = (id: string) => {
+    const state = useRepurposeStore.getState();
+    const index = state.sfxClips.findIndex((clip) => clip.id === id);
+    if (index < 0) return;
+    const nearest = state.sfxClips[index + 1] ?? state.sfxClips[index - 1] ?? null;
+    state.removeSfxClip(id);
+    state.selectSfxClip(nearest?.id ?? null);
+    focusSfxTimelineTarget(nearest?.id ?? null);
+  };
+
   const generate = async () => {
     const state = useRepurposeStore.getState();
     if (state.duration <= 0 || state.sfxGenerating) return;
@@ -233,7 +259,7 @@ export function SfxPanel({ projectId, sfxImportOwner }: { projectId: string; sfx
         <span className="min-w-0 flex-1 truncate text-[11px]">{entry.displayName}</span>
         <button type="button" aria-label={`${auditionIdentity === resolved.identity ? "Stop" : "Audition"} ${entry.displayName}`} onClick={() => audition(resolved.identity, resolved.url, false)}>{auditionIdentity === resolved.identity ? <Pause size={12} /> : <Play size={12} />}</button>
         <button type="button" aria-label={`Add ${entry.displayName} at playhead`} onClick={() => add(entry.displayName, { kind: "built-in", key })} className="text-[10px]">Add</button>
-        {selected && <button type="button" aria-label={`Replace ${selected.name} with ${entry.displayName}`} onClick={() => useRepurposeStore.getState().replaceSfxClipSource(selected.id, { name: entry.displayName, source: { kind: "built-in", key } })} className="text-[10px]">Replace</button>}
+        {selected && <button type="button" aria-label={`Replace ${selected.name} with ${entry.displayName}`} onClick={() => replace(selected.id, entry.displayName, { kind: "built-in", key })} className="text-[10px]">Replace</button>}
       </div>
     );
   };
@@ -259,7 +285,7 @@ export function SfxPanel({ projectId, sfxImportOwner }: { projectId: string; sfx
         {imported.length > 0 && <div><h4 className="mb-1 text-[10px] font-semibold uppercase text-muted-foreground">Project imports</h4><div className="space-y-1">{imported.map((asset) => {
           const unavailable = !asset.sourcePath || asset.srcDuration <= 0;
           const resolved = resolveSfxSource(sourceForAsset(asset), assets);
-          return <div key={asset.id} draggable={!unavailable} onDragStart={(event) => dragPayload(event, { assetId: asset.id })} className="flex items-center gap-1 rounded border border-border px-1.5 py-1"><span className="min-w-0 flex-1 truncate text-[11px]">{asset.name}</span>{unavailable && <span className="text-[9px] text-amber-300">Unavailable</span>}<button type="button" disabled={unavailable} aria-label={`Audition ${asset.name}`} onClick={() => audition(resolved.identity, resolved.url, unavailable)}><Play size={12} /></button><button type="button" disabled={unavailable} aria-label={`Add ${asset.name} at playhead`} onClick={() => add(asset.name, sourceForAsset(asset))} className="text-[10px]">Add</button>{selected && <button type="button" disabled={unavailable} aria-label={`Replace ${selected.name} with ${asset.name}`} onClick={() => useRepurposeStore.getState().replaceSfxClipSource(selected.id, { name: asset.name, source: sourceForAsset(asset) })} className="text-[10px]">Replace</button>}</div>;
+          return <div key={asset.id} draggable={!unavailable} onDragStart={(event) => dragPayload(event, { assetId: asset.id })} className="flex items-center gap-1 rounded border border-border px-1.5 py-1"><span className="min-w-0 flex-1 truncate text-[11px]">{asset.name}</span>{unavailable && <span className="text-[9px] text-amber-300">Unavailable</span>}<button type="button" disabled={unavailable} aria-label={`Audition ${asset.name}`} onClick={() => audition(resolved.identity, resolved.url, unavailable)}><Play size={12} /></button><button type="button" disabled={unavailable} aria-label={`Add ${asset.name} at playhead`} onClick={() => add(asset.name, sourceForAsset(asset))} className="text-[10px]">Add</button>{selected && <button type="button" disabled={unavailable} aria-label={`Replace ${selected.name} with ${asset.name}`} onClick={() => replace(selected.id, asset.name, sourceForAsset(asset))} className="text-[10px]">Replace</button>}</div>;
         })}</div></div>}
       </div>
       {selected && <div className="space-y-2 rounded border border-emerald-500/30 bg-emerald-500/5 p-2"><div className="flex items-center justify-between"><strong className="truncate text-[11px]">{selected.name}</strong>{selectedImportedAssetId !== null && !assets.some((asset) => asset.id === selectedImportedAssetId && asset.sourcePath) && <span className="text-[9px] text-amber-300">Unavailable</span>}</div>
@@ -268,7 +294,7 @@ export function SfxPanel({ projectId, sfxImportOwner }: { projectId: string; sfx
         <Slider clipId={selected.id} kind="source-out" label="Source out" value={selected.sourceEnd} min={selected.sourceStart + .001} max={sfxSourceDuration(selected.source)} step={.01} />
         <Slider clipId={selected.id} kind="fade-in" label="Fade in" value={selected.fadeInSec} min={0} max={2} step={.01} />
         <Slider clipId={selected.id} kind="fade-out" label="Fade out" value={selected.fadeOutSec} min={0} max={2} step={.01} />
-        <div className="flex flex-wrap gap-1"><button type="button" aria-label={`${selected.muted ? "Unmute" : "Mute"} ${selected.name}`} onClick={() => useRepurposeStore.getState().setSfxClipMuted(selected.id, !selected.muted)} className="rounded border border-border px-1.5 py-1 text-[10px]">{selected.muted ? "Unmute" : "Mute"}</button><button type="button" aria-label={`Duplicate ${selected.name}`} onClick={() => { const id = useRepurposeStore.getState().duplicateSfxClip(selected.id); if (id) useRepurposeStore.getState().selectSfxClip(id); }} className="rounded border border-border px-1.5 py-1 text-[10px]">Duplicate</button><button type="button" aria-label={`Delete ${selected.name}`} onClick={() => useRepurposeStore.getState().removeSfxClip(selected.id)} className="rounded border border-red-500/30 px-1.5 py-1 text-[10px] text-red-300"><Trash size={11} /></button></div>
+        <div className="flex flex-wrap gap-1"><button type="button" aria-label={`${selected.muted ? "Unmute" : "Mute"} ${selected.name}`} onClick={() => useRepurposeStore.getState().setSfxClipMuted(selected.id, !selected.muted)} className="rounded border border-border px-1.5 py-1 text-[10px]">{selected.muted ? "Unmute" : "Mute"}</button><button type="button" aria-label={`Duplicate ${selected.name}`} onClick={() => duplicate(selected.id)} className="rounded border border-border px-1.5 py-1 text-[10px]">Duplicate</button><button type="button" aria-label={`Delete ${selected.name}`} onClick={() => remove(selected.id)} className="rounded border border-red-500/30 px-1.5 py-1 text-[10px] text-red-300"><Trash size={11} /></button></div>
       </div>}
       {error && <p role="alert" className="flex gap-1 text-[10px] text-red-300"><Warning size={12} />{error}</p>}
     </section>

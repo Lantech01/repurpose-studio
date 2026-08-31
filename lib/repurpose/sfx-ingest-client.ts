@@ -6,6 +6,9 @@ const SFX_MIME_BY_EXTENSION: Record<string, ReadonlySet<string>> = {
   mp3: new Set(["audio/mpeg", "audio/mp3"]),
   m4a: new Set(["audio/mp4", "audio/x-m4a", "audio/m4a"]),
 };
+const AUDIO_EXTENSIONS = new Set([
+  "aac", "aif", "aiff", "flac", "m4a", "m4b", "mp3", "ogg", "opus", "wav", "wma",
+]);
 
 export interface SfxImportOwner {
   readonly id: number;
@@ -37,6 +40,11 @@ export function classifySfxFile(file: File): boolean {
   const allowedMimes = SFX_MIME_BY_EXTENSION[extension];
   const mime = file.type.trim().toLowerCase();
   return Boolean(allowedMimes && (mime === "" || allowedMimes.has(mime)));
+}
+
+export function isAudioLikeFile(file: File): boolean {
+  const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
+  return file.type.trim().toLowerCase().startsWith("audio/") || AUDIO_EXTENSIONS.has(extension);
 }
 
 export function createSfxImportOwner(projectId: string): SfxImportOwner {

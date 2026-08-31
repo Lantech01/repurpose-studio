@@ -1,8 +1,10 @@
-import { cleanup, createEvent, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, createEvent, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Timeline } from "@/app/repurpose-studio/_components/Timeline";
+import { SfxPanel } from "@/app/repurpose-studio/_components/SfxPanel";
 import { SFX_DRAG_MIME } from "@/lib/repurpose/sfx-drag";
+import { createSfxImportOwner, registerSfxImportOwner, releaseSfxImportOwner } from "@/lib/repurpose/sfx-ingest-client";
 import { useRepurposeStore } from "@/lib/repurpose/store";
 import type { Clip, SfxClip } from "@/lib/repurpose/types";
 
@@ -129,5 +131,88 @@ describe("Timeline real SFX interactions", () => {
       expect.objectContaining({ timelineStart: 2, source: { kind: "imported", assetId: "asset", srcDuration: 1 } }),
     ]);
     expect(useRepurposeStore.getState().overlays).toBe(overlays);
+  });
+
+  it("selects a focused block so Duplicate targets it and restores focus to the copy", async () => {
+    useRepurposeStore.setState({
+      sfxClips: [
+        effect({ id: "first", name: "First" }),
+        effect({ id: "focused", name: "Focused", timelineStart: 4 }),
+      ],
+      selectedSfxClipId: null,
+      past: [],
+      future: [],
+    });
+    render(<Timeline />);
+    const focused = screen.getByRole("button", { name: /Select Focused/ });
+
+    focused.focus();
+    expect(useRepurposeStore.getState().selectedSfxClipId).toBe("focused");
+    fireEvent.keyDown(focused, { key: "d", code: "KeyD", ctrlKey: true });
+
+    await waitFor(() => expect(useRepurposeStore.getState().sfxClips).toHaveLength(3));
+    const copyId = useRepurposeStore.getState().selectedSfxClipId as string;
+    expect(useRepurposeStore.getState().sfxClips.find((clip) => clip.id === copyId)).toMatchObject({
+      name: "Focused",
+      source: { kind: "built-in", key: "ding" },
+    });
+    await waitFor(() => expect(document.activeElement).toHaveAttribute("data-sfx-select-id", copyId));
+  });
+
+  it("deletes a middle clip, selects the nearest survivor, and focuses its selection control", async () => {
+    useRepurposeStore.setState({
+      sfxClips: [
+        effect({ id: "first", name: "First", timelineStart: 0 }),
+        effect({ id: "middle", name: "Middle", timelineStart: 3 }),
+        effect({ id: "last", name: "Last", timelineStart: 6 }),
+      ],
+      selectedSfxClipId: null,
+      past: [],
+      future: [],
+    });
+    render(<Timeline />);
+    const middle = screen.getByRole("button", { name: /Select Middle/ });
+    middle.focus();
+
+    fireEvent.keyDown(middle, { key: "Delete", code: "Delete" });
+
+    await waitFor(() => expect(useRepurposeStore.getState().selectedSfxClipId).toBe("last"));
+    expect(useRepurposeStore.getState().sfxClips.map((clip) => clip.id)).toEqual(["first", "last"]);
+    await waitFor(() => expect(document.activeElement).toHaveAttribute("data-sfx-select-id", "last"));
+  });
+
+  it("focuses the labelled SFX row fallback after deleting the final clip", async () => {
+    render(<Timeline />);
+    const selection = screen.getByRole("button", { name: /Select Impact/ });
+    selection.focus();
+
+    fireEvent.keyDown(selection, { key: "Delete", code: "Delete" });
+
+    await waitFor(() => expect(useRepurposeStore.getState().sfxClips).toEqual([]));
+    const row = screen.getByRole("region", { name: "Sound effects timeline" });
+    await waitFor(() => expect(row).toHaveFocus());
+    expect(row).toHaveAttribute("tabindex", "0");
+  });
+
+  it("retains selection-control focus after replacing from the SFX panel", async () => {
+    const owner = registerSfxImportOwner(createSfxImportOwner("focus-project"));
+    useRepurposeStore.setState({ selectedSfxClipId: "effect" });
+    try {
+      render(<><Timeline /><SfxPanel projectId="focus-project" sfxImportOwner={owner} /></>);
+      screen.getByRole("button", { name: /Select Impact/ }).focus();
+
+      const replace = screen.getByRole("button", { name: "Replace Impact with Mouse Click" });
+      replace.focus();
+      fireEvent.click(replace);
+
+      await waitFor(() => expect(useRepurposeStore.getState().sfxClips[0]).toMatchObject({
+        id: "effect",
+        name: "Mouse Click",
+        source: { kind: "built-in", key: "mouse_click" },
+      }));
+      await waitFor(() => expect(document.activeElement).toHaveAttribute("data-sfx-select-id", "effect"));
+    } finally {
+      releaseSfxImportOwner(owner);
+    }
   });
 });

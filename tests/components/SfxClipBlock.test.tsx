@@ -58,6 +58,18 @@ describe("SfxClipBlock", () => {
     expect(onDelete).toHaveBeenCalledWith("sfx-1");
   });
 
+  it("selects when its actual focusable selection control receives focus", () => {
+    const onSelect = vi.fn();
+    render(<SfxClipBlock clip={clip} left={0} width={100} top={0} height={30}
+      selected={false} missing={false} waveform={null} onSelect={onSelect}
+      onBodyPointerDown={vi.fn()} onEdgePointerDown={vi.fn()} onDelete={vi.fn()} />);
+
+    screen.getByRole("button", { name: /Select Whoosh/ }).focus();
+
+    expect(onSelect).toHaveBeenCalledOnce();
+    expect(onSelect).toHaveBeenCalledWith("sfx-1");
+  });
+
   it("routes body, trim, selection, and delete actions exclusively", () => {
     const onSelect = vi.fn();
     const onBodyPointerDown = vi.fn();

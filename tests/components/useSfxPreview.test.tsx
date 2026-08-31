@@ -13,6 +13,7 @@ const sourceNodes: Array<{ disconnect: ReturnType<typeof vi.fn>; onended: (() =>
 const gainDisconnects: ReturnType<typeof vi.fn>[] = [];
 let close: ReturnType<typeof vi.fn>;
 let decodeMock: ReturnType<typeof vi.fn>;
+let contextTime: number;
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -46,8 +47,9 @@ beforeEach(() => {
   gainDisconnects.length = 0;
   close = vi.fn().mockResolvedValue(undefined);
   decodeMock = vi.fn().mockResolvedValue(decodedBuffer);
+  contextTime = 10;
   class AudioContextMock {
-    currentTime = 10;
+    get currentTime() { return contextTime; }
     destination = {};
     resume = vi.fn().mockResolvedValue(undefined);
     close = close;
@@ -103,6 +105,49 @@ describe("useSfxPreview", () => {
     useRepurposeStore.setState({ isPlaying: false });
     rendered.unmount();
     expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("reschedules after cumulative sub-threshold scrub steps diverge from the schedule clock", async () => {
+    useRepurposeStore.setState({ playhead: 0, playbackRate: 1 });
+    render(<Harness clips={[effect("scrub", 0)]} />);
+    useRepurposeStore.setState({ isPlaying: true });
+    await waitFor(() => expect(starts).toHaveLength(1));
+
+    useRepurposeStore.setState({ playhead: 0.15 });
+    useRepurposeStore.setState({ playhead: 0.3 });
+    expect(starts).toHaveLength(1);
+    useRepurposeStore.setState({ playhead: 0.45 });
+
+    await waitFor(() => expect(starts).toHaveLength(2));
+    expect(stops[0]).toHaveBeenCalledOnce();
+  });
+
+  it("does not reschedule for normal playback that tracks the AudioContext clock", async () => {
+    useRepurposeStore.setState({ playhead: 0, playbackRate: 1 });
+    render(<Harness clips={[effect("clocked", 0)]} />);
+    useRepurposeStore.setState({ isPlaying: true });
+    await waitFor(() => expect(starts).toHaveLength(1));
+
+    contextTime = 10.1;
+    useRepurposeStore.setState({ playhead: 0.1 });
+    contextTime = 10.2;
+    useRepurposeStore.setState({ playhead: 0.2 });
+    contextTime = 10.4;
+    useRepurposeStore.setState({ playhead: 0.4 });
+
+    expect(starts).toHaveLength(1);
+    expect(stops[0]).not.toHaveBeenCalled();
+  });
+
+  it("uses a meaningful paused playhead change when playback resumes", async () => {
+    useRepurposeStore.setState({ playhead: 0, playbackRate: 1 });
+    render(<Harness clips={[effect("paused-seek", 0)]} />);
+
+    useRepurposeStore.setState({ playhead: 0.5 });
+    useRepurposeStore.setState({ isPlaying: true });
+
+    await waitFor(() => expect(starts).toHaveLength(1));
+    expect(starts[0]).toHaveBeenCalledWith(10, 0.75, 0.5);
   });
 
   it("reports and skips unavailable imported sources without mutating clips", async () => {

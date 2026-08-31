@@ -29,7 +29,7 @@ import { sfxClipTimelineEnd } from "@/lib/repurpose/sfx-clips";
 import { resolveSfxSource } from "@/lib/repurpose/sfx-source";
 import { isApprovedSfxKey, SFX_CATALOG } from "@/lib/repurpose/sfx-effects";
 import { SFX_DRAG_MIME, type SfxDragPayload } from "@/lib/repurpose/sfx-drag";
-import { classifySfxFile, importSfxFile, type SfxImportOwner } from "@/lib/repurpose/sfx-ingest-client";
+import { importSfxFile, isAudioLikeFile, type SfxImportOwner } from "@/lib/repurpose/sfx-ingest-client";
 import {
   ingestOverlayFiles,
   type OverlayImportOwner,
@@ -66,6 +66,7 @@ import {
   snapTime,
   snapMovedSpan,
 } from "./timeline-utils";
+import { focusSfxTimelineTarget } from "./sfx-focus";
 
 export interface TimelineProps {
   /** Optional height override for the whole widget; defaults to fitting 3 tracks + ruler. */
@@ -479,8 +480,8 @@ export function Timeline({
       }
       const files = Array.from(e.dataTransfer.files ?? []);
       if (files.length === 0) return;
-      const audioFiles = files.filter(classifySfxFile);
-      const overlayFiles = files.filter((file) => !classifySfxFile(file));
+      const audioFiles = files.filter(isAudioLikeFile);
+      const overlayFiles = files.filter((file) => !isAudioLikeFile(file));
       if (audioFiles.length > 0 && sfxImportOwner) {
         setSfxDropError(null);
         void (async () => {
@@ -507,6 +508,16 @@ export function Timeline({
     },
     [dragCarriesFiles, dragCarriesSfx, overlayImportOwner, sfxImportOwner, snappedDropTime]
   );
+
+  const deleteSfxClipAndRestoreFocus = useCallback((id: string) => {
+    const state = useRepurposeStore.getState();
+    const index = state.sfxClips.findIndex((clip) => clip.id === id);
+    if (index < 0) return;
+    const nearest = state.sfxClips[index + 1] ?? state.sfxClips[index - 1] ?? null;
+    removeSfxClip(id);
+    selectSfxClip(nearest?.id ?? null);
+    focusSfxTimelineTarget(nearest?.id ?? null);
+  }, [removeSfxClip, selectSfxClip]);
 
   // ---- zoom -----------------------------------------------------------------
   // Zoom ANCHORED ON THE PLAYHEAD: the frame under the play mark must stay put on
@@ -1100,11 +1111,7 @@ export function Timeline({
       const sfxState = useRepurposeStore.getState();
       if ((e.key === "Delete" || e.key === "Backspace") && sfxState.selectedSfxClipId) {
         e.preventDefault();
-        const index = sfxState.sfxClips.findIndex((clip) => clip.id === sfxState.selectedSfxClipId);
-        const nearest = sfxState.sfxClips[index + 1] ?? sfxState.sfxClips[index - 1] ?? null;
-        removeSfxClip(sfxState.selectedSfxClipId);
-        selectSfxClip(nearest?.id ?? null);
-        if (nearest) requestAnimationFrame(() => document.querySelector<HTMLElement>(`[data-sfx-clip-id="${nearest.id}"]`)?.focus());
+        deleteSfxClipAndRestoreFocus(sfxState.selectedSfxClipId);
         return;
       }
       if ((e.metaKey || e.ctrlKey) && e.code === "KeyD" && sfxState.selectedSfxClipId) {
@@ -1112,7 +1119,7 @@ export function Timeline({
         const id = duplicateSfxClip(sfxState.selectedSfxClipId);
         if (id) {
           selectSfxClip(id);
-          requestAnimationFrame(() => document.querySelector<HTMLElement>(`[data-sfx-clip-id="${id}"]`)?.focus());
+          focusSfxTimelineTarget(id);
         }
         return;
       }
@@ -1187,6 +1194,7 @@ export function Timeline({
     removeOverlay,
     removeSfxClip,
     duplicateSfxClip,
+    deleteSfxClipAndRestoreFocus,
     selectSfxClip,
     fitToWindow,
     zoomToSelection,
@@ -1687,6 +1695,10 @@ export function Timeline({
                   below the picture and music tracks. */}
                <div
                  data-testid="sfx-row"
+                 data-sfx-focus-fallback
+                 role="region"
+                 aria-label="Sound effects timeline"
+                 tabIndex={0}
                  className="absolute left-0 right-0 border-b border-emerald-500/25"
                  style={{ top: audioRowTop, height: sfxRowHeight }}
                >
@@ -1708,7 +1720,7 @@ export function Timeline({
                      onSelect={selectSfxClip}
                      onBodyPointerDown={handleSfxBodyDragStart}
                      onEdgePointerDown={handleSfxEdgeDragStart}
-                     onDelete={removeSfxClip}
+                     onDelete={deleteSfxClipAndRestoreFocus}
                    />
                  ))}
                </div>

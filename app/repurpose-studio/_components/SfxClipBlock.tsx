@@ -72,7 +72,9 @@ export function SfxClipBlock(props: SfxClipBlockProps) {
         type="button"
         aria-label={`Select ${label}`}
         aria-pressed={selected}
+        data-sfx-select-id={clip.id}
         className="absolute inset-0 z-10 flex items-center overflow-hidden px-2 text-left"
+        onFocus={() => props.onSelect(clip.id)}
         onClick={(event) => {
           event.stopPropagation();
           props.onSelect(clip.id);

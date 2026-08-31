@@ -185,7 +185,7 @@ test("an SFX drag does not snap back to its own live edge", () => {
   expect(useRepurposeStore.getState().sfxClips[0].timelineStart).toBeCloseTo(15 / 90, 5);
 });
 
-test("surfaces an external SFX drop failure and allows a successful retry", async () => {
+test.each(["ogg", "aac"])("reports an unsupported .%s audio drop and allows a supported retry", async (extension) => {
   const owner = registerSfxImportOwner(createSfxImportOwner("timeline-project"));
   class AudioContextMock {
     decodeAudioData = vi.fn().mockResolvedValue({ duration: 1 });
@@ -193,10 +193,6 @@ test("surfaces an external SFX drop failure and allows a successful retry", asyn
   }
   vi.stubGlobal("AudioContext", AudioContextMock);
   const fetchMock = vi.fn()
-    .mockResolvedValueOnce(new Response(JSON.stringify({ ok: false, error: "disk full" }), {
-      status: 507,
-      headers: { "Content-Type": "application/json" },
-    }))
     .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true, path: "C:\\audio\\retry.wav" }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
@@ -206,19 +202,22 @@ test("surfaces an external SFX drop failure and allows a successful retry", asyn
   useRepurposeStore.setState({ clips, duration: 2 });
   const { getByTestId } = render(<Timeline sfxImportOwner={owner} />);
   const target = getByTestId("sfx-row").parentElement as HTMLElement;
-  const file = new File(["x"], "retry.wav", { type: "audio/wav" });
-  const dataTransfer = { types: ["Files"], files: [file], getData: () => "", dropEffect: "none" };
-  const dropFile = () => {
+  const dropFile = (file: File) => {
+    const dataTransfer = { types: ["Files"], files: [file], getData: () => "", dropEffect: "none" };
     const event = createEvent.drop(target, { dataTransfer });
     Object.defineProperty(event, "clientX", { value: 0 });
     fireEvent(target, event);
   };
 
-  dropFile();
-  await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/retry\.wav.*disk full/i));
+  dropFile(new File(["x"], `unsupported.${extension}`, { type: `audio/${extension}` }));
+  await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(
+    new RegExp(`unsupported\\.${extension}.*choose a \\.wav, \\.mp3, or \\.m4a`, "i")
+  ));
   expect(useRepurposeStore.getState().sfxClips).toEqual([]);
+  expect(useRepurposeStore.getState().overlays).toEqual([]);
+  expect(fetchMock).not.toHaveBeenCalled();
 
-  dropFile();
+  dropFile(new File(["x"], "retry.wav", { type: "audio/wav" }));
   await waitFor(() => {
     const retryError = screen.queryByRole("alert");
     if (retryError) throw new Error(retryError.textContent ?? "retry failed");

@@ -39,6 +39,9 @@ export function useSfxPreview(
     documentToken: number;
     projectEpoch: number;
     revision: number;
+    playhead: number;
+    contextTime: number;
+    playbackRate: number;
   } | null>(null);
   const tokenRef = useRef(0);
   const documentTokenRef = useRef(0);
@@ -138,6 +141,9 @@ export function useSfxPreview(
       documentToken: documentTokenRef.current,
       projectEpoch: state.projectEpoch,
       revision: state.sfxDocumentRevision,
+      playhead: state.playhead,
+      contextTime: context.currentTime,
+      playbackRate: state.playbackRate > 0 ? state.playbackRate : 1,
     };
     operationRef.current = operation;
     warningRef.current(null);
@@ -222,7 +228,17 @@ export function useSfxPreview(
     let previous = useRepurposeStore.getState();
     const unsubscribe = useRepurposeStore.subscribe((state) => {
       const playChanged = state.isPlaying !== previous.isPlaying;
-      const seeked = state.isPlaying && Math.abs(state.playhead - previous.playhead) > SEEK_JUMP_SEC;
+      const operation = operationRef.current;
+      const context = contextRef.current;
+      const expectedPlayhead = operation && context
+        ? operation.playhead
+          + Math.max(0, context.currentTime - operation.contextTime) * operation.playbackRate
+        : state.playhead;
+      const seeked = state.isPlaying
+        && operation !== null
+        && Math.abs(state.playhead - expectedPlayhead) > SEEK_JUMP_SEC;
+      const pausedSeeked = !state.isPlaying
+        && Math.abs(state.playhead - previous.playhead) > 0.001;
       const rateChanged = state.playbackRate !== previous.playbackRate;
       const revisionChanged = state.sfxDocumentRevision !== previous.sfxDocumentRevision;
       const projectChanged = state.projectEpoch !== previous.projectEpoch;
@@ -233,6 +249,8 @@ export function useSfxPreview(
         invalidateSchedule();
       } else if (playChanged || seeked || rateChanged) {
         schedule();
+      } else if (pausedSeeked) {
+        invalidateSchedule();
       }
       previous = state;
     });

@@ -58,7 +58,12 @@ import { overlayUrlForPath } from "./overlay-ingest";
 import { effectiveSplitRatio } from "./split-ratio";
 import { resolveOverlayAppearanceAt } from "./overlay-effects";
 import type { Clip, FootageMeta, MusicTrack, Overlay, SfxAsset, SfxClip } from "./types";
-import { mixPreparedSfxIntoBuffer, prepareSfxForExport } from "./sfx-export";
+import {
+  clampPcmChannels,
+  mixPreparedSfxIntoBuffer,
+  prepareSfxForExport,
+  sumPcmChannels,
+} from "./sfx-export";
 export { mixSfxClipsPcm } from "./sfx-export";
 
 /**
@@ -1131,6 +1136,13 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
         abortSignal
       );
     }
+    if (audioBuffer) {
+      const completedAudio = audioBuffer;
+      clampPcmChannels(Array.from(
+        { length: completedAudio.numberOfChannels },
+        (_, channel) => completedAudio.getChannelData(channel)
+      ));
+    }
   } catch (err) {
     if (isAbortError(err) || abortSignal?.aborted) throw err;
     // Layer mixers are best-effort already, but keep an outer boundary so an
@@ -1390,8 +1402,8 @@ export async function assembleClipAudio(
  *    silent bed sized `duration` at 48000/2ch is created so a music-only reel
  *    still exports.
  *  - Only samples that land WITHIN the base buffer are written; music that runs
- *    past the reel end is clipped. After summing, every touched sample is HARD-
- *    CLAMPED to [-1, 1] (additive mix can exceed full scale; no limiter upstream).
+ *    past the reel end is clipped. Clamping is deferred until narration, music,
+ *    and every SFX contribution have been summed.
  *
  * Best-effort: any decode/resample failure logs a warning and returns `base`
  * unchanged so music never fails the export.
@@ -1475,19 +1487,14 @@ async function mixMusicIntoBuffer(
 
     // How many resampled samples fit between writeStart and the reel end -- clip
     // any music that runs past the end.
-    const sumLen = Math.min(resampled.length, targetFrames - writeStart);
-    for (let ch = 0; ch < targetChannels; ch++) {
-      const srcCh = ch < resampled.numberOfChannels ? ch : 0;
-      const srcData = resampled.getChannelData(srcCh);
-      const dstData = out.getChannelData(ch);
-      for (let i = 0; i < sumLen; i++) {
-        // Sum then HARD-CLAMP to [-1, 1] -- additive mix can exceed full scale.
-        let v = dstData[writeStart + i] + srcData[i];
-        if (v > 1) v = 1;
-        else if (v < -1) v = -1;
-        dstData[writeStart + i] = v;
-      }
-    }
+    sumPcmChannels(
+      Array.from({ length: targetChannels }, (_, channel) => out.getChannelData(channel)),
+      Array.from(
+        { length: resampled.numberOfChannels },
+        (_, channel) => resampled.getChannelData(channel)
+      ),
+      writeStart
+    );
 
     return out;
   } catch (err) {
