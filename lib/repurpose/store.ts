@@ -2192,22 +2192,28 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     for (const listener of sfxGestureCancellationListeners) listener();
   };
 
+  const restoreSfxGesture = (
+    gesture: NonNullable<typeof activeSfxGesture>
+  ): void => {
+    const state = get();
+    const documentChanged = !sfxDocumentEqual(state.sfxClips, gesture.sfxClips);
+    set({
+      sfxClips: gesture.sfxClips,
+      past: gesture.past,
+      future: gesture.future,
+      sfxDocumentRevision: state.sfxDocumentRevision + (documentChanged ? 1 : 0),
+      selectedSfxClipId: state.selectedSfxClipId !== null
+        && gesture.sfxClips.some((clip) => clip.id === state.selectedSfxClipId)
+        ? state.selectedSfxClipId
+        : null,
+    });
+  };
+
   const cancelActiveSfxGesture = (signal = true): boolean => {
     const gesture = activeSfxGesture;
     if (!gesture) return false;
     activeSfxGesture = null;
-    if (gesture.historyCommitted) {
-      set({
-        sfxClips: gesture.sfxClips,
-        past: gesture.past,
-        future: gesture.future,
-        sfxDocumentRevision: get().sfxDocumentRevision + 1,
-        selectedSfxClipId: get().selectedSfxClipId !== null
-          && gesture.sfxClips.some((clip) => clip.id === get().selectedSfxClipId)
-          ? get().selectedSfxClipId
-          : null,
-      });
-    }
+    if (gesture.historyCommitted) restoreSfxGesture(gesture);
     if (signal) signalSfxGestureCancellation();
     return true;
   };
@@ -2230,10 +2236,11 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
   };
 
   const constrainCurrentSfxToDuration = (
-    duration: number
+    duration: number,
+    sourceClips = get().sfxClips
   ): Partial<RepurposeState> => {
     const state = get();
-    const sfxClips = constrainSfxClipsToDuration(state.sfxClips, duration);
+    const sfxClips = constrainSfxClipsToDuration(sourceClips, duration);
     if (sfxDocumentEqual(sfxClips, state.sfxClips)) return {};
     return {
       sfxClips,
@@ -2414,18 +2421,25 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     const state = get();
     const explicitSfxDocument = hydrationSfxClipsBaseline !== null
       && state.sfxClips !== hydrationSfxClipsBaseline;
-    const migrated = hydrationSfxClipsBaseline !== null
+    const shouldMigrateLegacyTrack = hydrationSfxClipsBaseline !== null
       && !explicitSfxDocument
       && state.sfxTrack !== null
-      && state.sfxClips.length === 0
+      && state.sfxClips.length === 0;
+    const legacyTrack = shouldMigrateLegacyTrack ? state.sfxTrack : null;
+    const legacyClip = legacyTrack !== null
       ? migrateLegacySfxTrack(
-          state.sfxTrack,
-          state.duration,
-          nextAvailableSfxClipId(new Set(state.sfxClips.map((clip) => clip.id)))
+          legacyTrack,
+          state.duration
         )
       : null;
+    const migrated = legacyClip
+      ? {
+          ...legacyClip,
+          id: nextAvailableSfxClipId(new Set(state.sfxClips.map((clip) => clip.id))),
+        }
+      : null;
     const sfxClips = migrated ? [migrated] : state.sfxClips;
-    const synchronizeRuntime = explicitSfxDocument || migrated !== null;
+    const synchronizeRuntime = explicitSfxDocument || shouldMigrateLegacyTrack;
     const documentChanged = hydrationSfxClipsBaseline !== null
       && !sfxDocumentEqual(sfxClips, hydrationSfxClipsBaseline);
     reseedIdCounters({ sfxClips });
@@ -2961,7 +2975,8 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
   trimClip: (id, edge, target) => {
     // Coalesce the whole trim drag (one edge of one clip) into a single step.
     get().commitHistory(`trim:${id}:${edge}`);
-    const { clips } = get();
+    const { clips, past } = get();
+    const sfxBaseline = past[past.length - 1]?.sfxClips ?? get().sfxClips;
     const updated = clips.map((c) => {
       if (c.id !== id) return c;
       if (edge === "start") {
@@ -2978,7 +2993,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     set({
       clips: laidOut,
       duration,
-      ...constrainCurrentSfxToDuration(duration),
+      ...constrainCurrentSfxToDuration(duration, sfxBaseline),
     });
   },
 
@@ -4375,8 +4390,15 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     });
   },
   endSfxGesture: (token) => {
-    if (activeSfxGesture?.token !== token) return;
+    const gesture = activeSfxGesture;
+    if (gesture?.token !== token) return;
     activeSfxGesture = null;
+    if (
+      gesture.historyCommitted
+      && sfxDocumentEqual(get().sfxClips, gesture.sfxClips)
+    ) {
+      restoreSfxGesture(gesture);
+    }
   },
   cancelSfxGesture: (token) => {
     if (activeSfxGesture?.token !== token) return;

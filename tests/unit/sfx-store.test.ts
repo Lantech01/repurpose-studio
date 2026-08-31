@@ -460,6 +460,36 @@ describe("temporary legacy bridge", () => {
       future: [],
     });
   });
+
+  it("clears a track-only hydration when zero project duration prevents migration", () => {
+    useRepurposeStore.getState().setHydrating(true);
+    useRepurposeStore.getState().resetProject();
+    useRepurposeStore.setState({ sfxTrack: track });
+
+    useRepurposeStore.getState().setHydrating(false);
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      duration: 0,
+      sfxClips: [],
+      sfxTrack: null,
+    });
+  });
+
+  it("clears a track-only hydration when the legacy track is invalid", () => {
+    useRepurposeStore.getState().setHydrating(true);
+    useRepurposeStore.getState().resetProject();
+    useRepurposeStore.getState().setClips([scene(10)]);
+    useRepurposeStore.setState({
+      sfxTrack: { ...track, gain: Number.NaN },
+    });
+
+    useRepurposeStore.getState().setHydrating(false);
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      sfxClips: [],
+      sfxTrack: null,
+    });
+  });
 });
 
 describe("SFX selection ownership", () => {
@@ -587,6 +617,34 @@ describe("SFX gesture ownership", () => {
   });
 
   it.each([
+    ["move", 4, 1],
+    ["gain", 1.8, 1],
+    ["fade-in", 0.75, 0],
+  ] as const)(
+    "collapses an explicit %s gesture back to a true no-op",
+    (kind, away, original) => {
+      useRepurposeStore.getState().addMarker(1);
+      useRepurposeStore.getState().undo();
+      const baseline = useRepurposeStore.getState();
+      const baselineClips = baseline.sfxClips;
+      const baselinePast = baseline.past;
+      const baselineFuture = baseline.future;
+      const baselineRevision = baseline.sfxDocumentRevision;
+      const token = baseline.beginSfxGesture("sfx-test", kind) as string;
+
+      useRepurposeStore.getState().updateSfxGesture(token, away);
+      useRepurposeStore.getState().updateSfxGesture(token, original);
+      useRepurposeStore.getState().endSfxGesture(token);
+
+      const state = useRepurposeStore.getState();
+      expect(state.sfxClips).toBe(baselineClips);
+      expect(state.past).toBe(baselinePast);
+      expect(state.future).toBe(baselineFuture);
+      expect(state.sfxDocumentRevision).toBe(baselineRevision + 2);
+    }
+  );
+
+  it.each([
     ["left-trim", 1.5, { timelineStart: 1.5, sourceStart: 0.5 }],
     ["right-trim", 3, { sourceEnd: 2 }],
     ["gain", 1.4, { gain: 1.4 }],
@@ -627,6 +685,8 @@ describe("SFX gesture ownership", () => {
     useRepurposeStore.getState().updateSfxGesture(first, 4);
     const second = useRepurposeStore.getState().beginSfxGesture("sfx-test", "move") as string;
     useRepurposeStore.getState().updateSfxGesture(first, 5);
+    useRepurposeStore.getState().cancelSfxGesture(first);
+    useRepurposeStore.getState().endSfxGesture(first);
     useRepurposeStore.getState().updateSfxGesture(second, 2);
     useRepurposeStore.getState().endSfxGesture(second);
 
@@ -680,6 +740,54 @@ describe("SFX gesture ownership", () => {
 });
 
 describe("duration ownership", () => {
+  it("constrains a coalesced scene trim from its original SFX snapshot", () => {
+    useRepurposeStore.setState({
+      sfxClips: [
+        sfx({ timelineStart: 3, sourceEnd: 4 }),
+        sfx({ id: "sfx-late", timelineStart: 6, sourceEnd: 2 }),
+      ],
+      past: [],
+      future: [],
+    });
+
+    useRepurposeStore.getState().trimClip("scene", "end", 4);
+    useRepurposeStore.getState().trimClip("scene", "end", 8);
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      duration: 8,
+      sfxClips: [
+        expect.objectContaining({ id: "sfx-test", timelineStart: 3, sourceEnd: 4 }),
+        expect.objectContaining({ id: "sfx-late", timelineStart: 6, sourceEnd: 2 }),
+      ],
+      past: [expect.any(Object)],
+    });
+  });
+
+  it("keeps a finalized scene-trim constraint destructive when duration grows later", () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    useRepurposeStore.setState({
+      sfxClips: [
+        sfx({ timelineStart: 3, sourceEnd: 4 }),
+        sfx({ id: "sfx-late", timelineStart: 6, sourceEnd: 2 }),
+      ],
+      past: [],
+      future: [],
+    });
+
+    useRepurposeStore.getState().trimClip("scene", "end", 4);
+    now.mockReturnValue(2_000);
+    useRepurposeStore.getState().trimClip("scene", "end", 8);
+    now.mockRestore();
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      duration: 8,
+      sfxClips: [
+        expect.objectContaining({ id: "sfx-test", timelineStart: 3, sourceEnd: 1 }),
+      ],
+      past: [expect.any(Object), expect.any(Object)],
+    });
+  });
+
   it("constrains SFX in the same scene-trim snapshot and restores both on Undo", () => {
     useRepurposeStore.setState({
       sfxClips: [sfx({ timelineStart: 3, sourceEnd: 4 })],
