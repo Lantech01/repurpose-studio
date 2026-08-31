@@ -194,7 +194,7 @@ describe("resolved SFX audio loading", () => {
       .rejects.toThrow(/duration/i);
   });
 
-  it("rejects aborted work before fetch and after an uncancellable decode", async () => {
+  it("rejects aborted work before fetch and promptly during an uncancellable decode", async () => {
     const before = new AbortController();
     before.abort();
     const resolved = resolveSfxSource({ kind: "legacy", sourcePath: "C:\\old.wav", srcDuration: 1 }, []);
@@ -208,10 +208,43 @@ describe("resolved SFX audio loading", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(new ArrayBuffer(1))));
     vi.mocked(context.decodeAudioData).mockReturnValue(new Promise((resolve) => { finishDecode = resolve; }));
     const during = new AbortController();
+    const removeAbortListener = vi.spyOn(during.signal, "removeEventListener");
+    let staleSuccess = false;
     const pending = loadResolvedSfxAudio(resolved, context, during.signal);
+    void pending.then(() => { staleSuccess = true; }, () => {});
     await vi.waitFor(() => expect(context.decodeAudioData).toHaveBeenCalled());
     during.abort();
+
+    await expect(Promise.race([
+      pending,
+      new Promise((resolve) => setTimeout(() => resolve("decode still pending"), 20)),
+    ])).rejects.toMatchObject({ name: "AbortError" });
+    expect(removeAbortListener).toHaveBeenCalledWith("abort", expect.any(Function));
+
     finishDecode(audioBuffer([[0.2]], 1, 1));
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    await Promise.resolve();
+    expect(staleSuccess).toBe(false);
+  });
+
+  it("consumes a late decode rejection after prompt abort rejection", async () => {
+    const resolved = resolveSfxSource({ kind: "legacy", sourcePath: "C:\\old.wav", srcDuration: 1 }, []);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(new ArrayBuffer(1))));
+    let rejectDecode!: (error: Error) => void;
+    const context = {
+      decodeAudioData: vi.fn().mockReturnValue(new Promise((_resolve, reject) => { rejectDecode = reject; })),
+    } as unknown as BaseAudioContext;
+    const controller = new AbortController();
+    const pending = loadResolvedSfxAudio(resolved, context, controller.signal);
+    await vi.waitFor(() => expect(context.decodeAudioData).toHaveBeenCalled());
+
+    controller.abort();
+    await expect(Promise.race([
+      pending,
+      new Promise((resolve) => setTimeout(() => resolve("decode still pending"), 20)),
+    ])).rejects.toMatchObject({ name: "AbortError" });
+    rejectDecode(new Error("late decode failure"));
+    await Promise.resolve();
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
   });
 });

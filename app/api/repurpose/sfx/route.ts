@@ -773,6 +773,7 @@ export async function GET(request: Request): Promise<Response> {
 
   const rawPath = params.get("path");
   if (rawPath === null) return new Response("Supply exactly one SFX source", { status: 400 });
+  if (rawPath === "") return new Response("Missing ?path", { status: 400 });
   const candidate = generatedWavCandidate(rawPath);
   if (!candidate) return new Response("Not found", { status: 404 });
   let leasedPath = candidate;

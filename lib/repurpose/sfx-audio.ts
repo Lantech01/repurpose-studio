@@ -77,6 +77,41 @@ function verifyDecodedBuffer(buffer: AudioBuffer): void {
   }
 }
 
+function decodeAudioDataWithAbort(
+  context: BaseAudioContext,
+  bytes: ArrayBuffer,
+  signal: AbortSignal
+): Promise<AudioBuffer> {
+  signal.throwIfAborted();
+  const decode = context.decodeAudioData(bytes);
+  return new Promise<AudioBuffer>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    void decode.then(
+      (buffer) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(buffer);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      }
+    );
+    if (signal.aborted) onAbort();
+  });
+}
+
 export async function loadResolvedSfxAudio(
   source: ResolvedSfxSource,
   context: BaseAudioContext,
@@ -90,7 +125,7 @@ export async function loadResolvedSfxAudio(
   if (!response.ok) throw new Error(`SFX source request failed with HTTP ${response.status}`);
   const bytes = await response.arrayBuffer();
   signal.throwIfAborted();
-  const buffer = await context.decodeAudioData(bytes);
+  const buffer = await decodeAudioDataWithAbort(context, bytes, signal);
   signal.throwIfAborted();
   verifyDecodedBuffer(buffer);
 

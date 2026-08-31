@@ -206,6 +206,16 @@ describe("SFX route", () => {
     expect((await route.GET(new Request(`http://localhost/api/repurpose/sfx${query}`))).status).toBe(400);
   });
 
+  it("preserves the legacy 400 response for an explicitly empty path", async () => {
+    const cacheDir = path.join(await tempDir("repurpose-sfx-empty-path-cache-"), "cache");
+    const route = await loadRoute(cacheDir);
+
+    const response = await route.GET(new Request("http://localhost/api/repurpose/sfx?path="));
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("Missing ?path");
+  });
+
   it.each([
     "unknown",
     "../ding",
