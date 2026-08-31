@@ -16,11 +16,12 @@ vi.mock("@/app/repurpose-studio/_components/TransportBar", () => ({
   TransportBar: () => null,
 }));
 vi.mock("@/app/repurpose-studio/_components/SfxClipBlock", () => ({
-  SfxClipBlock: ({ clip, top, onSelect, onBodyPointerDown }: { clip: SfxClip; top: number; onSelect: (id: string) => void; onBodyPointerDown: (clip: SfxClip, clientX: number) => void }) => (
-    <button data-testid={`sfx-${clip.id}`} data-top={top} data-sfx-clip-id={clip.id} onClick={() => onSelect(clip.id)} onPointerDown={(event) => { event.stopPropagation(); onBodyPointerDown(clip, event.clientX); }}>{clip.name}</button>
+  SfxClipBlock: ({ clip, top, onSelect, onBodyPointerDown }: { clip: SfxClip; top: number; onSelect: (id: string) => void; onBodyPointerDown: (clip: SfxClip, pointer: { clientX: number; pointerId: number; captureTarget: HTMLButtonElement }) => void }) => (
+    <button data-testid={`sfx-${clip.id}`} data-top={top} data-sfx-clip-id={clip.id} onClick={() => onSelect(clip.id)} onPointerDown={(event) => { event.stopPropagation(); onBodyPointerDown(clip, { clientX: event.clientX, pointerId: event.pointerId, captureTarget: event.currentTarget }); }}>{clip.name}</button>
   ),
 }));
-vi.mock("@/app/repurpose-studio/_components/useFaceWaveform", () => ({
+vi.mock("@/app/repurpose-studio/_components/useFaceWaveform", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/app/repurpose-studio/_components/useFaceWaveform")>(),
   useFaceWaveform: () => null,
   useAudioWaveform: () => null,
   sliceClipPeaks: () => [],

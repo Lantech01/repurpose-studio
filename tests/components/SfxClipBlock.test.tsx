@@ -27,7 +27,11 @@ const editProps = {
   onTrimBy: vi.fn(),
 };
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 describe("SfxClipBlock", () => {
   it("uses a non-interactive group with separate focusable controls and announces state", () => {
@@ -93,8 +97,14 @@ describe("SfxClipBlock", () => {
     fireEvent.pointerDown(screen.getByLabelText("Trim Whoosh end"), { clientX: 90 });
     fireEvent.click(screen.getByRole("button", { name: "Delete Whoosh" }));
     expect(onSelect).toHaveBeenCalledWith("sfx-1");
-    expect(onEdgePointerDown).toHaveBeenNthCalledWith(1, clip, "start", 4);
-    expect(onEdgePointerDown).toHaveBeenNthCalledWith(2, clip, "end", 90);
+    expect(onEdgePointerDown).toHaveBeenNthCalledWith(1, clip, "start", expect.objectContaining({
+      clientX: 4,
+      captureTarget: screen.getByLabelText("Trim Whoosh start"),
+    }));
+    expect(onEdgePointerDown).toHaveBeenNthCalledWith(2, clip, "end", expect.objectContaining({
+      clientX: 90,
+      captureTarget: screen.getByLabelText("Trim Whoosh end"),
+    }));
     expect(onDelete).toHaveBeenCalledWith("sfx-1");
   });
 
@@ -149,5 +159,46 @@ describe("SfxClipBlock", () => {
     fireEvent.pointerDown(screen.getByLabelText("Trim Whoosh end"), { button: 2, clientX: 90 });
 
     expect(onEdgePointerDown).not.toHaveBeenCalled();
+  });
+
+  it("bounds waveform sampling and canvas dimensions at extreme zoom and high DPR", () => {
+    const context = {
+      clearRect: vi.fn(),
+      fillRect: vi.fn(),
+      setTransform: vi.fn(),
+      fillStyle: "",
+    };
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(context as never);
+    vi.stubGlobal("devicePixelRatio", 8);
+    const longClip: SfxClip = {
+      ...clip,
+      source: { kind: "imported", assetId: "long", srcDuration: 3600 },
+      sourceStart: 0,
+      sourceEnd: 3600,
+    };
+    const waveform = {
+      duration: 3600,
+      peaks: new Float32Array(4000).fill(0.5),
+    };
+
+    const rendered = render(<SfxClipBlock clip={longClip} left={0} width={3600 * 400} top={0} height={30}
+      selected={false} missing={false} waveform={waveform} onSelect={vi.fn()}
+      onBodyPointerDown={vi.fn()} onEdgePointerDown={vi.fn()} onDelete={vi.fn()} {...editProps} />);
+    const longCanvas = rendered.container.querySelector("canvas") as HTMLCanvasElement;
+
+    expect(longCanvas.style.width).toBe("8192px");
+    expect(longCanvas.style.height).toBe("30px");
+    expect(longCanvas.width).toBeLessThanOrEqual(16384);
+    expect(longCanvas.height).toBeLessThanOrEqual(16384);
+    expect(context.fillRect.mock.calls.length).toBeLessThanOrEqual(4096);
+
+    rendered.rerender(<SfxClipBlock clip={clip} left={0} width={100} top={0} height={30}
+      selected={false} missing={false} waveform={{ duration: 2, peaks: waveform.peaks }} onSelect={vi.fn()}
+      onBodyPointerDown={vi.fn()} onEdgePointerDown={vi.fn()} onDelete={vi.fn()} {...editProps} />);
+    const shortCanvas = rendered.container.querySelector("canvas") as HTMLCanvasElement;
+
+    expect(shortCanvas.style.width).toBe("100px");
+    expect(shortCanvas.width).toBe(200);
+    expect(context.fillRect).toHaveBeenCalled();
   });
 });

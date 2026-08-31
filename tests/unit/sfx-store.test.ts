@@ -345,6 +345,47 @@ describe("runtime SFX document API", () => {
 });
 
 describe("SFX selection ownership", () => {
+  it.each([
+    ["scene", { selectedClipId: "scene" }],
+    ["single overlay", { selectedOverlayId: "overlay" }],
+    ["multi-overlay", { selectedOverlayIds: ["overlay-a", "overlay-b"] }],
+    ["word range", { selectedWordRange: { lo: 0, hi: 1 } }],
+    ["caption", { selectedCaptionBlockId: "caption" }],
+  ])("selects an imported SFX exclusively over a %s selection", (_label, selection) => {
+    useRepurposeStore.setState(selection);
+    const revision = useRepurposeStore.getState().sfxDocumentRevision;
+    const documentObservations: Array<{ assets: number; clips: number }> = [];
+    const unsubscribe = useRepurposeStore.subscribe((state) => {
+      if (state.sfxAssets.length > 0 || state.sfxClips.length > 0) {
+        documentObservations.push({
+          assets: state.sfxAssets.length,
+          clips: state.sfxClips.length,
+        });
+      }
+    });
+
+    const imported = useRepurposeStore.getState().addImportedSfxClip({
+      name: "Imported.wav",
+      sourcePath: "C:\\audio\\imported.wav",
+      srcDuration: 2,
+      atTime: 1,
+    });
+    unsubscribe();
+
+    expect(imported).not.toBeNull();
+    expect(useRepurposeStore.getState()).toMatchObject({
+      selectedSfxClipId: imported?.clipId,
+      selectedClipId: null,
+      selectedOverlayId: null,
+      selectedOverlayIds: [],
+      selectedWordRange: null,
+      selectedCaptionBlockId: null,
+      past: [expect.any(Object)],
+      sfxDocumentRevision: revision + 1,
+    });
+    expect(documentObservations).toEqual([{ assets: 1, clips: 1 }]);
+  });
+
   it("is mutually exclusive with every real competing selection", () => {
     useRepurposeStore.setState({
       sfxClips: [sfx()],

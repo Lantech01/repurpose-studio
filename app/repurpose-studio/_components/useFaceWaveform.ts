@@ -258,6 +258,57 @@ export function useFaceWaveform(footageMeta: FootageMeta | null): FaceWaveform |
   return useAudioWaveform(footageMeta?.faceCamPath || null);
 }
 
+const MAX_WAVEFORM_CSS_WIDTH = 8192;
+const MAX_WAVEFORM_CSS_HEIGHT = 512;
+const MAX_WAVEFORM_BACKING_DIMENSION = 16384;
+const MAX_WAVEFORM_BINS = 4096;
+
+export interface WaveformRenderMetrics {
+  cssWidth: number;
+  cssHeight: number;
+  backingWidth: number;
+  backingHeight: number;
+  scale: number;
+  binCount: number;
+}
+
+/**
+ * Keep waveform canvases below conservative cross-browser limits. At extreme
+ * zoom the bounded canvas is a compressed overview of the full source range;
+ * the timeline block remains full width while waveform allocation stays fixed.
+ */
+export function waveformRenderMetrics(
+  width: number,
+  height: number,
+  devicePixelRatio: number
+): WaveformRenderMetrics {
+  const cssWidth = Math.max(1, Math.min(
+    MAX_WAVEFORM_CSS_WIDTH,
+    Number.isFinite(width) ? Math.floor(width) : 1
+  ));
+  const cssHeight = Math.max(1, Math.min(
+    MAX_WAVEFORM_CSS_HEIGHT,
+    Number.isFinite(height) ? Math.floor(height) : 1
+  ));
+  const requestedScale = Number.isFinite(devicePixelRatio)
+    ? Math.max(1, Math.min(devicePixelRatio, 2))
+    : 1;
+  const scale = Math.min(
+    requestedScale,
+    MAX_WAVEFORM_BACKING_DIMENSION / cssWidth,
+    MAX_WAVEFORM_BACKING_DIMENSION / cssHeight
+  );
+
+  return {
+    cssWidth,
+    cssHeight,
+    backingWidth: Math.max(1, Math.floor(cssWidth * scale)),
+    backingHeight: Math.max(1, Math.floor(cssHeight * scale)),
+    scale,
+    binCount: Math.min(MAX_WAVEFORM_BINS, Math.max(4, Math.round(cssWidth / 2))),
+  };
+}
+
 /**
  * Slice the whole-file peaks for one clip's SOURCE range into `outBins` sample
  * values (absolute-max amplitude per output bin, 0..1). Pure + cheap -- called

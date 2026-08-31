@@ -36,13 +36,14 @@ import {
 } from "@/lib/repurpose/overlay-ingest";
 import { ClipBlock } from "./ClipBlock";
 import { OverlayBlock, useOverlayThumbnails } from "./OverlayBlock";
-import { SfxClipBlock } from "./SfxClipBlock";
+import { SfxClipBlock, type SfxPointerStart } from "./SfxClipBlock";
 import { useSfxWaveform } from "./useSfxWaveform";
 import { TransportBar } from "./TransportBar";
 import {
   useFaceWaveform,
   useAudioWaveform,
   sliceClipPeaks,
+  waveformRenderMetrics,
   type FaceWaveform,
 } from "./useFaceWaveform";
 import {
@@ -117,8 +118,22 @@ type DragKind =
       clip: SfxClip;
       edge: "body" | "start" | "end";
       startClientX: number;
+      pointerId: number;
+      captureTarget: HTMLButtonElement;
       token: string | null;
     };
+
+type SfxDrag = Extract<DragKind, { type: "sfx" }>;
+
+function releaseSfxPointerCapture(drag: SfxDrag): void {
+  try {
+    if (drag.captureTarget.hasPointerCapture(drag.pointerId)) {
+      drag.captureTarget.releasePointerCapture(drag.pointerId);
+    }
+  } catch {
+    // The element may already be detached or capture may have been released by the browser.
+  }
+}
 
 // The Screen + Face recordings are FRAME-LOCKED -- one timeline drives both, so
 // every scene is always the same source range on both tracks. Rendering two
@@ -813,18 +828,49 @@ export function Timeline({
     [stopCoast]
   );
 
-  const handleSfxBodyDragStart = useCallback((clip: SfxClip, clientX: number) => {
+  const handleSfxBodyDragStart = useCallback((clip: SfxClip, pointer: SfxPointerStart) => {
+    if (dragRef.current) return;
     stopCoast();
-    dragRef.current = { type: "sfx", clip, edge: "body", startClientX: clientX, token: null };
+    try {
+      pointer.captureTarget.setPointerCapture(pointer.pointerId);
+    } catch {
+      // Pointer capture is optional in test DOMs and may fail for a detached target.
+    }
+    dragRef.current = {
+      type: "sfx",
+      clip,
+      edge: "body",
+      startClientX: pointer.clientX,
+      pointerId: pointer.pointerId,
+      captureTarget: pointer.captureTarget,
+      token: null,
+    };
   }, [stopCoast]);
 
-  const handleSfxEdgeDragStart = useCallback((clip: SfxClip, edge: "start" | "end", clientX: number) => {
+  const handleSfxEdgeDragStart = useCallback((clip: SfxClip, edge: "start" | "end", pointer: SfxPointerStart) => {
+    if (dragRef.current) return;
     stopCoast();
-    dragRef.current = { type: "sfx", clip, edge, startClientX: clientX, token: null };
+    try {
+      pointer.captureTarget.setPointerCapture(pointer.pointerId);
+    } catch {
+      // Pointer capture is optional in test DOMs and may fail for a detached target.
+    }
+    dragRef.current = {
+      type: "sfx",
+      clip,
+      edge,
+      startClientX: pointer.clientX,
+      pointerId: pointer.pointerId,
+      captureTarget: pointer.captureTarget,
+      token: null,
+    };
   }, [stopCoast]);
 
   useEffect(() => useRepurposeStore.getState().subscribeSfxGestureCancellation(() => {
-    if (dragRef.current?.type === "sfx") dragRef.current = null;
+    if (dragRef.current?.type === "sfx") {
+      releaseSfxPointerCapture(dragRef.current);
+      dragRef.current = null;
+    }
     setSnapGuideX(null);
   }), []);
 
@@ -873,6 +919,7 @@ export function Timeline({
     const handleMove = (e: PointerEvent) => {
       const drag = dragRef.current;
       if (!drag) return;
+      if (drag.type === "sfx" && e.pointerId !== drag.pointerId) return;
       const {
         clientXToTime,
         clips,
@@ -1066,11 +1113,15 @@ export function Timeline({
       }
     };
 
-    const handleUp = () => {
+    const handleUp = (e: PointerEvent) => {
       const drag = dragRef.current;
+      if (drag?.type === "sfx" && e.pointerId !== drag.pointerId) return;
       dragRef.current = null;
       setSnapGuideX(null);
-      if (drag?.type === "sfx" && drag.token) endSfxGesture(drag.token);
+      if (drag?.type === "sfx") {
+        releaseSfxPointerCapture(drag);
+        if (drag.token) endSfxGesture(drag.token);
+      }
       if (drag?.type === "playhead") {
         lastScrubClientXRef.current = null;
         // Hand the release velocity to the standalone coast driver. The coast
@@ -1081,11 +1132,15 @@ export function Timeline({
       }
     };
 
-    const handleCancel = () => {
+    const handleCancel = (e: PointerEvent) => {
       const drag = dragRef.current;
+      if (drag?.type === "sfx" && e.pointerId !== drag.pointerId) return;
       dragRef.current = null;
       setSnapGuideX(null);
-      if (drag?.type === "sfx" && drag.token) cancelSfxGesture(drag.token);
+      if (drag?.type === "sfx") {
+        releaseSfxPointerCapture(drag);
+        if (drag.token) cancelSfxGesture(drag.token);
+      }
     };
 
     window.addEventListener("pointermove", handleMove);
@@ -1096,7 +1151,11 @@ export function Timeline({
       window.removeEventListener("pointerup", handleUp);
       window.removeEventListener("pointercancel", handleCancel);
       const drag = dragRef.current;
-      if (drag?.type === "sfx" && drag.token) cancelSfxGesture(drag.token);
+      if (drag?.type === "sfx") {
+        dragRef.current = null;
+        releaseSfxPointerCapture(drag);
+        if (drag.token) cancelSfxGesture(drag.token);
+      }
       // NOTE: do NOT cancel momentumRafRef here. The coast is owned by its own
       // unmount-only effect (see below); cancelling it on every re-render is
       // exactly the bug this fix removes.
@@ -1880,8 +1939,8 @@ function TimelineSfxBlock({
   onSelect: (id: string) => void;
   onMoveBy: (id: string, delta: number) => void;
   onTrimBy: (id: string, edge: "start" | "end", delta: number) => void;
-  onBodyPointerDown: (clip: SfxClip, clientX: number) => void;
-  onEdgePointerDown: (clip: SfxClip, edge: "start" | "end", clientX: number) => void;
+  onBodyPointerDown: (clip: SfxClip, pointer: SfxPointerStart) => void;
+  onEdgePointerDown: (clip: SfxClip, edge: "start" | "end", pointer: SfxPointerStart) => void;
   onDelete: (id: string) => void;
 }) {
   const source = resolveSfxSource(clip.source, assets);
@@ -1919,28 +1978,23 @@ function TrackWaveform({
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // One bin per ~2 CSS px (same density as the face clips' ClipWaveform).
-  const outBins = Math.max(4, Math.round(width / 2));
+  const renderMetrics = useMemo(() => waveformRenderMetrics(
+    width,
+    height,
+    typeof window === "undefined" ? 1 : window.devicePixelRatio || 1
+  ), [height, width]);
   const peaks = useMemo(
-    () => sliceClipPeaks(waveform, srcStart, srcEnd, outBins),
-    [waveform, srcStart, srcEnd, outBins]
+    () => sliceClipPeaks(waveform, srcStart, srcEnd, renderMetrics.binCount),
+    [waveform, srcStart, srcEnd, renderMetrics.binCount]
   );
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const dpr = Math.min(typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1, 2);
-    const w = Math.max(1, Math.floor(width));
-    const h = Math.max(1, Math.floor(height));
-    // Browsers cap a canvas dimension at ~32767px and this block spans the WHOLE
-    // reel: 60s at max zoom (400px/s) on a 2x display = 48,000 backing px --
-    // past the cap the canvas silently allocates nothing and the waveform
-    // vanishes. Clamp the backing scale so width stays comfortably under it;
-    // bars get slightly softer at extreme zoom instead of disappearing.
-    const scale = Math.min(dpr, 16384 / w);
-    canvas.width = Math.max(1, Math.floor(w * scale));
-    canvas.height = Math.max(1, Math.floor(h * scale));
+    const { backingHeight, backingWidth, cssHeight: h, cssWidth: w, scale } = renderMetrics;
+    canvas.width = backingWidth;
+    canvas.height = backingHeight;
 
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
@@ -1960,7 +2014,7 @@ function TrackWaveform({
       const x = i * barW;
       ctx.fillRect(x, h - amp, Math.max(1, barW * 0.7), amp);
     }
-  }, [peaks, width, height, color]);
+  }, [peaks, renderMetrics, color]);
 
   if (peaks.length === 0) return null;
 
@@ -1970,8 +2024,8 @@ function TrackWaveform({
     // bars must stop at the real audio end, not stretch across the silence.
     <canvas
       ref={canvasRef}
-      className="pointer-events-none absolute left-0 top-0 h-full rounded-md opacity-60"
-      style={{ width }}
+      className="pointer-events-none absolute left-0 top-0 rounded-md opacity-60"
+      style={{ width: renderMetrics.cssWidth, height: renderMetrics.cssHeight }}
       aria-hidden
     />
   );

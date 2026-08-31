@@ -1104,6 +1104,17 @@ function snapshotToPatch(snap: EditableSnapshot): Partial<RepurposeState> {
   };
 }
 
+function exclusiveSfxSelection(selectedSfxClipId: string) {
+  return {
+    selectedSfxClipId,
+    selectedClipId: null,
+    selectedOverlayId: null,
+    selectedOverlayIds: [],
+    selectedWordRange: null,
+    selectedCaptionBlockId: null,
+  };
+}
+
 /**
  * The exact slice of the store that undo/redo tracks -- the "document", i.e.
  * everything an edit changes and that should be restored on undo. Transient
@@ -4212,7 +4223,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
         srcDuration: input.srcDuration,
       }],
       sfxClips: [...state.sfxClips, placed],
-      selectedSfxClipId: clipId,
+      ...exclusiveSfxSelection(clipId),
       sfxDocumentRevision: state.sfxDocumentRevision + 1,
     });
     return { assetId, clipId };
@@ -4275,14 +4286,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       return;
     }
     if (!get().sfxClips.some((clip) => clip.id === id)) return;
-    set({
-      selectedSfxClipId: id,
-      selectedClipId: null,
-      selectedOverlayId: null,
-      selectedOverlayIds: [],
-      selectedWordRange: null,
-      selectedCaptionBlockId: null,
-    });
+    set(exclusiveSfxSelection(id));
   },
 
   moveSfxClip: (id, timelineStart) => {

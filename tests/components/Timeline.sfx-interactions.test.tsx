@@ -14,7 +14,8 @@ vi.mock("@/app/repurpose-studio/_components/OverlayBlock", () => ({
   useOverlayThumbnails: () => new Map(),
 }));
 vi.mock("@/app/repurpose-studio/_components/TransportBar", () => ({ TransportBar: () => null }));
-vi.mock("@/app/repurpose-studio/_components/useFaceWaveform", () => ({
+vi.mock("@/app/repurpose-studio/_components/useFaceWaveform", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/app/repurpose-studio/_components/useFaceWaveform")>(),
   useFaceWaveform: () => null,
   useAudioWaveform: () => null,
   sliceClipPeaks: () => [],
@@ -66,6 +67,71 @@ describe("Timeline real SFX interactions", () => {
 
     expect(useRepurposeStore.getState().sfxClips[0]).toMatchObject(expected);
     expect(useRepurposeStore.getState().past).toHaveLength(1);
+    useRepurposeStore.getState().undo();
+    expect(useRepurposeStore.getState().sfxClips[0]).toMatchObject(effect());
+  });
+
+  it("keeps a body drag owned by its initiating pointer through move, up, and cancel", () => {
+    render(<Timeline />);
+    const body = screen.getByRole("button", { name: /Select Impact/ });
+    const setPointerCapture = vi.fn();
+    const releasePointerCapture = vi.fn();
+    Object.defineProperties(body, {
+      setPointerCapture: { configurable: true, value: setPointerCapture },
+      hasPointerCapture: { configurable: true, value: (pointerId: number) => pointerId === 11 },
+      releasePointerCapture: { configurable: true, value: releasePointerCapture },
+    });
+
+    fireEvent.pointerDown(body, { button: 0, clientX: 90, pointerId: 11 });
+    fireEvent.pointerMove(window, { clientX: 180, pointerId: 22 });
+    fireEvent.pointerUp(window, { pointerId: 22 });
+    fireEvent.pointerCancel(window, { pointerId: 22 });
+
+    expect(useRepurposeStore.getState().sfxClips[0].timelineStart).toBe(1);
+    expect(useRepurposeStore.getState().past).toEqual([]);
+    expect(releasePointerCapture).not.toHaveBeenCalled();
+
+    fireEvent.pointerMove(window, { clientX: 180, pointerId: 11 });
+    expect(useRepurposeStore.getState().sfxClips[0].timelineStart).toBe(2);
+    fireEvent.pointerUp(window, { pointerId: 11 });
+
+    expect(useRepurposeStore.getState().past).toHaveLength(1);
+    expect(setPointerCapture).toHaveBeenCalledWith(11);
+    expect(releasePointerCapture).toHaveBeenCalledWith(11);
+    useRepurposeStore.getState().undo();
+    expect(useRepurposeStore.getState().sfxClips[0]).toMatchObject(effect());
+  });
+
+  it("keeps a trim drag owned by its initiating pointer through move, up, and cancel", () => {
+    render(<Timeline />);
+    const handle = screen.getByRole("slider", { name: "Trim Impact start" });
+    const setPointerCapture = vi.fn();
+    const releasePointerCapture = vi.fn();
+    Object.defineProperties(handle, {
+      setPointerCapture: { configurable: true, value: setPointerCapture },
+      hasPointerCapture: { configurable: true, value: (pointerId: number) => pointerId === 31 },
+      releasePointerCapture: { configurable: true, value: releasePointerCapture },
+    });
+
+    fireEvent.pointerDown(handle, { button: 0, clientX: 90, pointerId: 31 });
+    fireEvent.pointerMove(window, { clientX: 180, pointerId: 32 });
+    fireEvent.pointerUp(window, { pointerId: 32 });
+    fireEvent.pointerCancel(window, { pointerId: 32 });
+
+    expect(useRepurposeStore.getState().sfxClips[0]).toMatchObject(effect());
+    expect(useRepurposeStore.getState().past).toEqual([]);
+    expect(releasePointerCapture).not.toHaveBeenCalled();
+
+    fireEvent.pointerMove(window, { clientX: 135, pointerId: 31 });
+    expect(useRepurposeStore.getState().sfxClips[0]).toMatchObject({
+      timelineStart: 1.5,
+      sourceStart: 0.5,
+    });
+    fireEvent.pointerUp(window, { pointerId: 31 });
+
+    expect(useRepurposeStore.getState().past).toHaveLength(1);
+    expect(setPointerCapture).toHaveBeenCalledWith(31);
+    expect(releasePointerCapture).toHaveBeenCalledWith(31);
     useRepurposeStore.getState().undo();
     expect(useRepurposeStore.getState().sfxClips[0]).toMatchObject(effect());
   });

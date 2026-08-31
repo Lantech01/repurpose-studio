@@ -6,7 +6,17 @@ import { Trash, Warning, SpeakerSlash } from "@phosphor-icons/react";
 import type { SfxClip } from "@/lib/repurpose/types";
 import { sfxClipTimelineEnd } from "@/lib/repurpose/sfx-clips";
 import { formatTimecode } from "./timeline-utils";
-import { sliceClipPeaks, type FaceWaveform } from "./useFaceWaveform";
+import {
+  sliceClipPeaks,
+  waveformRenderMetrics,
+  type FaceWaveform,
+} from "./useFaceWaveform";
+
+export interface SfxPointerStart {
+  clientX: number;
+  pointerId: number;
+  captureTarget: HTMLButtonElement;
+}
 
 export interface SfxClipBlockProps {
   clip: SfxClip;
@@ -23,20 +33,25 @@ export interface SfxClipBlockProps {
   onSelect: (id: string) => void;
   onMoveBy: (id: string, delta: number) => void;
   onTrimBy: (id: string, edge: "start" | "end", delta: number) => void;
-  onBodyPointerDown: (clip: SfxClip, clientX: number) => void;
-  onEdgePointerDown: (clip: SfxClip, edge: "start" | "end", clientX: number) => void;
+  onBodyPointerDown: (clip: SfxClip, pointer: SfxPointerStart) => void;
+  onEdgePointerDown: (clip: SfxClip, edge: "start" | "end", pointer: SfxPointerStart) => void;
   onDelete: (id: string) => void;
 }
 
 export function SfxClipBlock(props: SfxClipBlockProps) {
   const { clip, left, width, top, height, selected, missing, waveform } = props;
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const renderMetrics = useMemo(() => waveformRenderMetrics(
+    width,
+    height,
+    typeof window === "undefined" ? 1 : window.devicePixelRatio || 1
+  ), [height, width]);
   const peaks = useMemo(() => sliceClipPeaks(
     waveform,
     clip.sourceStart,
     clip.sourceEnd,
-    Math.max(4, Math.round(width / 2))
-  ), [clip.sourceEnd, clip.sourceStart, waveform, width]);
+    renderMetrics.binCount
+  ), [clip.sourceEnd, clip.sourceStart, renderMetrics.binCount, waveform]);
   const end = sfxClipTimelineEnd(clip);
   const trimStartMin = Math.max(0, clip.timelineStart - clip.sourceStart);
   const trimStartMax = Math.max(trimStartMin, end - 1 / 1000);
@@ -71,10 +86,10 @@ export function SfxClipBlock(props: SfxClipBlockProps) {
     const canvas = canvasRef.current;
     const context = canvas?.getContext("2d");
     if (!canvas || !context || peaks.length === 0) return;
-    const w = Math.max(1, Math.floor(width));
-    const h = Math.max(1, Math.floor(height));
-    canvas.width = w;
-    canvas.height = h;
+    const { backingHeight, backingWidth, cssHeight: h, cssWidth: w, scale } = renderMetrics;
+    canvas.width = backingWidth;
+    canvas.height = backingHeight;
+    context.setTransform(scale, 0, 0, scale, 0, 0);
     context.clearRect(0, 0, w, h);
     context.fillStyle = "rgba(6, 78, 59, .8)";
     const barWidth = w / peaks.length;
@@ -82,7 +97,7 @@ export function SfxClipBlock(props: SfxClipBlockProps) {
       const barHeight = Math.max(1, peak * (h - 4));
       context.fillRect(index * barWidth, h - barHeight, Math.max(1, barWidth * .7), barHeight);
     });
-  }, [height, peaks, width]);
+  }, [peaks, renderMetrics]);
 
   return (
     <div
@@ -93,7 +108,9 @@ export function SfxClipBlock(props: SfxClipBlockProps) {
       className={`group absolute overflow-hidden rounded border bg-emerald-500/20 text-[10px] text-emerald-100 ${selected ? "border-emerald-200 ring-2 ring-emerald-300/70" : "border-emerald-500/50"}`}
       style={{ left, width: Math.max(6, width), top, height }}
     >
-      {peaks.length > 0 && <canvas ref={canvasRef} aria-hidden className="pointer-events-none absolute inset-0 h-full w-full opacity-60" />}
+      {peaks.length > 0 && <canvas ref={canvasRef} aria-hidden
+        className="pointer-events-none absolute left-0 top-0 opacity-60"
+        style={{ width: renderMetrics.cssWidth, height: renderMetrics.cssHeight }} />}
       <button
         type="button"
         aria-label={`Select ${label}`}
@@ -115,7 +132,11 @@ export function SfxClipBlock(props: SfxClipBlockProps) {
           if (event.button !== 0) return;
           event.stopPropagation();
           props.onSelect(clip.id);
-          props.onBodyPointerDown(clip, event.clientX);
+          props.onBodyPointerDown(clip, {
+            clientX: event.clientX,
+            pointerId: event.pointerId,
+            captureTarget: event.currentTarget,
+          });
         }}
       >
         <span className="relative truncate font-medium">{clip.name}</span>
@@ -128,13 +149,17 @@ export function SfxClipBlock(props: SfxClipBlockProps) {
         className="absolute inset-y-0 left-0 z-20 w-2 border-l-2 border-emerald-200/70"
         onKeyDown={handleTrimKeyDown("start")}
         onClick={(event) => { event.stopPropagation(); props.onSelect(clip.id); }}
-        onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); props.onEdgePointerDown(clip, "start", event.clientX); }} />
+        onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); props.onEdgePointerDown(clip, "start", {
+          clientX: event.clientX, pointerId: event.pointerId, captureTarget: event.currentTarget,
+        }); }} />
       <button type="button" role="slider" aria-label={`Trim ${clip.name} end`}
         aria-valuemin={trimEndMin} aria-valuemax={trimEndMax} aria-valuenow={end}
         className="absolute inset-y-0 right-0 z-20 w-2 border-r-2 border-emerald-200/70"
         onKeyDown={handleTrimKeyDown("end")}
         onClick={(event) => { event.stopPropagation(); props.onSelect(clip.id); }}
-        onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); props.onEdgePointerDown(clip, "end", event.clientX); }} />
+        onPointerDown={(event) => { if (event.button !== 0) return; event.stopPropagation(); props.onEdgePointerDown(clip, "end", {
+          clientX: event.clientX, pointerId: event.pointerId, captureTarget: event.currentTarget,
+        }); }} />
       <button type="button" aria-label={`Delete ${clip.name}`} className="absolute right-2 top-1/2 z-30 -translate-y-1/2 rounded bg-black/70 p-0.5 opacity-0 group-hover:opacity-100 focus:opacity-100"
         onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); props.onDelete(clip.id); }}><Trash size={11} /></button>
     </div>
