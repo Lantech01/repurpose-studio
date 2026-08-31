@@ -384,6 +384,82 @@ describe("temporary legacy bridge", () => {
 
     expect(useRepurposeStore.getState().sfxTrack).toBeNull();
   });
+
+  it("migrates a track-only project replacement before establishing history", () => {
+    const beforeRevision = useRepurposeStore.getState().sfxDocumentRevision;
+    useRepurposeStore.getState().setHydrating(true);
+    useRepurposeStore.getState().resetProject();
+    useRepurposeStore.getState().setClips([scene(10)]);
+    useRepurposeStore.setState({ sfxTrack: track });
+    useRepurposeStore.getState().setHydrating(false);
+
+    let state = useRepurposeStore.getState();
+    expect(state.sfxClips).toEqual([
+      expect.objectContaining({
+        id: expect.stringMatching(/^sfx-clip-/),
+        name: "Legacy Sound Effects",
+        origin: "automatic",
+        source: {
+          kind: "legacy",
+          sourcePath: track.sourcePath,
+          srcDuration: track.durationSec,
+        },
+        sourceEnd: track.durationSec,
+        gain: track.gain,
+      }),
+    ]);
+    expect(state.sfxTrack).toEqual({
+      src: `/api/repurpose/sfx?path=${encodeURIComponent(track.sourcePath)}`,
+      sourcePath: track.sourcePath,
+      durationSec: track.durationSec,
+      gain: track.gain,
+    });
+    expect(state.past).toEqual([]);
+    expect(state.sfxDocumentRevision).toBeGreaterThan(beforeRevision);
+
+    state.addMarker(1);
+    state = useRepurposeStore.getState();
+    expect(state.past).toHaveLength(1);
+    state.undo();
+    expect(useRepurposeStore.getState()).toMatchObject({
+      sfxClips: [expect.objectContaining({ origin: "automatic" })],
+      sfxTrack: expect.objectContaining({
+        sourcePath: track.sourcePath,
+        gain: track.gain,
+      }),
+      past: [],
+    });
+    useRepurposeStore.getState().redo();
+    expect(useRepurposeStore.getState()).toMatchObject({
+      sfxClips: [expect.objectContaining({ origin: "automatic" })],
+      sfxTrack: expect.objectContaining({ sourcePath: track.sourcePath }),
+      past: [expect.any(Object)],
+    });
+
+    const migratedId = useRepurposeStore.getState().sfxClips[0].id;
+    const addedId = useRepurposeStore.getState().addSfxClip({
+      name: "Next",
+      source: { kind: "built-in", key: "ding" },
+      atTime: 2,
+    });
+    expect(addedId).not.toBe(migratedId);
+  });
+
+  it("treats an explicit empty SFX document as authoritative over a stale track", () => {
+    useRepurposeStore.getState().setHydrating(true);
+    useRepurposeStore.getState().resetProject();
+    useRepurposeStore.getState().setClips([scene(10)]);
+    useRepurposeStore.setState({ sfxTrack: track, sfxClips: [] });
+
+    useRepurposeStore.getState().setHydrating(false);
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      sfxClips: [],
+      sfxTrack: null,
+      past: [],
+      future: [],
+    });
+  });
 });
 
 describe("SFX selection ownership", () => {

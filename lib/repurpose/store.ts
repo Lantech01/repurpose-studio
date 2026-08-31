@@ -1999,6 +1999,8 @@ const MIN_PLAYBACK_RATE = PLAYBACK_RATES[0];
 const MAX_PLAYBACK_RATE = PLAYBACK_RATES[PLAYBACK_RATES.length - 1];
 
 export const useRepurposeStore = create<RepurposeState>((set, get) => {
+  // A restored array has a distinct identity even when it is explicitly empty.
+  let hydrationSfxClipsBaseline: SfxClip[] | null = null;
   let splitRatioGestureCounter = 0;
   const splitRatioGestureCancellationListeners = new Set<() => void>();
   let activeSplitRatioGesture: {
@@ -2402,8 +2404,40 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
 
   hydrating: false,
   setHydrating: (hydrating) => {
-    if (hydrating) closeActiveHistoryGestures();
-    set({ hydrating });
+    if (hydrating) {
+      closeActiveHistoryGestures();
+      hydrationSfxClipsBaseline = get().sfxClips;
+      set({ hydrating: true });
+      return;
+    }
+
+    const state = get();
+    const explicitSfxDocument = hydrationSfxClipsBaseline !== null
+      && state.sfxClips !== hydrationSfxClipsBaseline;
+    const migrated = hydrationSfxClipsBaseline !== null
+      && !explicitSfxDocument
+      && state.sfxTrack !== null
+      && state.sfxClips.length === 0
+      ? migrateLegacySfxTrack(
+          state.sfxTrack,
+          state.duration,
+          nextAvailableSfxClipId(new Set(state.sfxClips.map((clip) => clip.id)))
+        )
+      : null;
+    const sfxClips = migrated ? [migrated] : state.sfxClips;
+    const synchronizeRuntime = explicitSfxDocument || migrated !== null;
+    const documentChanged = hydrationSfxClipsBaseline !== null
+      && !sfxDocumentEqual(sfxClips, hydrationSfxClipsBaseline);
+    reseedIdCounters({ sfxClips });
+    hydrationSfxClipsBaseline = null;
+    set({
+      hydrating: false,
+      sfxClips,
+      ...(synchronizeRuntime
+        ? { sfxTrack: runtimeSfxTrackFromDocument(sfxClips) }
+        : {}),
+      sfxDocumentRevision: state.sfxDocumentRevision + (documentChanged ? 1 : 0),
+    });
   },
   projectEpoch: 0,
 
@@ -2466,6 +2500,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       projectEpoch: get().projectEpoch + 1,
       editStats: null,
     });
+    if (get().hydrating) hydrationSfxClipsBaseline = get().sfxClips;
   },
 
   activeSnapGuides: [],
@@ -2780,6 +2815,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       ...constrainCurrentSfxToDuration(duration),
       selectedSfxClipId: null,
     });
+    if (get().hydrating) hydrationSfxClipsBaseline = get().sfxClips;
   },
 
   deleteClip: (id) => {
