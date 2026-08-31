@@ -24,11 +24,27 @@ import type {
   OverlayEffect,
   OverlayTransform,
   SelectedObject,
+  SfxAsset,
+  SfxClip,
+  SfxClipSource,
   SfxTrack,
   VideoSourceRecord,
   VideoSourceTarget,
   Word,
 } from "./types";
+import { defaultBuiltInDuration } from "./sfx-effects";
+import {
+  constrainSfxClipsToDuration,
+  duplicateSfxClip as duplicateSfxClipValue,
+  migrateLegacySfxTrack,
+  moveSfxClip as moveSfxClipValue,
+  placeSfxClip,
+  replaceAutomaticSfxClips as mergeAutomaticSfxClips,
+  replaceSfxClipSource as replaceSfxClipSourceValue,
+  sfxSourceDuration,
+  trimSfxClipLeft as trimSfxClipLeftValue,
+  trimSfxClipRight as trimSfxClipRightValue,
+} from "./sfx-clips";
 import type { EditStats } from "./ingest";
 import { DEFAULT_SMART_TRANSITION, footageUrlForPath } from "./ingest";
 import type {
@@ -198,6 +214,30 @@ function nextMediaAssetId(): string {
   return `asset-${mediaAssetIdCounter}`;
 }
 
+let sfxClipIdCounter = 0;
+function nextSfxClipId(): string {
+  sfxClipIdCounter += 1;
+  return `sfx-clip-${sfxClipIdCounter}`;
+}
+
+function nextAvailableSfxClipId(usedIds: ReadonlySet<string>): string {
+  let id = nextSfxClipId();
+  while (usedIds.has(id)) id = nextSfxClipId();
+  return id;
+}
+
+let sfxAssetIdCounter = 0;
+function nextSfxAssetId(): string {
+  sfxAssetIdCounter += 1;
+  return `sfx-asset-${sfxAssetIdCounter}`;
+}
+
+function nextAvailableSfxAssetId(usedIds: ReadonlySet<string>): string {
+  let id = nextSfxAssetId();
+  while (usedIds.has(id)) id = nextSfxAssetId();
+  return id;
+}
+
 // Sane default visible window (output seconds) for a freshly-added overlay: a
 // still image gets a 4s window; a video gets its own duration capped at 6s so a
 // long clip doesn't drop a wall of timeline. Both are clamped to the project end.
@@ -282,6 +322,8 @@ export function reseedIdCounters(state: {
   markers?: Marker[];
   overlays?: Overlay[];
   mediaAssets?: MediaAsset[];
+  sfxClips?: SfxClip[];
+  sfxAssets?: SfxAsset[];
 }): void {
   splitClipCounter = Math.max(
     splitClipCounter,
@@ -298,6 +340,55 @@ export function reseedIdCounters(state: {
   mediaAssetIdCounter = Math.max(
     mediaAssetIdCounter,
     maxIdSuffix((state.mediaAssets ?? []).map((a) => a.id), "asset-")
+  );
+  sfxClipIdCounter = Math.max(
+    sfxClipIdCounter,
+    maxIdSuffix((state.sfxClips ?? []).map((clip) => clip.id), "sfx-clip-")
+  );
+  sfxAssetIdCounter = Math.max(
+    sfxAssetIdCounter,
+    maxIdSuffix((state.sfxAssets ?? []).map((asset) => asset.id), "sfx-asset-")
+  );
+}
+
+function sfxSourceEqual(a: SfxClipSource, b: SfxClipSource): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === "built-in" && b.kind === "built-in") return a.key === b.key;
+  if (a.kind === "imported" && b.kind === "imported") {
+    return a.assetId === b.assetId && a.srcDuration === b.srcDuration;
+  }
+  if (a.kind === "legacy" && b.kind === "legacy") {
+    return a.sourcePath === b.sourcePath && a.srcDuration === b.srcDuration;
+  }
+  return false;
+}
+
+function sfxClipEqual(a: SfxClip, b: SfxClip): boolean {
+  return a === b || (
+    a.id === b.id
+    && a.name === b.name
+    && sfxSourceEqual(a.source, b.source)
+    && a.origin === b.origin
+    && a.timelineStart === b.timelineStart
+    && a.sourceStart === b.sourceStart
+    && a.sourceEnd === b.sourceEnd
+    && a.gain === b.gain
+    && a.fadeInSec === b.fadeInSec
+    && a.fadeOutSec === b.fadeOutSec
+    && a.muted === b.muted
+  );
+}
+
+function sfxDocumentEqual(a: readonly SfxClip[], b: readonly SfxClip[]): boolean {
+  return a === b || (
+    a.length === b.length && a.every((clip, index) => sfxClipEqual(clip, b[index]))
+  );
+}
+
+function sfxClipContentEqual(a: SfxClip, b: SfxClip): boolean {
+  return sfxClipEqual(
+    { ...a, id: b.id, origin: b.origin },
+    b
   );
 }
 
@@ -965,6 +1056,7 @@ function captureSnapshot(state: RepurposeState): EditableSnapshot {
     captionBlocks: state.captionBlocks,
     markers: state.markers,
     overlays: state.overlays,
+    sfxClips: state.sfxClips,
     deletedWordIndices: state.deletedWordIndices,
   };
 }
@@ -975,11 +1067,13 @@ function captureSnapshot(state: RepurposeState): EditableSnapshot {
  */
 function snapshotToPatch(snap: EditableSnapshot): Partial<RepurposeState> {
   const clips = normalizeClipSplitRatios(snap.clips);
+  const duration = deriveDuration(clips);
   return {
     ...snap,
     clips,
     splitRatio: parsePersistedSplitRatio(snap.splitRatio, 0.5),
-    duration: deriveDuration(clips),
+    duration,
+    sfxClips: constrainSfxClipsToDuration(snap.sfxClips, duration),
   };
 }
 
@@ -1014,6 +1108,8 @@ interface EditableSnapshot {
    * never ripple with clip/word edits.
    */
   overlays: Overlay[];
+  /** Independent output-time SFX clips. Assets and transient audio state stay out. */
+  sfxClips: SfxClip[];
   /**
    * Raw word indices the user has explicitly deleted from the short (sorted
    * plain number[]). The AUTHORITY for word deletion -- the clip cut is a derived
@@ -1038,7 +1134,31 @@ function synchronizeVideoTimelineSnapshot(
     previousDuration,
     nextDuration
   );
-  return clips === snapshot.clips ? snapshot : { ...snapshot, clips };
+  const sfxClips = constrainSfxClipsToDuration(snapshot.sfxClips, deriveDuration(clips));
+  return clips === snapshot.clips && sfxDocumentEqual(sfxClips, snapshot.sfxClips)
+    ? snapshot
+    : { ...snapshot, clips, sfxClips };
+}
+
+export type SfxGestureKind =
+  | "move"
+  | "left-trim"
+  | "right-trim"
+  | "gain"
+  | "fade-in"
+  | "fade-out";
+
+export interface AddSfxClipInput {
+  name: string;
+  source: SfxClipSource;
+  atTime: number;
+  origin?: SfxClip["origin"];
+  sourceStart?: number;
+  sourceEnd?: number;
+  gain?: number;
+  fadeInSec?: number;
+  fadeOutSec?: number;
+  muted?: boolean;
 }
 
 interface RepurposeState {
@@ -1105,6 +1225,14 @@ interface RepurposeState {
    * generated artifact, like footageMeta) but IS persisted across reload.
    */
   sfxTrack: SfxTrack | null;
+  /** Editable output-time sound-effect document. */
+  sfxClips: SfxClip[];
+  /** Passive imported SFX inventory; deliberately outside Undo history. */
+  sfxAssets: SfxAsset[];
+  /** Transient selected SFX block. */
+  selectedSfxClipId: string | null;
+  /** Monotonic stale-generation guard; never restored from history. */
+  sfxDocumentRevision: number;
   /** True while the SFX engine is rendering the track (drives the button spinner). */
   sfxGenerating: boolean;
   /** Set/replace the generated SFX track (called on a successful render). */
@@ -1115,6 +1243,28 @@ interface RepurposeState {
   setSfxGenerating: (generating: boolean) => void;
   /** Adjust the whole SFX bed's playback gain (0..2, 1 = as rendered). */
   setSfxGain: (gain: number) => void;
+  addSfxAsset: (asset: Omit<SfxAsset, "id">) => string;
+  addSfxClip: (input: AddSfxClipInput) => string | null;
+  replaceAutomaticSfxClips: (clips: readonly SfxClip[]) => void;
+  selectSfxClip: (id: string | null) => void;
+  moveSfxClip: (id: string, timelineStart: number) => void;
+  trimSfxClipLeft: (id: string, timelineStart: number) => void;
+  trimSfxClipRight: (id: string, timelineEnd: number) => void;
+  setSfxClipGain: (id: string, gain: number) => void;
+  setSfxClipFadeIn: (id: string, seconds: number) => void;
+  setSfxClipFadeOut: (id: string, seconds: number) => void;
+  setSfxClipMuted: (id: string, muted: boolean) => void;
+  replaceSfxClipSource: (
+    id: string,
+    replacement: { name: string; source: SfxClipSource }
+  ) => void;
+  duplicateSfxClip: (id: string) => string | null;
+  removeSfxClip: (id: string) => void;
+  beginSfxGesture: (id: string, kind: SfxGestureKind) => string | null;
+  updateSfxGesture: (token: string, value: number) => void;
+  endSfxGesture: (token: string) => void;
+  cancelSfxGesture: (token: string) => void;
+  subscribeSfxGestureCancellation: (listener: () => void) => () => void;
 
   // --- background music (manual) --------------------------------------------
   /**
@@ -1877,6 +2027,17 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
         historyCommitted: boolean;
       }
     | null = null;
+  let sfxGestureCounter = 0;
+  const sfxGestureCancellationListeners = new Set<() => void>();
+  let activeSfxGesture: {
+    token: string;
+    id: string;
+    kind: SfxGestureKind;
+    sfxClips: SfxClip[];
+    past: EditableSnapshot[];
+    future: EditableSnapshot[];
+    historyCommitted: boolean;
+  } | null = null;
   const captionGestureOwnsFrame = (): boolean => activeCaptionGesture !== null;
 
   const cancelActiveSplitRatioGesture = (): boolean => {
@@ -2007,13 +2168,61 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     return true;
   };
 
+  const signalSfxGestureCancellation = (): void => {
+    for (const listener of sfxGestureCancellationListeners) listener();
+  };
+
+  const cancelActiveSfxGesture = (signal = true): boolean => {
+    const gesture = activeSfxGesture;
+    if (!gesture) return false;
+    activeSfxGesture = null;
+    if (gesture.historyCommitted) {
+      set({
+        sfxClips: gesture.sfxClips,
+        past: gesture.past,
+        future: gesture.future,
+        sfxDocumentRevision: get().sfxDocumentRevision + 1,
+        selectedSfxClipId: get().selectedSfxClipId !== null
+          && gesture.sfxClips.some((clip) => clip.id === get().selectedSfxClipId)
+          ? get().selectedSfxClipId
+          : null,
+      });
+    }
+    if (signal) signalSfxGestureCancellation();
+    return true;
+  };
+
+  const closeActiveSfxGestureForHistory = (): boolean => {
+    if (!activeSfxGesture) return false;
+    activeSfxGesture = null;
+    signalSfxGestureCancellation();
+    return true;
+  };
+
   const closeActiveHistoryGestures = (): void => {
+    cancelActiveSfxGesture();
     cancelActiveOverlayTransformGesture();
     cancelActiveCaptionGesture();
     cancelActiveOverlayAppearanceGesture();
     if (cancelActiveSplitRatioGesture()) {
       signalSplitRatioGestureCancellation();
     }
+  };
+
+  const constrainCurrentSfxToDuration = (
+    duration: number
+  ): Partial<RepurposeState> => {
+    const state = get();
+    const sfxClips = constrainSfxClipsToDuration(state.sfxClips, duration);
+    if (sfxDocumentEqual(sfxClips, state.sfxClips)) return {};
+    return {
+      sfxClips,
+      sfxDocumentRevision: state.sfxDocumentRevision + 1,
+      selectedSfxClipId: state.selectedSfxClipId !== null
+        && sfxClips.some((clip) => clip.id === state.selectedSfxClipId)
+        ? state.selectedSfxClipId
+        : null,
+    };
   };
 
   const withAttachedCaptionOverride = (block: CaptionBlock): CaptionBlock => {
@@ -2078,6 +2287,43 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     set({ past, future: [] });
   };
 
+  const commitSfxDocument = (
+    sfxClips: SfxClip[],
+    patch: Partial<RepurposeState> = {}
+  ): boolean => {
+    const state = get();
+    if (sfxDocumentEqual(sfxClips, state.sfxClips)) {
+      if (Object.keys(patch).length > 0) set(patch);
+      return false;
+    }
+    captureHistoryEntry();
+    set({
+      ...patch,
+      sfxClips,
+      sfxDocumentRevision: state.sfxDocumentRevision + 1,
+      selectedSfxClipId: state.selectedSfxClipId !== null
+        && sfxClips.some((clip) => clip.id === state.selectedSfxClipId)
+        ? state.selectedSfxClipId
+        : null,
+    });
+    return true;
+  };
+
+  const updateSfxClip = (
+    id: string,
+    update: (clip: SfxClip, duration: number) => SfxClip | null
+  ): boolean => {
+    closeActiveHistoryGestures();
+    const state = get();
+    const target = state.sfxClips.find((clip) => clip.id === id);
+    if (!target) return false;
+    const updated = update(target, state.duration);
+    if (!updated || sfxClipEqual(updated, target)) return false;
+    return commitSfxDocument(
+      state.sfxClips.map((clip) => clip.id === id ? updated : clip)
+    );
+  };
+
   return {
   clips: [],
   duration: 0,
@@ -2099,7 +2345,11 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
   captionBlocks: [],
 
   sfxTrack: null,
+  sfxClips: [],
+  sfxAssets: [],
+  selectedSfxClipId: null,
   sfxGenerating: false,
+  sfxDocumentRevision: 0,
 
   musicTrack: null,
 
@@ -2133,7 +2383,10 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
   toggleGrid: () => set({ showGrid: !get().showGrid }),
 
   hydrating: false,
-  setHydrating: (hydrating) => set({ hydrating }),
+  setHydrating: (hydrating) => {
+    if (hydrating) closeActiveHistoryGestures();
+    set({ hydrating });
+  },
   projectEpoch: 0,
 
   // Wipe the whole editor back to the initial-state baseline (mirrors the literal
@@ -2141,6 +2394,9 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
   // history + transient selection/playback). Deliberately does NOT reset the
   // module id counters; the loader reseeds them after hydrating the target project.
   resetProject: () => {
+    cancelActiveSfxGesture();
+    const revision = get().sfxDocumentRevision
+      + (get().sfxClips.length > 0 ? 1 : 0);
     cancelActiveOverlayTransformGesture();
     cancelActiveCaptionGesture();
     cancelActiveOverlayAppearanceGesture();
@@ -2159,7 +2415,11 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       captionStyle: DEFAULT_CAPTION_STYLE,
       captionBlocks: [],
       sfxTrack: null,
+      sfxClips: [],
+      sfxAssets: [],
+      selectedSfxClipId: null,
       sfxGenerating: false,
+      sfxDocumentRevision: revision,
       musicTrack: null,
       deletedWordIndices: [],
       selectedWordRange: null,
@@ -2263,6 +2523,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     get().syncVideoTimeline(previousMeta);
   },
   syncVideoTimeline: (previousMeta) => {
+    closeActiveHistoryGestures();
     const state = get();
     const nextDuration = effectiveVideoTimelineDuration(state.footageMeta);
     if (nextDuration === null) return;
@@ -2279,8 +2540,12 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     const future = state.future.map((snapshot) =>
       synchronizeVideoTimelineSnapshot(snapshot, previousDuration, nextDuration)
     );
+    const duration = deriveDuration(clips);
+    const sfxClips = constrainSfxClipsToDuration(state.sfxClips, duration);
+    const sfxChanged = !sfxDocumentEqual(sfxClips, state.sfxClips);
     if (
       clips === state.clips &&
+      !sfxChanged &&
       past.every((snapshot, index) => snapshot === state.past[index]) &&
       future.every((snapshot, index) => snapshot === state.future[index])
     ) {
@@ -2288,9 +2553,19 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     }
     set({
       clips,
-      duration: deriveDuration(clips),
+      duration,
       past,
       future,
+      ...(sfxChanged
+        ? {
+            sfxClips,
+            sfxDocumentRevision: state.sfxDocumentRevision + 1,
+            selectedSfxClipId: state.selectedSfxClipId !== null
+              && sfxClips.some((clip) => clip.id === state.selectedSfxClipId)
+              ? state.selectedSfxClipId
+              : null,
+          }
+        : {}),
     });
   },
   setVideoSourceRecord: (target, source) => {
@@ -2397,6 +2672,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
   },
 
   undo: () => {
+    closeActiveSfxGestureForHistory();
     closeActiveOverlayTransformGestureForHistory();
     cancelActiveCaptionGesture();
     cancelActiveOverlayAppearanceGesture();
@@ -2411,10 +2687,23 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     // Break coalescing: the next edit must start its own step, never fold into
     // the gesture that preceded this undo.
     lastCommitKey = null;
-    set({ past, future, ...snapshotToPatch(restore) });
+    const patch = snapshotToPatch(restore);
+    const restoredSfxClips = patch.sfxClips as SfxClip[];
+    const sfxChanged = !sfxDocumentEqual(restoredSfxClips, state.sfxClips);
+    set({
+      past,
+      future,
+      ...patch,
+      sfxDocumentRevision: state.sfxDocumentRevision + (sfxChanged ? 1 : 0),
+      selectedSfxClipId: state.selectedSfxClipId !== null
+        && restoredSfxClips.some((clip) => clip.id === state.selectedSfxClipId)
+        ? state.selectedSfxClipId
+        : null,
+    });
   },
 
   redo: () => {
+    cancelActiveSfxGesture();
     cancelActiveOverlayTransformGesture();
     cancelActiveCaptionGesture();
     cancelActiveOverlayAppearanceGesture();
@@ -2427,10 +2716,23 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     // Push the current state back onto `past` so undo works again after a redo.
     const past = [...state.past, captureSnapshot(state)];
     lastCommitKey = null;
-    set({ past, future, ...snapshotToPatch(restore) });
+    const patch = snapshotToPatch(restore);
+    const restoredSfxClips = patch.sfxClips as SfxClip[];
+    const sfxChanged = !sfxDocumentEqual(restoredSfxClips, state.sfxClips);
+    set({
+      past,
+      future,
+      ...patch,
+      sfxDocumentRevision: state.sfxDocumentRevision + (sfxChanged ? 1 : 0),
+      selectedSfxClipId: state.selectedSfxClipId !== null
+        && restoredSfxClips.some((clip) => clip.id === state.selectedSfxClipId)
+        ? state.selectedSfxClipId
+        : null,
+    });
   },
 
   setClips: (clips) => {
+    cancelActiveSfxGesture();
     cancelActiveOverlayTransformGesture();
     cancelActiveCaptionGesture();
     cancelActiveOverlayAppearanceGesture();
@@ -2447,15 +2749,18 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     // restore path). Also drop any dangling overlay selection.
     lastCommitKey = null;
     overlayDeleteStash.clear();
+    const duration = deriveDuration(laidOut);
     set({
       clips: laidOut,
-      duration: deriveDuration(laidOut),
+      duration,
       past: [],
       future: [],
       deletedWordIndices: [],
       overlays: [],
       selectedOverlayId: null,
       selectedOverlayIds: [],
+      ...constrainCurrentSfxToDuration(duration),
+      selectedSfxClipId: null,
     });
   },
 
@@ -2499,9 +2804,10 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
         removed: overlays.filter((o) => !surviving.has(o.id)),
       });
     }
+    const duration = deriveDuration(laidOut);
     set({
       clips: laidOut,
-      duration: deriveDuration(laidOut),
+      duration,
       overlays: nextOverlays,
       // Drop a dangling overlay selection if that overlay was removed.
       selectedClipId: get().selectedClipId === id ? null : get().selectedClipId,
@@ -2510,6 +2816,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
         !nextOverlays.some((o) => o.id === get().selectedOverlayId)
           ? null
           : get().selectedOverlayId,
+      ...constrainCurrentSfxToDuration(duration),
     });
   },
 
@@ -2554,10 +2861,12 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
         nextOverlays = densePackOverlayZ(nextOverlays);
       }
     }
+    const duration = deriveDuration(laidOut);
     set({
       clips: laidOut,
-      duration: deriveDuration(laidOut),
+      duration,
       overlays: nextOverlays,
+      ...constrainCurrentSfxToDuration(duration),
     });
   },
 
@@ -2585,10 +2894,12 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     const next = [...clips];
     next.splice(index + 1, 0, copy);
     const laidOut = recomputeTimeline(next);
+    const duration = deriveDuration(laidOut);
     set({
       clips: laidOut,
-      duration: deriveDuration(laidOut),
+      duration,
       selectedClipId: copy.id,
+      ...constrainCurrentSfxToDuration(duration),
     });
   },
 
@@ -2608,9 +2919,11 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       return { ...c, srcEnd: nextEnd };
     });
     const laidOut = recomputeTimeline(updated);
+    const duration = deriveDuration(laidOut);
     set({
       clips: laidOut,
-      duration: deriveDuration(laidOut),
+      duration,
+      ...constrainCurrentSfxToDuration(duration),
     });
   },
 
@@ -2968,6 +3281,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
   },
 
   beginOverlayTransformGesture: (id) => {
+    cancelActiveSfxGesture();
     cancelActiveCaptionGesture();
     cancelActiveOverlayAppearanceGesture();
     if (cancelActiveSplitRatioGesture()) signalSplitRatioGestureCancellation();
@@ -3360,13 +3674,17 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     set({
       selectedOverlayId: id,
       selectedOverlayIds: id === null ? [] : [id],
-      selectedClipId: null,
+      selectedClipId: id === null ? get().selectedClipId : null,
+      selectedSfxClipId: id === null ? get().selectedSfxClipId : null,
     }),
 
   // Caption-block selection is orthogonal to the canvas object selection (it
   // lives in the Inspector rail, not on the canvas), so it does NOT clear
   // selectedClipId / selectedOverlayId. Transient -- never enters history.
-  selectCaptionBlock: (id) => set({ selectedCaptionBlockId: id }),
+  selectCaptionBlock: (id) => set({
+    selectedCaptionBlockId: id,
+    selectedSfxClipId: id === null ? get().selectedSfxClipId : null,
+  }),
 
   toggleOverlaySelected: (id) => {
     const { overlays, selectedOverlayIds } = get();
@@ -3382,6 +3700,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       selectedOverlayId: nextIds[nextIds.length - 1] ?? null,
       // A non-empty overlay selection is mutually exclusive with a clip selection.
       selectedClipId: nextIds.length > 0 ? null : get().selectedClipId,
+      selectedSfxClipId: nextIds.length > 0 ? null : get().selectedSfxClipId,
     });
   },
 
@@ -3493,6 +3812,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
   },
 
   beginOverlayAppearanceGesture: (id, field) => {
+    cancelActiveSfxGesture();
     cancelActiveOverlayTransformGesture();
     cancelActiveCaptionGesture();
     if (cancelActiveSplitRatioGesture()) {
@@ -3661,6 +3981,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
   },
 
   beginSplitRatioGesture: (target) => {
+    cancelActiveSfxGesture();
     cancelActiveOverlayTransformGesture();
     cancelActiveCaptionGesture();
     cancelActiveOverlayAppearanceGesture();
@@ -3797,7 +4118,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       selectedClipId: null,
       captionsEnabled: true,
       captionBlocks,
-      sfxTrack: null,
+      ...constrainCurrentSfxToDuration(duration),
       editStats: input.editStats ?? null,
       playhead: Math.max(0, Math.min(duration, state.playhead)),
       inPoint,
@@ -3805,19 +4126,252 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     });
   },
 
-  // --- sound effects (SFX track) --------------------------------------------
-  // Generated artifact, not a fine-grained edit: these set state directly and do
-  // NOT push an undo snapshot (mirrors footageMeta / grades-are-discrete). The
-  // green Audio-row block reads `sfxTrack`; the button reads `sfxGenerating`.
-  setSfxTrack: (track) => set({ sfxTrack: track }),
-  clearSfxTrack: () => set({ sfxTrack: null }),
-  setSfxGenerating: (generating) => set({ sfxGenerating: generating }),
+  // --- sound effects ---------------------------------------------------------
+  addSfxAsset: (asset) => {
+    const existing = get().sfxAssets.find(
+      (candidate) => candidate.sourcePath === asset.sourcePath
+    );
+    if (existing) return existing.id;
+    const id = nextAvailableSfxAssetId(new Set(get().sfxAssets.map((item) => item.id)));
+    set({ sfxAssets: [...get().sfxAssets, { id, ...asset }] });
+    return id;
+  },
+
+  addSfxClip: (input) => {
+    closeActiveHistoryGestures();
+    const state = get();
+    const sourceDuration = input.source.kind === "built-in"
+      ? defaultBuiltInDuration(input.source.key)
+      : sfxSourceDuration(input.source);
+    const candidate: SfxClip = {
+      id: nextAvailableSfxClipId(new Set(state.sfxClips.map((clip) => clip.id))),
+      name: input.name,
+      source: input.source,
+      origin: input.origin ?? "manual",
+      timelineStart: 0,
+      sourceStart: input.sourceStart ?? 0,
+      sourceEnd: input.sourceEnd ?? sourceDuration,
+      gain: input.gain ?? 1,
+      fadeInSec: input.fadeInSec ?? 0,
+      fadeOutSec: input.fadeOutSec ?? 0,
+      muted: input.muted ?? false,
+    };
+    const placed = placeSfxClip(candidate, input.atTime, state.duration);
+    if (!placed) return null;
+    commitSfxDocument([...state.sfxClips, placed]);
+    return placed.id;
+  },
+
+  replaceAutomaticSfxClips: (automatic) => {
+    closeActiveHistoryGestures();
+    const state = get();
+    const constrained = constrainSfxClipsToDuration(
+      automatic.map((clip) => ({ ...clip, origin: "automatic" as const })),
+      state.duration
+    );
+    const currentAutomatic = state.sfxClips.filter((clip) => clip.origin === "automatic");
+    if (
+      currentAutomatic.length === constrained.length
+      && currentAutomatic.every((clip, index) =>
+        sfxClipContentEqual(clip, constrained[index])
+      )
+    ) return;
+    const usedIds = new Set(state.sfxClips.map((clip) => clip.id));
+    const replacements = constrainSfxClipsToDuration(
+      constrained.map((clip) => {
+        const id = nextAvailableSfxClipId(usedIds);
+        usedIds.add(id);
+        return { ...clip, id, origin: "automatic" as const };
+      }),
+      state.duration
+    );
+    commitSfxDocument(mergeAutomaticSfxClips(state.sfxClips, replacements));
+  },
+
+  selectSfxClip: (id) => {
+    if (id === null) {
+      set({ selectedSfxClipId: null });
+      return;
+    }
+    if (!get().sfxClips.some((clip) => clip.id === id)) return;
+    set({
+      selectedSfxClipId: id,
+      selectedClipId: null,
+      selectedOverlayId: null,
+      selectedOverlayIds: [],
+      selectedWordRange: null,
+      selectedCaptionBlockId: null,
+    });
+  },
+
+  moveSfxClip: (id, timelineStart) => {
+    updateSfxClip(id, (clip, duration) => moveSfxClipValue(clip, timelineStart, duration));
+  },
+  trimSfxClipLeft: (id, timelineStart) => {
+    updateSfxClip(id, (clip) => trimSfxClipLeftValue(clip, timelineStart));
+  },
+  trimSfxClipRight: (id, timelineEnd) => {
+    updateSfxClip(id, (clip, duration) =>
+      trimSfxClipRightValue(clip, timelineEnd, duration, sfxSourceDuration(clip.source))
+    );
+  },
+  setSfxClipGain: (id, gain) => {
+    if (!Number.isFinite(gain)) return;
+    updateSfxClip(id, (clip) => ({ ...clip, gain: Math.max(0, Math.min(2, gain)) }));
+  },
+  setSfxClipFadeIn: (id, seconds) => {
+    if (!Number.isFinite(seconds)) return;
+    updateSfxClip(id, (clip) => ({
+      ...clip,
+      fadeInSec: Math.max(0, Math.min(2, seconds)),
+    }));
+  },
+  setSfxClipFadeOut: (id, seconds) => {
+    if (!Number.isFinite(seconds)) return;
+    updateSfxClip(id, (clip) => ({
+      ...clip,
+      fadeOutSec: Math.max(0, Math.min(2, seconds)),
+    }));
+  },
+  setSfxClipMuted: (id, muted) => {
+    updateSfxClip(id, (clip) => ({ ...clip, muted }));
+  },
+  replaceSfxClipSource: (id, replacement) => {
+    updateSfxClip(id, (clip, duration) =>
+      replaceSfxClipSourceValue(clip, replacement, duration)
+    );
+  },
+  duplicateSfxClip: (id) => {
+    closeActiveHistoryGestures();
+    const state = get();
+    const target = state.sfxClips.find((clip) => clip.id === id);
+    if (!target) return null;
+    const duplicate = duplicateSfxClipValue(
+      target,
+      nextAvailableSfxClipId(new Set(state.sfxClips.map((clip) => clip.id))),
+      state.duration
+    );
+    if (!duplicate) return null;
+    commitSfxDocument([...state.sfxClips, duplicate]);
+    return duplicate.id;
+  },
+  removeSfxClip: (id) => {
+    closeActiveHistoryGestures();
+    const state = get();
+    if (!state.sfxClips.some((clip) => clip.id === id)) return;
+    commitSfxDocument(state.sfxClips.filter((clip) => clip.id !== id));
+  },
+
+  beginSfxGesture: (id, kind) => {
+    closeActiveHistoryGestures();
+    const state = get();
+    if (!state.sfxClips.some((clip) => clip.id === id)) return null;
+    const token = `sfx-gesture-${++sfxGestureCounter}`;
+    activeSfxGesture = {
+      token,
+      id,
+      kind,
+      sfxClips: state.sfxClips,
+      past: state.past,
+      future: state.future,
+      historyCommitted: false,
+    };
+    return token;
+  },
+  updateSfxGesture: (token, value) => {
+    const gesture = activeSfxGesture;
+    if (!gesture || gesture.token !== token || !Number.isFinite(value)) return;
+    const state = get();
+    const target = state.sfxClips.find((clip) => clip.id === gesture.id);
+    if (!target) {
+      cancelActiveSfxGesture();
+      return;
+    }
+    let updated: SfxClip = target;
+    if (gesture.kind === "move") {
+      updated = moveSfxClipValue(target, value, state.duration);
+    } else if (gesture.kind === "left-trim") {
+      updated = trimSfxClipLeftValue(target, value);
+    } else if (gesture.kind === "right-trim") {
+      updated = trimSfxClipRightValue(
+        target,
+        value,
+        state.duration,
+        sfxSourceDuration(target.source)
+      );
+    } else if (gesture.kind === "gain") {
+      updated = { ...target, gain: Math.max(0, Math.min(2, value)) };
+    } else if (gesture.kind === "fade-in") {
+      updated = { ...target, fadeInSec: Math.max(0, Math.min(2, value)) };
+    } else {
+      updated = { ...target, fadeOutSec: Math.max(0, Math.min(2, value)) };
+    }
+    if (sfxClipEqual(updated, target)) return;
+    if (!gesture.historyCommitted) {
+      captureHistoryEntry();
+      gesture.historyCommitted = true;
+    }
+    set({
+      sfxClips: state.sfxClips.map((clip) => clip.id === gesture.id ? updated : clip),
+      sfxDocumentRevision: state.sfxDocumentRevision + 1,
+    });
+  },
+  endSfxGesture: (token) => {
+    if (activeSfxGesture?.token !== token) return;
+    activeSfxGesture = null;
+  },
+  cancelSfxGesture: (token) => {
+    if (activeSfxGesture?.token !== token) return;
+    cancelActiveSfxGesture();
+  },
+  subscribeSfxGestureCancellation: (listener) => {
+    sfxGestureCancellationListeners.add(listener);
+    return () => sfxGestureCancellationListeners.delete(listener);
+  },
+
+  // Deprecated compatibility bridge for the old panel/timeline/preview/export.
+  setSfxTrack: (track) => {
+    closeActiveHistoryGestures();
+    const state = get();
+    const currentLegacy = state.sfxClips.find(
+      (clip) => clip.origin === "automatic" && clip.source.kind === "legacy"
+    );
+    const retained = state.sfxClips.filter(
+      (clip) => !(clip.origin === "automatic" && clip.source.kind === "legacy")
+    );
+    const legacy = track
+      ? migrateLegacySfxTrack(
+          track,
+          state.duration,
+          currentLegacy?.id
+            ?? nextAvailableSfxClipId(new Set(state.sfxClips.map((clip) => clip.id)))
+        )
+      : null;
+    commitSfxDocument(
+      legacy ? [...retained, legacy] : retained,
+      { sfxTrack: track }
+    );
+  },
+  clearSfxTrack: () => get().setSfxTrack(null),
+  setSfxGenerating: (generating) => {
+    if (generating) closeActiveHistoryGestures();
+    set({ sfxGenerating: generating });
+  },
   setSfxGain: (gain) => {
-    const track = get().sfxTrack;
-    if (!track) return;
-    // Clamp to a sane range so a stray value can't blow out the mix.
-    const g = Math.max(0, Math.min(2, gain));
-    set({ sfxTrack: { ...track, gain: g } });
+    if (!Number.isFinite(gain)) return;
+    closeActiveHistoryGestures();
+    const state = get();
+    if (!state.sfxTrack) return;
+    const clamped = Math.max(0, Math.min(2, gain));
+    const nextTrack = state.sfxTrack.gain === clamped
+      ? state.sfxTrack
+      : { ...state.sfxTrack, gain: clamped };
+    const sfxClips = state.sfxClips.map((clip) =>
+      clip.origin === "automatic" && clip.source.kind === "legacy"
+        ? { ...clip, gain: clamped }
+        : clip
+    );
+    commitSfxDocument(sfxClips, { sfxTrack: nextTrack });
   },
 
   // --- background music (manual) --------------------------------------------
@@ -3879,6 +4433,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     // for the survivors (their source moments are unchanged).
     const mergedClips = mergeAdjacentKeptFragments(working);
     const laidOut = recomputeTimeline(mergedClips);
+    const duration = deriveDuration(laidOut);
 
     // Union the freshly-deleted indices into the sorted authority list.
     const mergedIndices = [...deletedSet];
@@ -3892,12 +4447,13 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
 
     set({
       clips: laidOut,
-      duration: deriveDuration(laidOut),
+      duration,
       deletedWordIndices: nextDeleted,
       selectedClipId: selStillExists ? selId : null,
       // The just-deleted words are now ghosts; drop the shared word selection so
       // a second Delete doesn't sit on a stale range and the highlight clears.
       selectedWordRange: null,
+      ...constrainCurrentSfxToDuration(duration),
     });
     // Re-chunk captions from the words that survive the delete: struck words drop
     // out of the caption stream. Reads fresh state (the clips/deletedWordIndices
@@ -3937,6 +4493,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     // Merge preserves source coverage, so the ripple remap below is a no-op.
     const mergedClips = mergeAdjacentKeptFragments(updated);
     const laidOut = recomputeTimeline(mergedClips);
+    const duration = deriveDuration(laidOut);
 
     // Drop the restored indices from the authority list.
     const restoreSet = new Set(toRestore);
@@ -3944,8 +4501,9 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
 
     set({
       clips: laidOut,
-      duration: deriveDuration(laidOut),
+      duration,
       deletedWordIndices: nextDeleted,
+      ...constrainCurrentSfxToDuration(duration),
     });
     // Restored words rejoin the caption stream: re-chunk from the fresh state.
     // Adjacent same-originId survivors were already auto-merged above.
@@ -3989,6 +4547,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     // so the ripple remap stays a no-op for the survivors.
     const mergedClips = mergeAdjacentKeptFragments(working);
     const laidOut = recomputeTimeline(mergedClips);
+    const duration = deriveDuration(laidOut);
 
     // Union the removed filler indices into the sorted authority list.
     const mergedIndices = [...deletedSet];
@@ -4002,9 +4561,10 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
 
     set({
       clips: laidOut,
-      duration: deriveDuration(laidOut),
+      duration,
       deletedWordIndices: nextDeleted,
       selectedClipId: selStillExists ? selId : null,
+      ...constrainCurrentSfxToDuration(duration),
     });
     // Struck fillers drop out of the caption stream: re-chunk from fresh state.
     get().rebuildCaptionBlocks();
@@ -4032,9 +4592,11 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     // just lays the now-shorter takes back-to-back.
     get().commitHistory();
     const laidOut = recomputeTimeline(tightened);
+    const duration = deriveDuration(laidOut);
     set({
       clips: laidOut,
-      duration: deriveDuration(laidOut),
+      duration,
+      ...constrainCurrentSfxToDuration(duration),
     });
     // Trimmed dead air can shift where caption words land: re-chunk from fresh
     // state so the caption stream matches the tightened runtime.
@@ -4123,6 +4685,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
   },
 
   beginCaptionGesture: (blockId) => {
+    cancelActiveSfxGesture();
     cancelActiveOverlayTransformGesture();
     cancelActiveCaptionGesture();
     const cancelledSplit = cancelActiveSplitRatioGesture();
@@ -4166,6 +4729,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
   },
 
   beginCaptionPositionGesture: (blockId) => {
+    cancelActiveSfxGesture();
     cancelActiveOverlayTransformGesture();
     cancelActiveCaptionGesture();
     const cancelledSplit = cancelActiveSplitRatioGesture();
@@ -4498,6 +5062,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       // the word selection alone -- callers that want a word selected pass the
       // range through selectWords, which itself clears selectedClipId.
       selectedWordRange: id === null ? get().selectedWordRange : null,
+      selectedSfxClipId: id === null ? get().selectedSfxClipId : null,
     }),
 
   // Shared word selection (transcript + timeline word cells). Passing a range
@@ -4516,6 +5081,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       selectedClipId: null,
       selectedOverlayId: null,
       selectedOverlayIds: [],
+      selectedSfxClipId: null,
     });
   },
 

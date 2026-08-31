@@ -6,7 +6,7 @@ import {
   isUntouchedVideoTimeline,
 } from "@/lib/repurpose/transcript-application";
 import { useRepurposeStore } from "@/lib/repurpose/store";
-import { VIDEO_TIMELINE_CLIP_ID, type Clip, type FootageMeta, type VideoSourceRecord, type Word } from "@/lib/repurpose/types";
+import { VIDEO_TIMELINE_CLIP_ID, type Clip, type FootageMeta, type SfxClip, type VideoSourceRecord, type Word } from "@/lib/repurpose/types";
 
 function source(name: string, durationSec: number): VideoSourceRecord {
   return {
@@ -246,6 +246,34 @@ function seedRichState(): void {
       durationSec: 6,
       gain: 0.8,
     },
+    sfxClips: [
+      {
+        id: "sfx-crossing-new-end",
+        name: "Crossing",
+        source: { kind: "imported", assetId: "sfx-asset-1", srcDuration: 6 },
+        origin: "manual",
+        timelineStart: 1.5,
+        sourceStart: 0,
+        sourceEnd: 4,
+        gain: 1,
+        fadeInSec: 0,
+        fadeOutSec: 0,
+        muted: false,
+      },
+      {
+        id: "sfx-after-new-end",
+        name: "After",
+        source: { kind: "built-in", key: "ding" },
+        origin: "automatic",
+        timelineStart: 5,
+        sourceStart: 0,
+        sourceEnd: 1,
+        gain: 1,
+        fadeInSec: 0,
+        fadeOutSec: 0,
+        muted: false,
+      },
+    ] satisfies SfxClip[],
     musicTrack: {
       src: "/music.mp3",
       sourcePath: "C:\\media\\music.mp3",
@@ -471,6 +499,7 @@ describe("atomic transcript store action", () => {
     expect(state.overlays).toEqual(before.overlays);
     expect(state.markers).toEqual(before.markers);
     expect(state.sfxTrack).toEqual(before.sfxTrack);
+    expect(state.sfxClips).toEqual(before.sfxClips);
     expect(state.musicTrack).toEqual(before.musicTrack);
     expect(state.mediaAssets).toEqual(before.mediaAssets);
     expect(state.editStats).toEqual(before.editStats);
@@ -537,7 +566,15 @@ describe("atomic transcript store action", () => {
     expect(state.clips[0]).not.toHaveProperty("manualScene");
     expect(state.duration).toBe(2);
     expect(state.selectedClipId).toBeNull();
-    expect(state.sfxTrack).toBeNull();
+    expect(state.sfxTrack).toEqual(before.sfxTrack);
+    expect(state.sfxClips).toEqual([
+      expect.objectContaining({
+        id: "sfx-crossing-new-end",
+        timelineStart: 1.5,
+        sourceStart: 0,
+        sourceEnd: 0.5,
+      }),
+    ]);
     expect(state.editStats).toEqual(stats);
     expect(state.playhead).toBe(2);
     expect(state.inPoint).toBeNull();
@@ -559,7 +596,8 @@ describe("atomic transcript store action", () => {
     expect(state.words).toEqual(oldWords);
     expect(state.overlays).toEqual(before.overlays);
     expect(state.markers).toEqual(before.markers);
-    expect(state.sfxTrack).toBeNull();
+    expect(state.sfxTrack).toEqual(before.sfxTrack);
+    expect(state.sfxClips).toEqual(before.sfxClips);
     expect(state.editStats).toEqual(stats);
     expect(state.playhead).toBe(2);
     expect(state.inPoint).toBeNull();
@@ -570,6 +608,9 @@ describe("atomic transcript store action", () => {
     expect(state.clips[0]).toMatchObject({ id: "rebuilt", timelineStart: 0, timelineEnd: 2 });
     expect(state.words).toEqual(newWords);
     expect(state.captionsEnabled).toBe(true);
+    expect(state.sfxClips).toEqual([
+      expect.objectContaining({ id: "sfx-crossing-new-end", sourceEnd: 0.5 }),
+    ]);
   });
 
   it("keeps deleted-scene overlay recovery for preserve-cuts", () => {
