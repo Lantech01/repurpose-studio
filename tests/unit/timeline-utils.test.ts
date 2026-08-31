@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { packLanes } from "@/app/repurpose-studio/_components/timeline-utils";
+import { SNAP_PX, packLanes, snapMovedSpan } from "@/app/repurpose-studio/_components/timeline-utils";
+
+it("uses the specified four-pixel snap threshold", () => {
+  expect(SNAP_PX).toBe(4);
+});
 
 describe("packLanes", () => {
   it("reuses lanes for touching intervals and separates overlaps", () => {
@@ -19,5 +23,34 @@ describe("packLanes", () => {
     ];
     expect(packLanes(spans)).toEqual(packLanes([...spans]));
     expect(packLanes([...spans].reverse()).laneCount).toBe(2);
+  });
+});
+
+describe("snapMovedSpan", () => {
+  it("preserves leading-edge snapping", () => {
+    expect(snapMovedSpan(1.04, 1, [1], .05)).toEqual({
+      start: 1,
+      snapped: true,
+      snapTarget: 1,
+      edge: "leading",
+    });
+  });
+
+  it("translates the whole clip when only the trailing edge is in range", () => {
+    expect(snapMovedSpan(1.1, .95, [2], .06)).toEqual({
+      start: 1.05,
+      snapped: true,
+      snapTarget: 2,
+      edge: "trailing",
+    });
+  });
+
+  it("deterministically prefers the leading edge on an equal-distance tie", () => {
+    expect(snapMovedSpan(1.05, .9, [2, 1], .06)).toEqual({
+      start: 1,
+      snapped: true,
+      snapTarget: 1,
+      edge: "leading",
+    });
   });
 });

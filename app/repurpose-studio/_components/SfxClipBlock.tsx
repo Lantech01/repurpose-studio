@@ -60,35 +60,40 @@ export function SfxClipBlock(props: SfxClipBlockProps) {
 
   return (
     <div
-      role="button"
-      tabIndex={0}
+      role="group"
       aria-label={label}
-      aria-pressed={selected}
       data-sfx-clip-id={clip.id}
       data-testid={`sfx-block-${clip.id}`}
-      className={`group absolute flex items-center overflow-hidden rounded border bg-emerald-500/20 px-2 text-[10px] text-emerald-100 ${selected ? "border-emerald-200 ring-2 ring-emerald-300/70" : "border-emerald-500/50"}`}
+      className={`group absolute overflow-hidden rounded border bg-emerald-500/20 text-[10px] text-emerald-100 ${selected ? "border-emerald-200 ring-2 ring-emerald-300/70" : "border-emerald-500/50"}`}
       style={{ left, width: Math.max(6, width), top, height }}
-      onClick={(event) => {
-        event.stopPropagation();
-        props.onSelect(clip.id);
-      }}
-      onPointerDown={(event) => {
-        if (event.button !== 0) return;
-        event.stopPropagation();
-        props.onSelect(clip.id);
-        props.onBodyPointerDown(clip, event.clientX);
-      }}
     >
       {peaks.length > 0 && <canvas ref={canvasRef} aria-hidden className="pointer-events-none absolute inset-0 h-full w-full opacity-60" />}
-      <span className="relative truncate font-medium">{clip.name}</span>
-      <span className="relative ml-1 rounded bg-black/40 px-1">{clip.origin === "automatic" ? "Automatic" : "Manual"}</span>
-      {clip.muted && <SpeakerSlash aria-label="Muted" className="relative ml-1" size={12} />}
-      {missing && <span className="relative ml-1 flex items-center gap-0.5 text-amber-300"><Warning size={11} />Missing</span>}
-      <button type="button" aria-label={`Trim ${clip.name} start`} className="absolute inset-y-0 left-0 w-2 border-l-2 border-emerald-200/70"
+      <button
+        type="button"
+        aria-label={`Select ${label}`}
+        aria-pressed={selected}
+        className="absolute inset-0 z-10 flex items-center overflow-hidden px-2 text-left"
+        onClick={(event) => {
+          event.stopPropagation();
+          props.onSelect(clip.id);
+        }}
+        onPointerDown={(event) => {
+          if (event.button !== 0) return;
+          event.stopPropagation();
+          props.onSelect(clip.id);
+          props.onBodyPointerDown(clip, event.clientX);
+        }}
+      >
+        <span className="relative truncate font-medium">{clip.name}</span>
+        <span className="relative ml-1 rounded bg-black/40 px-1">{clip.origin === "automatic" ? "Automatic" : "Manual"}</span>
+        {clip.muted && <SpeakerSlash aria-label="Muted" className="relative ml-1" size={12} />}
+        {missing && <span className="relative ml-1 flex items-center gap-0.5 text-amber-300"><Warning size={11} />Missing</span>}
+      </button>
+      <button type="button" aria-label={`Trim ${clip.name} start`} className="absolute inset-y-0 left-0 z-20 w-2 border-l-2 border-emerald-200/70"
         onClick={(event) => event.stopPropagation()} onPointerDown={(event) => { event.stopPropagation(); props.onEdgePointerDown(clip, "start", event.clientX); }} />
-      <button type="button" aria-label={`Trim ${clip.name} end`} className="absolute inset-y-0 right-0 w-2 border-r-2 border-emerald-200/70"
+      <button type="button" aria-label={`Trim ${clip.name} end`} className="absolute inset-y-0 right-0 z-20 w-2 border-r-2 border-emerald-200/70"
         onClick={(event) => event.stopPropagation()} onPointerDown={(event) => { event.stopPropagation(); props.onEdgePointerDown(clip, "end", event.clientX); }} />
-      <button type="button" aria-label={`Delete ${clip.name}`} className="absolute right-2 top-1/2 hidden -translate-y-1/2 rounded bg-black/70 p-0.5 group-hover:block"
+      <button type="button" aria-label={`Delete ${clip.name}`} className="absolute right-2 top-1/2 z-30 -translate-y-1/2 rounded bg-black/70 p-0.5 opacity-0 group-hover:opacity-100 focus:opacity-100"
         onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); props.onDelete(clip.id); }}><Trash size={11} /></button>
     </div>
   );

@@ -1,15 +1,11 @@
 import { useRepurposeStore } from "./store";
+import { isAbsoluteLocalMediaPath } from "./local-media-path";
 
-const SFX_EXTENSIONS = new Set(["wav", "mp3", "m4a"]);
-const SFX_MIME_TYPES = new Set([
-  "audio/wav",
-  "audio/x-wav",
-  "audio/mpeg",
-  "audio/mp3",
-  "audio/mp4",
-  "audio/x-m4a",
-  "audio/m4a",
-]);
+const SFX_MIME_BY_EXTENSION: Record<string, ReadonlySet<string>> = {
+  wav: new Set(["audio/wav", "audio/x-wav"]),
+  mp3: new Set(["audio/mpeg", "audio/mp3"]),
+  m4a: new Set(["audio/mp4", "audio/x-m4a", "audio/m4a"]),
+};
 
 export interface SfxImportOwner {
   readonly id: number;
@@ -38,7 +34,9 @@ function abortError(): DOMException {
 
 export function classifySfxFile(file: File): boolean {
   const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
-  return SFX_EXTENSIONS.has(extension) || SFX_MIME_TYPES.has(file.type.toLowerCase());
+  const allowedMimes = SFX_MIME_BY_EXTENSION[extension];
+  const mime = file.type.trim().toLowerCase();
+  return Boolean(allowedMimes && (mime === "" || allowedMimes.has(mime)));
 }
 
 export function createSfxImportOwner(projectId: string): SfxImportOwner {
@@ -84,10 +82,19 @@ async function upload(file: File, signal: AbortSignal): Promise<string> {
   form.append("file", file);
   form.append("name", uploadName(file.name));
   const response = await fetch("/api/repurpose/asset", { method: "POST", body: form, signal });
-  if (!response.ok) throw new Error(`Sound-effect upload failed (${response.status}).`);
-  const body = await response.json() as { ok?: boolean; path?: string; error?: string };
-  if (!body.ok || typeof body.path !== "string" || body.path.length === 0) {
-    throw new Error(body.error || "Sound-effect upload returned no saved path.");
+  const body = await response.json().catch(() => null) as {
+    ok?: boolean;
+    path?: string;
+    error?: string;
+  } | null;
+  if (!response.ok) {
+    throw new Error(body?.error || `Sound-effect upload failed (${response.status}).`);
+  }
+  if (!body?.ok || typeof body.path !== "string" || body.path.length === 0) {
+    throw new Error(body?.error || "Sound-effect upload returned no saved path.");
+  }
+  if (!isAbsoluteLocalMediaPath(body.path)) {
+    throw new Error("Sound-effect upload returned an unsafe saved local path.");
   }
   return body.path;
 }

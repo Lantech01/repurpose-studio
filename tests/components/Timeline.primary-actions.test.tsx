@@ -1,7 +1,8 @@
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, createEvent, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { Timeline } from "@/app/repurpose-studio/_components/Timeline";
 import { useRepurposeStore } from "@/lib/repurpose/store";
+import { createSfxImportOwner, registerSfxImportOwner, releaseSfxImportOwner } from "@/lib/repurpose/sfx-ingest-client";
 import type { Clip, Overlay, SfxClip } from "@/lib/repurpose/types";
 
 vi.mock("@/app/repurpose-studio/_components/ClipBlock", () => ({
@@ -182,4 +183,48 @@ test("an SFX drag does not snap back to its own live edge", () => {
   fireEvent.pointerUp(window);
 
   expect(useRepurposeStore.getState().sfxClips[0].timelineStart).toBeCloseTo(15 / 90, 5);
+});
+
+test("surfaces an external SFX drop failure and allows a successful retry", async () => {
+  const owner = registerSfxImportOwner(createSfxImportOwner("timeline-project"));
+  class AudioContextMock {
+    decodeAudioData = vi.fn().mockResolvedValue({ duration: 1 });
+    close = vi.fn().mockResolvedValue(undefined);
+  }
+  vi.stubGlobal("AudioContext", AudioContextMock);
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(new Response(JSON.stringify({ ok: false, error: "disk full" }), {
+      status: 507,
+      headers: { "Content-Type": "application/json" },
+    }))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true, path: "C:\\audio\\retry.wav" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }))
+    .mockResolvedValueOnce(new Response(new ArrayBuffer(4), { status: 200 }));
+  vi.stubGlobal("fetch", fetchMock);
+  useRepurposeStore.setState({ clips, duration: 2 });
+  const { getByTestId } = render(<Timeline sfxImportOwner={owner} />);
+  const target = getByTestId("sfx-row").parentElement as HTMLElement;
+  const file = new File(["x"], "retry.wav", { type: "audio/wav" });
+  const dataTransfer = { types: ["Files"], files: [file], getData: () => "", dropEffect: "none" };
+  const dropFile = () => {
+    const event = createEvent.drop(target, { dataTransfer });
+    Object.defineProperty(event, "clientX", { value: 0 });
+    fireEvent(target, event);
+  };
+
+  dropFile();
+  await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/retry\.wav.*disk full/i));
+  expect(useRepurposeStore.getState().sfxClips).toEqual([]);
+
+  dropFile();
+  await waitFor(() => {
+    const retryError = screen.queryByRole("alert");
+    if (retryError) throw new Error(retryError.textContent ?? "retry failed");
+    expect(useRepurposeStore.getState().sfxClips).toHaveLength(1);
+  });
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  releaseSfxImportOwner(owner);
+  vi.unstubAllGlobals();
 });

@@ -21,10 +21,21 @@ afterEach(() => {
 describe("project-owned SFX import", () => {
   it.each([
     ["hit.wav", "audio/wav"],
+    ["hit.wav", ""],
     ["hit.mp3", "audio/mpeg"],
     ["hit.m4a", "audio/mp4"],
   ])("accepts %s", (name, type) => {
     expect(classifySfxFile(new File(["x"], name, { type }))).toBe(true);
+  });
+
+  it.each([
+    ["spoof.ogg", "audio/wav"],
+    ["spoof.aac", "audio/mp4"],
+    ["spoof.wav", "audio/mpeg"],
+    ["spoof.mp3", "audio/mp4"],
+    ["spoof.m4a", "audio/wav"],
+  ])("rejects extension/MIME spoof %s (%s)", (name, type) => {
+    expect(classifySfxFile(new File(["x"], name, { type }))).toBe(false);
   });
 
   it("rejects unsupported files before upload", async () => {
@@ -72,6 +83,31 @@ describe("project-owned SFX import", () => {
     useRepurposeStore.getState().resetProject();
     resolveProbe(1);
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(useRepurposeStore.getState()).toMatchObject({ sfxAssets: [], sfxClips: [] });
+  });
+
+  it.each([
+    "relative/hit.wav",
+    "/api/repurpose/asset",
+    "blob:temporary",
+    "https://example.com/hit.wav",
+    "C:\\audio\\hit.wav?token=bad",
+  ])("rejects unsafe upload path %s before probing or committing", async (path) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      ok: true,
+      path,
+    }), { status: 200, headers: { "Content-Type": "application/json" } })));
+    const probeDuration = vi.fn().mockResolvedValue(1);
+    const owner = registerSfxImportOwner(createSfxImportOwner("project-a"));
+
+    await expect(importSfxFile(
+      new File(["x"], "hit.wav", { type: "audio/wav" }),
+      2,
+      owner,
+      { probeDuration }
+    )).rejects.toThrow(/saved path|local path/i);
+
+    expect(probeDuration).not.toHaveBeenCalled();
     expect(useRepurposeStore.getState()).toMatchObject({ sfxAssets: [], sfxClips: [] });
   });
 });

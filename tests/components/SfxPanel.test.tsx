@@ -74,6 +74,50 @@ describe("SfxPanel workspace", () => {
     expect(pause).toHaveBeenCalledTimes(2);
   });
 
+  it("clears audition ownership and UI when audio ends naturally", () => {
+    const instances: AudioMock[] = [];
+    class AudioMock {
+      pause = vi.fn();
+      play = vi.fn().mockResolvedValue(undefined);
+      currentTime = 0;
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor() { instances.push(this); }
+    }
+    vi.stubGlobal("Audio", AudioMock);
+    render(<SfxPanel projectId="project-a" sfxImportOwner={owner} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Audition Mouse Click" }));
+    expect(screen.getByRole("button", { name: "Stop Mouse Click" })).toBeInTheDocument();
+    act(() => instances[0].onended?.());
+
+    expect(screen.getByRole("button", { name: "Audition Mouse Click" })).toBeInTheDocument();
+    expect(instances[0].onended).toBeNull();
+    expect(instances[0].onerror).toBeNull();
+  });
+
+  it("clears audition ownership and reports an accessible error on media failure", async () => {
+    const instances: AudioMock[] = [];
+    class AudioMock {
+      pause = vi.fn();
+      play = vi.fn().mockResolvedValue(undefined);
+      currentTime = 0;
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor() { instances.push(this); }
+    }
+    vi.stubGlobal("Audio", AudioMock);
+    render(<SfxPanel projectId="project-a" sfxImportOwner={owner} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Audition Mouse Click" }));
+    act(() => instances[0].onerror?.());
+
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/could not audition/i));
+    expect(screen.getByRole("button", { name: "Audition Mouse Click" })).toBeInTheDocument();
+    expect(instances[0].onended).toBeNull();
+    expect(instances[0].onerror).toBeNull();
+  });
+
   it("regenerates automatic clips atomically while preserving manual clips", async () => {
     useRepurposeStore.setState({ sfxClips: [manual], past: [], future: [] });
     render(<SfxPanel projectId="project-a" sfxImportOwner={owner} />);
@@ -100,6 +144,93 @@ describe("SfxPanel workspace", () => {
     resolveFetch(new Response(new ArrayBuffer(4), { status: 200 }));
     await waitFor(() => expect(useRepurposeStore.getState().sfxGenerating).toBe(false));
     expect(useRepurposeStore.getState().sfxClips).toEqual([manual]);
+  });
+
+  it.each(["project", "epoch", "clips", "words", "duration", "revision"] as const)(
+    "cancels generation without stale commits or errors when %s ownership changes",
+    async (changed) => {
+      useRepurposeStore.setState({ sfxClips: [manual], past: [], future: [] });
+      let resolveFetch!: (response: Response) => void;
+      vi.stubGlobal("fetch", vi.fn().mockImplementation(() => new Promise((resolve) => { resolveFetch = resolve; })));
+      const rendered = render(<SfxPanel projectId="project-a" sfxImportOwner={owner} />);
+      fireEvent.click(screen.getByRole("button", { name: "Generate automatic effects" }));
+      await waitFor(() => expect(resolveFetch).toBeTypeOf("function"));
+
+      act(() => {
+        const state = useRepurposeStore.getState();
+        if (changed === "project") rendered.rerender(<SfxPanel projectId="project-b" sfxImportOwner={owner} />);
+        if (changed === "epoch") useRepurposeStore.setState({ projectEpoch: state.projectEpoch + 1 });
+        if (changed === "clips") useRepurposeStore.setState({ clips: [...state.clips] });
+        if (changed === "words") useRepurposeStore.setState({ words: [...state.words] });
+        if (changed === "duration") useRepurposeStore.setState({ duration: 4 });
+        if (changed === "revision") state.setSfxClipMuted(manual.id, true);
+      });
+      resolveFetch(new Response(new ArrayBuffer(4), { status: 200 }));
+
+      await waitFor(() => expect(useRepurposeStore.getState().sfxGenerating).toBe(false));
+      expect(useRepurposeStore.getState().sfxClips.every((clip) => clip.origin === "manual")).toBe(true);
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    }
+  );
+
+  it.each([
+    { label: "source request", install: () => vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 404 }))), message: /HTTP 404/i },
+    { label: "decoded source validation", install: () => {
+      class SilentAudioContextMock {
+        decodeAudioData = vi.fn().mockResolvedValue({
+          duration: 1, length: 2, numberOfChannels: 1, sampleRate: 2,
+          getChannelData: () => Float32Array.from([0, 0]),
+        });
+        close = close;
+      }
+      vi.stubGlobal("AudioContext", SilentAudioContextMock);
+    }, message: /silent/i },
+  ])("keeps the document atomic when $label validation fails", async ({ install, message }) => {
+    useRepurposeStore.setState({ sfxClips: [manual], past: [], future: [] });
+    install();
+    render(<SfxPanel projectId="project-a" sfxImportOwner={owner} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate automatic effects" }));
+
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(message));
+    expect(useRepurposeStore.getState().sfxClips).toEqual([manual]);
+    expect(useRepurposeStore.getState().past).toEqual([]);
+  });
+
+  it("aborts generation and clears transient state on unmount", async () => {
+    useRepurposeStore.setState({ sfxClips: [manual] });
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => new Promise(() => undefined)));
+    const rendered = render(<SfxPanel projectId="project-a" sfxImportOwner={owner} />);
+    fireEvent.click(screen.getByRole("button", { name: "Generate automatic effects" }));
+    await waitFor(() => expect(useRepurposeStore.getState().sfxGenerating).toBe(true));
+
+    rendered.unmount();
+
+    expect(useRepurposeStore.getState().sfxGenerating).toBe(false);
+    expect(useRepurposeStore.getState().sfxClips).toEqual([manual]);
+  });
+
+  it("auditions an available project import through its authoritative asset URL", () => {
+    const constructed: string[] = [];
+    const play = vi.fn().mockResolvedValue(undefined);
+    class AudioMock {
+      pause = vi.fn();
+      play = play;
+      currentTime = 0;
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor(url: string) { constructed.push(url); }
+    }
+    vi.stubGlobal("Audio", AudioMock);
+    useRepurposeStore.setState({
+      sfxAssets: [{ id: "asset", name: "Imported hit", sourcePath: "C:\\audio\\hit.wav", srcDuration: 1 }],
+    });
+    render(<SfxPanel projectId="project-a" sfxImportOwner={owner} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Audition Imported hit" }));
+
+    expect(constructed).toEqual([`/api/repurpose/asset?path=${encodeURIComponent("C:\\audio\\hit.wav")}`]);
+    expect(play).toHaveBeenCalledOnce();
   });
 
   it("edits selected clip controls with one gesture history entry and supports replace, duplicate, mute, and delete", () => {

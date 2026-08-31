@@ -64,6 +64,7 @@ import {
   pxToTime,
   clamp,
   snapTime,
+  snapMovedSpan,
 } from "./timeline-utils";
 
 export interface TimelineProps {
@@ -298,6 +299,7 @@ export function Timeline({
 
   const [pixelsPerSecond, setPixelsPerSecond] = useState(DEFAULT_PPS);
   const [snapGuideX, setSnapGuideX] = useState<number | null>(null);
+  const [sfxDropError, setSfxDropError] = useState<string | null>(null);
   // Content-space x of the coral drop indicator while dragging a media file over
   // the tracks (null = no drag in progress). Shows exactly where a dropped
   // image/video overlay would start.
@@ -480,11 +482,19 @@ export function Timeline({
       const audioFiles = files.filter(classifySfxFile);
       const overlayFiles = files.filter((file) => !classifySfxFile(file));
       if (audioFiles.length > 0 && sfxImportOwner) {
+        setSfxDropError(null);
         void (async () => {
           for (const file of audioFiles) {
-            await importSfxFile(file, atTime, sfxImportOwner);
+            try {
+              await importSfxFile(file, atTime, sfxImportOwner);
+            } catch (error) {
+              if (error instanceof DOMException && error.name === "AbortError") continue;
+              const message = error instanceof Error ? error.message : "Sound-effect import failed.";
+              setSfxDropError(`${file.name}: ${message}`);
+              break;
+            }
           }
-        })().catch(() => undefined);
+        })();
       }
       if (overlayFiles.length > 0) {
         void ingestOverlayFiles(
@@ -875,24 +885,33 @@ export function Timeline({
           drag.token = beginSfxGesture(drag.clip.id, kind);
         }
         if (!drag.token) return;
-        const anchor = drag.edge === "end"
-          ? sfxClipTimelineEnd(drag.clip)
-          : drag.clip.timelineStart;
+        const anchor = drag.edge === "end" ? sfxClipTimelineEnd(drag.clip) : drag.clip.timelineStart;
         const ownEnd = sfxClipTimelineEnd(drag.clip);
         const liveClip = useRepurposeStore.getState().sfxClips.find(
           (clip) => clip.id === drag.clip.id
         );
         const liveEnd = liveClip ? sfxClipTimelineEnd(liveClip) : ownEnd;
-        const { time, snapped } = snapTime(
-          anchor + pxToTime(deltaPx, pixelsPerSecond),
-          snapTargets.filter((target) => (
+        const selfFilteredTargets = snapTargets.filter((target) => (
             Math.abs(target - drag.clip.timelineStart) > .001
             && Math.abs(target - ownEnd) > .001
             && Math.abs(target - (liveClip?.timelineStart ?? drag.clip.timelineStart)) > .001
             && Math.abs(target - liveEnd) > .001
-          )),
-          snapThresholdSeconds
-        );
+        ));
+        const candidate = anchor + pxToTime(deltaPx, pixelsPerSecond);
+        if (drag.edge === "body") {
+          const snappedMove = snapMovedSpan(
+            candidate,
+            drag.clip.sourceEnd - drag.clip.sourceStart,
+            selfFilteredTargets,
+            snapThresholdSeconds
+          );
+          setSnapGuideX(snappedMove.snapTarget === null
+            ? null
+            : timeToPx(snappedMove.snapTarget, pixelsPerSecond));
+          updateSfxGesture(drag.token, snappedMove.start);
+          return;
+        }
+        const { time, snapped } = snapTime(candidate, selfFilteredTargets, snapThresholdSeconds);
         setSnapGuideX(snapped ? timeToPx(time, pixelsPerSecond) : null);
         updateSfxGesture(drag.token, time);
         return;
@@ -1671,6 +1690,11 @@ export function Timeline({
                  className="absolute left-0 right-0 border-b border-emerald-500/25"
                  style={{ top: audioRowTop, height: sfxRowHeight }}
                >
+                 {sfxDropError && (
+                   <p role="alert" className="absolute left-2 top-1 z-40 max-w-[28rem] rounded bg-red-950/90 px-2 py-1 text-[10px] text-red-200">
+                     {sfxDropError}
+                   </p>
+                 )}
                  {sfxClips.map((clip, index) => (
                    <TimelineSfxBlock
                      key={clip.id}

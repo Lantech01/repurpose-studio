@@ -87,12 +87,22 @@ export function SfxPanel({ projectId, sfxImportOwner }: { projectId: string; sfx
   const generationRef = useRef<{ token: number; controller: AbortController } | null>(null);
   const tokenRef = useRef(0);
 
-  const stopAudition = useCallback(() => {
-    audioRef.current?.pause();
-    if (audioRef.current) audioRef.current.currentTime = 0;
+  const retireAudition = useCallback((audio: HTMLAudioElement, stopPlayback: boolean) => {
+    audio.onended = null;
+    audio.onerror = null;
+    if (stopPlayback) {
+      audio.pause();
+      audio.currentTime = 0;
+    }
+    if (audioRef.current !== audio) return;
     audioRef.current = null;
     setAuditionIdentity(null);
   }, []);
+
+  const stopAudition = useCallback(() => {
+    const audio = audioRef.current;
+    if (audio) retireAudition(audio, true);
+  }, [retireAudition]);
 
   useEffect(() => stopAudition, [stopAudition]);
   useEffect(() => () => {
@@ -141,9 +151,15 @@ export function SfxPanel({ projectId, sfxImportOwner }: { projectId: string; sfx
     const audio = new Audio(url);
     audioRef.current = audio;
     setAuditionIdentity(identity);
+    audio.onended = () => retireAudition(audio, false);
+    audio.onerror = () => {
+      if (audioRef.current !== audio) return;
+      retireAudition(audio, true);
+      setError("Could not audition that sound effect.");
+    };
     void audio.play().catch(() => {
       if (audioRef.current === audio) {
-        stopAudition();
+        retireAudition(audio, true);
         setError("Could not audition that sound effect.");
       }
     });

@@ -28,10 +28,20 @@ export function useSfxPreview(
   onWarning: (message: string | null) => void = () => {}
 ): void {
   const contextRef = useRef<AudioContext | null>(null);
-  const nodesRef = useRef<Array<{ source: AudioBufferSourceNode; gain: GainNode }>>([]);
-  const cacheRef = useRef(new Map<string, Promise<{ buffer: AudioBuffer; sourceBaseGain: number }>>());
-  const operationRef = useRef<{ token: number; controller: AbortController } | null>(null);
+  const nodesRef = useRef<Array<{ source: AudioBufferSourceNode; gain: GainNode; token: number }>>([]);
+  const cacheRef = useRef(new Map<string, {
+    controller: AbortController;
+    status: "pending" | "ready" | "failed";
+    promise: Promise<{ buffer: AudioBuffer; sourceBaseGain: number }>;
+  }>());
+  const operationRef = useRef<{
+    token: number;
+    documentToken: number;
+    projectEpoch: number;
+    revision: number;
+  } | null>(null);
   const tokenRef = useRef(0);
+  const documentTokenRef = useRef(0);
   const clipsRef = useRef(clips);
   const assetsRef = useRef(assets);
   const warningRef = useRef(onWarning);
@@ -49,18 +59,73 @@ export function useSfxPreview(
     return contextRef.current;
   };
 
-  const stopNodes = () => {
-    for (const node of nodesRef.current) {
+  const disposeNode = (
+    node: { source: AudioBufferSourceNode; gain: GainNode; token: number },
+    stop: boolean
+  ) => {
+    node.source.onended = null;
+    if (stop) {
       try { node.source.stop(); } catch { /* already stopped */ }
-      node.source.disconnect();
-      node.gain.disconnect();
     }
-    nodesRef.current = [];
+    node.source.disconnect();
+    node.gain.disconnect();
+    nodesRef.current = nodesRef.current.filter((candidate) => candidate !== node);
   };
 
-  const schedule = (head: number, requestedRate: number) => {
-    operationRef.current?.controller.abort();
+  const stopNodes = () => {
+    for (const node of [...nodesRef.current]) disposeNode(node, true);
+  };
+
+  const invalidateSchedule = () => {
+    tokenRef.current += 1;
+    operationRef.current = null;
     stopNodes();
+  };
+
+  const retireLoadsExcept = (identities: ReadonlySet<string> | null) => {
+    for (const [identity, entry] of cacheRef.current) {
+      if (identities?.has(identity)) continue;
+      cacheRef.current.delete(identity);
+      if (entry.status === "pending") entry.controller.abort();
+    }
+  };
+
+  const loadSource = (
+    resolved: ReturnType<typeof resolveSfxSource>,
+    context: AudioContext
+  ) => {
+    const existing = cacheRef.current.get(resolved.identity);
+    if (existing && existing.status !== "failed") return existing.promise;
+    if (existing) cacheRef.current.delete(resolved.identity);
+    const controller = new AbortController();
+    const entry: {
+      controller: AbortController;
+      status: "pending" | "ready" | "failed";
+      promise: Promise<{ buffer: AudioBuffer; sourceBaseGain: number }>;
+    } = {
+      controller,
+      status: "pending",
+      promise: Promise.resolve(null as never),
+    };
+    entry.promise = loadResolvedSfxAudio(resolved, context, controller.signal).then(
+      (loaded) => {
+        entry.status = "ready";
+        return loaded;
+      },
+      (error) => {
+        entry.status = "failed";
+        if (cacheRef.current.get(resolved.identity) === entry) {
+          cacheRef.current.delete(resolved.identity);
+        }
+        throw error;
+      }
+    );
+    cacheRef.current.set(resolved.identity, entry);
+    return entry.promise;
+  };
+
+  const schedule = () => {
+    invalidateSchedule();
     const state = useRepurposeStore.getState();
     if (!state.isPlaying) return;
     const context = getContext();
@@ -68,39 +133,45 @@ export function useSfxPreview(
       warningRef.current("Sound-effect preview is unavailable in this browser.");
       return;
     }
-    const rate = requestedRate > 0 ? requestedRate : 1;
-    const operation = { token: ++tokenRef.current, controller: new AbortController() };
+    const operation = {
+      token: ++tokenRef.current,
+      documentToken: documentTokenRef.current,
+      projectEpoch: state.projectEpoch,
+      revision: state.sfxDocumentRevision,
+    };
     operationRef.current = operation;
     warningRef.current(null);
     void context.resume();
 
     for (const clip of clipsRef.current) {
-      const clipEnd = sfxClipTimelineEnd(clip);
-      if (clip.muted || clipEnd <= head) continue;
       const resolved = resolveSfxSource(clip.source, assetsRef.current);
       if (resolved.missing || !resolved.url) {
         warningRef.current(`Sound effect “${clip.name}” is unavailable and was skipped.`);
         continue;
       }
-      let loaded = cacheRef.current.get(resolved.identity);
-      if (!loaded) {
-        loaded = loadResolvedSfxAudio(resolved, context, operation.controller.signal);
-        cacheRef.current.set(resolved.identity, loaded);
-        void loaded.catch(() => {
-          if (cacheRef.current.get(resolved.identity) === loaded) cacheRef.current.delete(resolved.identity);
-        });
-      }
+      const loaded = loadSource(resolved, context);
       void loaded.then(({ buffer, sourceBaseGain }) => {
+        const liveState = useRepurposeStore.getState();
         if (
           operationRef.current !== operation
-          || operation.controller.signal.aborted
-          || !useRepurposeStore.getState().isPlaying
+          || operation.documentToken !== documentTokenRef.current
+          || liveState.projectEpoch !== operation.projectEpoch
+          || liveState.sfxDocumentRevision !== operation.revision
+          || !liveState.isPlaying
         ) return;
+        const liveClip = clipsRef.current.find((candidate) => candidate.id === clip.id);
+        if (!liveClip) return;
+        const liveResolved = resolveSfxSource(liveClip.source, assetsRef.current);
+        if (liveResolved.identity !== resolved.identity || liveResolved.missing) return;
+        const head = liveState.playhead;
+        const rate = liveState.playbackRate > 0 ? liveState.playbackRate : 1;
+        const clipEnd = sfxClipTimelineEnd(liveClip);
+        if (liveClip.muted || clipEnd <= head) return;
         const now = context.currentTime;
-        const active = head >= clip.timelineStart;
-        const when = active ? now : now + (clip.timelineStart - head) / rate;
-        const offset = clip.sourceStart + (active ? head - clip.timelineStart : 0);
-        const duration = Math.max(0, clip.sourceEnd - offset);
+        const active = head >= liveClip.timelineStart;
+        const when = active ? now : now + (liveClip.timelineStart - head) / rate;
+        const offset = liveClip.sourceStart + (active ? head - liveClip.timelineStart : 0);
+        const duration = Math.max(0, Math.min(liveClip.sourceEnd, buffer.duration) - offset);
         if (duration <= 0 || offset >= buffer.duration) return;
         const source = context.createBufferSource();
         const gain = context.createGain();
@@ -108,14 +179,14 @@ export function useSfxPreview(
         source.playbackRate.value = rate;
         source.connect(gain);
         gain.connect(context.destination);
-        const baseGain = sourceBaseGain * clip.gain;
-        const fades = effectiveSfxFadeDurations(clip);
-        const local = Math.max(0, head - clip.timelineStart);
+        const baseGain = sourceBaseGain * liveClip.gain;
+        const fades = effectiveSfxFadeDurations(liveClip);
+        const local = Math.max(0, head - liveClip.timelineStart);
         const initialFadeIn = fades.fadeInSec > 0 ? Math.min(1, local / fades.fadeInSec) : 1;
         const remaining = clipEnd - head;
         const initialFadeOut = fades.fadeOutSec > 0 ? Math.min(1, remaining / fades.fadeOutSec) : 1;
         gain.gain.setValueAtTime(baseGain * Math.min(initialFadeIn, initialFadeOut), when);
-        const fadeInEnd = clip.timelineStart + fades.fadeInSec;
+        const fadeInEnd = liveClip.timelineStart + fades.fadeInSec;
         if (fades.fadeInSec > 0 && fadeInEnd > head) {
           gain.gain.linearRampToValueAtTime(baseGain, now + (fadeInEnd - head) / rate);
         }
@@ -126,22 +197,23 @@ export function useSfxPreview(
           }
           gain.gain.linearRampToValueAtTime(0, now + (clipEnd - head) / rate);
         }
+        const node = { source, gain, token: operation.token };
+        source.onended = () => disposeNode(node, false);
+        nodesRef.current.push(node);
         source.start(when, offset, duration);
-        nodesRef.current.push({ source, gain });
       }).catch((error) => {
-        if (operationRef.current !== operation || operation.controller.signal.aborted) return;
+        if (operationRef.current !== operation) return;
         warningRef.current(`Sound effect “${clip.name}” could not be decoded: ${error instanceof Error ? error.message : "unknown error"}`);
       });
     }
   };
 
   useEffect(() => {
+    documentTokenRef.current += 1;
+    const identities = new Set(clips.map((clip) => resolveSfxSource(clip.source, assets).identity));
+    retireLoadsExcept(identities);
     const state = useRepurposeStore.getState();
-    if (state.isPlaying) schedule(state.playhead, state.playbackRate);
-    return () => {
-      operationRef.current?.controller.abort();
-      stopNodes();
-    };
+    if (state.isPlaying) schedule();
     // Document identity changes invalidate every scheduled node.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clips, assets]);
@@ -153,15 +225,21 @@ export function useSfxPreview(
       const seeked = state.isPlaying && Math.abs(state.playhead - previous.playhead) > SEEK_JUMP_SEC;
       const rateChanged = state.playbackRate !== previous.playbackRate;
       const revisionChanged = state.sfxDocumentRevision !== previous.sfxDocumentRevision;
-      if (playChanged || seeked || rateChanged || revisionChanged) {
-        schedule(state.playhead, state.playbackRate);
+      const projectChanged = state.projectEpoch !== previous.projectEpoch;
+      if (projectChanged) {
+        invalidateSchedule();
+        retireLoadsExcept(null);
+      } else if (revisionChanged) {
+        invalidateSchedule();
+      } else if (playChanged || seeked || rateChanged) {
+        schedule();
       }
       previous = state;
     });
     return () => {
       unsubscribe();
-      operationRef.current?.controller.abort();
-      stopNodes();
+      invalidateSchedule();
+      retireLoadsExcept(null);
       const context = contextRef.current;
       contextRef.current = null;
       if (context) void context.close();

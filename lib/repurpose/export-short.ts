@@ -58,57 +58,8 @@ import { overlayUrlForPath } from "./overlay-ingest";
 import { effectiveSplitRatio } from "./split-ratio";
 import { resolveOverlayAppearanceAt } from "./overlay-effects";
 import type { Clip, FootageMeta, MusicTrack, Overlay, SfxAsset, SfxClip } from "./types";
-import { effectiveSfxFadeDurations } from "./sfx-clips";
-import { loadResolvedSfxAudio, secondsToSample } from "./sfx-audio";
-import { resolveSfxSource } from "./sfx-source";
-
-export interface SfxPcmSource {
-  clip: SfxClip;
-  channels: readonly Float32Array[];
-  sampleRate: number;
-  sourceBaseGain: number;
-}
-
-export function mixSfxClipsPcm(
-  outputChannels: readonly Float32Array[],
-  outputSampleRate: number,
-  sources: readonly SfxPcmSource[]
-): void {
-  for (const { clip, channels, sampleRate, sourceBaseGain } of sources) {
-    if (clip.muted || channels.length === 0 || sampleRate <= 0 || outputSampleRate <= 0) continue;
-    const outputStart = secondsToSample(clip.timelineStart, outputSampleRate);
-    const sourceStart = secondsToSample(clip.sourceStart, sampleRate);
-    const sourceEnd = secondsToSample(clip.sourceEnd, sampleRate);
-    const sourceFrames = Math.max(0, sourceEnd - sourceStart);
-    const outputFrames = secondsToSample(clip.sourceEnd - clip.sourceStart, outputSampleRate);
-    const frames = Math.min(outputFrames, outputChannels[0]?.length - outputStart);
-    if (frames <= 0 || sourceFrames <= 0) continue;
-    const fades = effectiveSfxFadeDurations(clip, clip.sourceEnd - clip.sourceStart);
-    const fadeInFrames = secondsToSample(fades.fadeInSec, outputSampleRate);
-    const fadeOutFrames = secondsToSample(fades.fadeOutSec, outputSampleRate);
-    for (let channel = 0; channel < outputChannels.length; channel += 1) {
-      const source = channels[Math.min(channel, channels.length - 1)];
-      const output = outputChannels[channel];
-      for (let frame = 0; frame < frames; frame += 1) {
-        const sourcePosition = sourceStart + frame * sampleRate / outputSampleRate;
-        const low = Math.min(source.length - 1, Math.floor(sourcePosition));
-        const high = Math.min(source.length - 1, low + 1);
-        const fraction = sourcePosition - low;
-        const sample = source[low] + (source[high] - source[low]) * fraction;
-        const fadeIn = fadeInFrames > 0 ? Math.min(1, frame / fadeInFrames) : 1;
-        const remaining = frames - frame;
-        const fadeOut = fadeOutFrames > 0 ? Math.min(1, remaining / fadeOutFrames) : 1;
-        output[outputStart + frame] +=
-          sample * sourceBaseGain * clip.gain * Math.min(fadeIn, fadeOut);
-      }
-    }
-  }
-  for (const output of outputChannels) {
-    for (let frame = 0; frame < output.length; frame += 1) {
-      output[frame] = Math.max(-1, Math.min(1, output[frame]));
-    }
-  }
-}
+import { mixPreparedSfxIntoBuffer, prepareSfxForExport } from "./sfx-export";
+export { mixSfxClipsPcm } from "./sfx-export";
 
 /**
  * Output resolution presets. Both are 9:16 vertical. "1080p" is the standard
@@ -1423,92 +1374,6 @@ export async function assembleClipAudio(
       /* ignore */
     }
   }
-}
-
-interface PreparedSfxSource {
-  buffer: AudioBuffer;
-  sourceBaseGain: number;
-}
-
-async function prepareSfxForExport(
-  clips: readonly SfxClip[],
-  assets: readonly SfxAsset[],
-  abortSignal?: AbortSignal
-): Promise<Map<string, PreparedSfxSource>> {
-  const prepared = new Map<string, PreparedSfxSource>();
-  if (clips.length === 0) return prepared;
-  const OfflineCtx =
-    (typeof OfflineAudioContext !== "undefined" && OfflineAudioContext)
-    || (globalThis as { webkitOfflineAudioContext?: typeof OfflineAudioContext }).webkitOfflineAudioContext;
-  if (!OfflineCtx) throw new Error("Sound effects cannot be decoded in this browser.");
-  const context = new OfflineCtx(1, 1, 48_000);
-  for (const clip of clips) {
-    abortSignal?.throwIfAborted();
-    const resolved = resolveSfxSource(clip.source, assets);
-    const importedAssetId = clip.source.kind === "imported" ? clip.source.assetId : null;
-    const rawPath = importedAssetId !== null
-      ? assets.find((asset) => asset.id === importedAssetId)?.sourcePath
-      : clip.source.kind === "legacy"
-        ? clip.source.sourcePath
-        : null;
-    if (resolved.missing || !resolved.url || rawPath?.startsWith("blob:")) {
-      throw new Error(`Sound effect “${clip.name}” is missing or unavailable.`);
-    }
-    if (prepared.has(resolved.identity)) continue;
-    try {
-      prepared.set(
-        resolved.identity,
-        await loadResolvedSfxAudio(
-          resolved,
-          context,
-          abortSignal ?? new AbortController().signal
-        )
-      );
-    } catch (error) {
-      if (isAbortError(error) || abortSignal?.aborted) throw error;
-      throw new Error(`Sound effect “${clip.name}” could not be decoded: ${error instanceof Error ? error.message : "unknown error"}`);
-    }
-  }
-  return prepared;
-}
-
-function mixPreparedSfxIntoBuffer(
-  base: AudioBuffer | null,
-  clips: readonly SfxClip[],
-  assets: readonly SfxAsset[],
-  prepared: ReadonlyMap<string, PreparedSfxSource>,
-  duration: number,
-  abortSignal?: AbortSignal
-): AudioBuffer {
-  abortSignal?.throwIfAborted();
-  const OfflineCtx =
-    (typeof OfflineAudioContext !== "undefined" && OfflineAudioContext)
-    || (globalThis as { webkitOfflineAudioContext?: typeof OfflineAudioContext }).webkitOfflineAudioContext;
-  if (!OfflineCtx) throw new Error("Sound effects cannot be mixed in this browser.");
-  const sampleRate = base?.sampleRate ?? 48_000;
-  const channelCount = base?.numberOfChannels ?? 2;
-  const frameCount = base?.length ?? Math.max(1, secondsToSample(duration, sampleRate));
-  const context = new OfflineCtx(channelCount, frameCount, sampleRate);
-  const output = context.createBuffer(channelCount, frameCount, sampleRate);
-  const channels = Array.from({ length: channelCount }, (_, channel) => output.getChannelData(channel));
-  if (base) channels.forEach((channel, index) => channel.set(base.getChannelData(index)));
-  const sources = clips.map((clip) => {
-    const resolved = resolveSfxSource(clip.source, assets);
-    const source = prepared.get(resolved.identity);
-    if (!source) throw new Error(`Sound effect “${clip.name}” was not prepared for export.`);
-    return {
-      clip,
-      channels: Array.from(
-        { length: source.buffer.numberOfChannels },
-        (_, channel) => source.buffer.getChannelData(channel)
-      ),
-      sampleRate: source.buffer.sampleRate,
-      sourceBaseGain: source.sourceBaseGain,
-    };
-  });
-  mixSfxClipsPcm(channels, sampleRate, sources);
-  abortSignal?.throwIfAborted();
-  return output;
 }
 
 /**
