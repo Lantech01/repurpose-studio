@@ -596,7 +596,9 @@ describe("atomic transcript store action", () => {
     expect(state.words).toEqual(oldWords);
     expect(state.overlays).toEqual(before.overlays);
     expect(state.markers).toEqual(before.markers);
-    expect(state.sfxTrack).toEqual(before.sfxTrack);
+    // The restored SFX document has no automatic legacy bridge clip, so history
+    // restoration deterministically clears the temporary runtime track.
+    expect(state.sfxTrack).toBeNull();
     expect(state.sfxClips).toEqual(before.sfxClips);
     expect(state.editStats).toEqual(stats);
     expect(state.playhead).toBe(2);
@@ -608,6 +610,7 @@ describe("atomic transcript store action", () => {
     expect(state.clips[0]).toMatchObject({ id: "rebuilt", timelineStart: 0, timelineEnd: 2 });
     expect(state.words).toEqual(newWords);
     expect(state.captionsEnabled).toBe(true);
+    expect(state.sfxTrack).toBeNull();
     expect(state.sfxClips).toEqual([
       expect.objectContaining({ id: "sfx-crossing-new-end", sourceEnd: 0.5 }),
     ]);

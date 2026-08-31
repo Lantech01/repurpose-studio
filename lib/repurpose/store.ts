@@ -45,6 +45,7 @@ import {
   trimSfxClipLeft as trimSfxClipLeftValue,
   trimSfxClipRight as trimSfxClipRightValue,
 } from "./sfx-clips";
+import { resolveSfxSource } from "./sfx-source";
 import type { EditStats } from "./ingest";
 import { DEFAULT_SMART_TRANSITION, footageUrlForPath } from "./ingest";
 import type {
@@ -390,6 +391,21 @@ function sfxClipContentEqual(a: SfxClip, b: SfxClip): boolean {
     { ...a, id: b.id, origin: b.origin },
     b
   );
+}
+
+function runtimeSfxTrackFromDocument(clips: readonly SfxClip[]): SfxTrack | null {
+  const legacy = clips.find(
+    (clip) => clip.origin === "automatic" && clip.source.kind === "legacy"
+  );
+  if (!legacy || legacy.source.kind !== "legacy") return null;
+  const resolved = resolveSfxSource(legacy.source, []);
+  if (!resolved.url) return null;
+  return {
+    src: resolved.url,
+    sourcePath: legacy.source.sourcePath,
+    durationSec: legacy.source.srcDuration,
+    gain: legacy.gain,
+  };
 }
 
 function recomputeTimeline(clips: Clip[]): Clip[] {
@@ -1068,12 +1084,14 @@ function captureSnapshot(state: RepurposeState): EditableSnapshot {
 function snapshotToPatch(snap: EditableSnapshot): Partial<RepurposeState> {
   const clips = normalizeClipSplitRatios(snap.clips);
   const duration = deriveDuration(clips);
+  const sfxClips = constrainSfxClipsToDuration(snap.sfxClips, duration);
   return {
     ...snap,
     clips,
     splitRatio: parsePersistedSplitRatio(snap.splitRatio, 0.5),
     duration,
-    sfxClips: constrainSfxClipsToDuration(snap.sfxClips, duration),
+    sfxClips,
+    sfxTrack: runtimeSfxTrackFromDocument(sfxClips),
   };
 }
 
@@ -2900,6 +2918,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       duration,
       selectedClipId: copy.id,
       ...constrainCurrentSfxToDuration(duration),
+      selectedSfxClipId: null,
     });
   },
 
@@ -3047,6 +3066,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       // Select the second half so a follow-up edit (delete/trim) targets the
       // piece after the cut -- the common "split then remove the tail" flow.
       selectedClipId: secondHalf.id,
+      selectedSfxClipId: null,
     });
   },
 
@@ -3256,6 +3276,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       selectedOverlayId: id,
       selectedOverlayIds: [id],
       selectedClipId: null,
+      selectedSfxClipId: null,
     });
     return id;
   },
@@ -3629,6 +3650,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       selectedOverlayId: copyId,
       selectedOverlayIds: [copyId],
       selectedClipId: null,
+      selectedSfxClipId: null,
     });
     // Return the fresh id so a direct-manipulation caller (Cmd/Ctrl-drag clone)
     // can begin a move gesture on the COPY straight away.

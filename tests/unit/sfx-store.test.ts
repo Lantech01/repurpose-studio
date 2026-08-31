@@ -302,6 +302,88 @@ describe("temporary legacy bridge", () => {
     expect(useRepurposeStore.getState().sfxClips).toHaveLength(2);
     expect(useRepurposeStore.getState().past).toHaveLength(1);
   });
+
+  it("keeps the runtime bridge equivalent when setting a track is undone and redone", () => {
+    useRepurposeStore.getState().setSfxTrack(track);
+    const revisionAfterSet = useRepurposeStore.getState().sfxDocumentRevision;
+
+    useRepurposeStore.getState().undo();
+    expect(useRepurposeStore.getState()).toMatchObject({
+      sfxTrack: null,
+      past: [],
+      future: [expect.any(Object)],
+    });
+    expect(useRepurposeStore.getState().sfxDocumentRevision).toBeGreaterThan(
+      revisionAfterSet
+    );
+
+    useRepurposeStore.getState().redo();
+    expect(useRepurposeStore.getState().sfxTrack).toEqual({
+      src: `/api/repurpose/sfx?path=${encodeURIComponent(track.sourcePath)}`,
+      sourcePath: track.sourcePath,
+      durationSec: track.durationSec,
+      gain: track.gain,
+    });
+    expect(useRepurposeStore.getState()).toMatchObject({
+      past: [expect.any(Object)],
+      future: [],
+    });
+  });
+
+  it("keeps runtime gain equivalent through Undo and Redo", () => {
+    useRepurposeStore.getState().setSfxTrack(track);
+    useRepurposeStore.getState().setSfxGain(1.25);
+
+    useRepurposeStore.getState().undo();
+    expect(useRepurposeStore.getState().sfxTrack).toMatchObject({ gain: track.gain });
+    expect(useRepurposeStore.getState().sfxClips[0].gain).toBe(track.gain);
+    expect(useRepurposeStore.getState().past).toHaveLength(1);
+
+    useRepurposeStore.getState().redo();
+    expect(useRepurposeStore.getState().sfxTrack).toMatchObject({ gain: 1.25 });
+    expect(useRepurposeStore.getState().sfxClips[0].gain).toBe(1.25);
+    expect(useRepurposeStore.getState().past).toHaveLength(2);
+  });
+
+  it("restores and clears the runtime bridge when clear is undone and redone", () => {
+    useRepurposeStore.getState().setSfxTrack(track);
+    useRepurposeStore.getState().clearSfxTrack();
+    expect(useRepurposeStore.getState().sfxTrack).toBeNull();
+
+    useRepurposeStore.getState().undo();
+    expect(useRepurposeStore.getState().sfxTrack).toEqual({
+      src: `/api/repurpose/sfx?path=${encodeURIComponent(track.sourcePath)}`,
+      sourcePath: track.sourcePath,
+      durationSec: track.durationSec,
+      gain: track.gain,
+    });
+    expect(useRepurposeStore.getState().past).toHaveLength(1);
+
+    useRepurposeStore.getState().redo();
+    expect(useRepurposeStore.getState().sfxTrack).toBeNull();
+    expect(useRepurposeStore.getState().past).toHaveLength(2);
+  });
+
+  it("does not mistake a manual legacy clip for the runtime bridge", () => {
+    useRepurposeStore.setState({
+      sfxClips: [sfx({
+        source: {
+          kind: "legacy",
+          sourcePath: "C:\\audio\\manual.wav",
+          srcDuration: 4,
+        },
+        origin: "manual",
+      })],
+      sfxTrack: track,
+      past: [],
+      future: [],
+    });
+    useRepurposeStore.getState().addMarker(1);
+
+    useRepurposeStore.getState().undo();
+
+    expect(useRepurposeStore.getState().sfxTrack).toBeNull();
+  });
 });
 
 describe("SFX selection ownership", () => {
@@ -358,6 +440,48 @@ describe("SFX selection ownership", () => {
     useRepurposeStore.getState().selectSfxClip(added);
     useRepurposeStore.getState().undo();
     expect(useRepurposeStore.getState().selectedSfxClipId).toBeNull();
+  });
+
+  it("clears SFX selection when duplicate and split actions select scenes", () => {
+    useRepurposeStore.setState({ sfxClips: [sfx()] });
+    useRepurposeStore.getState().selectSfxClip("sfx-test");
+
+    useRepurposeStore.getState().duplicateClip("scene");
+    expect(useRepurposeStore.getState().selectedSfxClipId).toBeNull();
+    expect(useRepurposeStore.getState().selectedClipId).toMatch(/^split-/);
+
+    useRepurposeStore.getState().selectSfxClip("sfx-test");
+    useRepurposeStore.getState().splitClipAtPlayhead(1);
+    expect(useRepurposeStore.getState().selectedSfxClipId).toBeNull();
+    expect(useRepurposeStore.getState().selectedClipId).toMatch(/^split-/);
+  });
+
+  it("clears SFX selection when add and duplicate actions select overlays", () => {
+    useRepurposeStore.setState({ sfxClips: [sfx()] });
+    useRepurposeStore.getState().selectSfxClip("sfx-test");
+
+    const overlayId = useRepurposeStore.getState().addOverlay({
+      kind: "image",
+      src: "/overlay.png",
+      naturalWidth: 100,
+      naturalHeight: 100,
+      atTime: 1,
+    });
+    expect(useRepurposeStore.getState()).toMatchObject({
+      selectedSfxClipId: null,
+      selectedOverlayId: overlayId,
+    });
+
+    useRepurposeStore.getState().selectSfxClip("sfx-test");
+    const duplicateId = useRepurposeStore.getState().duplicateOverlay(
+      overlayId,
+      { left: 0, top: 0, width: 1080, height: 1920 },
+      0.5
+    );
+    expect(useRepurposeStore.getState()).toMatchObject({
+      selectedSfxClipId: null,
+      selectedOverlayId: duplicateId,
+    });
   });
 });
 
