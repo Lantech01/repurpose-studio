@@ -240,7 +240,6 @@ function seedRichState(): void {
       },
     ],
     markers: [{ id: "marker-after-new-end", t: 5.5, label: "keep" }],
-    sfxTrack: null,
     sfxClips: [
       {
         id: "sfx-crossing-new-end",
@@ -493,8 +492,6 @@ describe("atomic transcript store action", () => {
     );
     expect(state.overlays).toEqual(before.overlays);
     expect(state.markers).toEqual(before.markers);
-    // Mixed imported/built-in documents never own the temporary runtime bridge.
-    expect(state.sfxTrack).toBeNull();
     expect(state.sfxClips).toEqual(before.sfxClips);
     expect(state.musicTrack).toEqual(before.musicTrack);
     expect(state.mediaAssets).toEqual(before.mediaAssets);
@@ -562,7 +559,6 @@ describe("atomic transcript store action", () => {
     expect(state.clips[0]).not.toHaveProperty("manualScene");
     expect(state.duration).toBe(2);
     expect(state.selectedClipId).toBeNull();
-    expect(state.sfxTrack).toBeNull();
     expect(state.sfxClips).toEqual([
       expect.objectContaining({
         id: "sfx-crossing-new-end",
@@ -592,9 +588,6 @@ describe("atomic transcript store action", () => {
     expect(state.words).toEqual(oldWords);
     expect(state.overlays).toEqual(before.overlays);
     expect(state.markers).toEqual(before.markers);
-    // The restored SFX document has no automatic legacy bridge clip, so history
-    // restoration deterministically clears the temporary runtime track.
-    expect(state.sfxTrack).toBeNull();
     expect(state.sfxClips).toEqual(before.sfxClips);
     expect(state.editStats).toEqual(stats);
     expect(state.playhead).toBe(2);
@@ -606,7 +599,6 @@ describe("atomic transcript store action", () => {
     expect(state.clips[0]).toMatchObject({ id: "rebuilt", timelineStart: 0, timelineEnd: 2 });
     expect(state.words).toEqual(newWords);
     expect(state.captionsEnabled).toBe(true);
-    expect(state.sfxTrack).toBeNull();
     expect(state.sfxClips).toEqual([
       expect.objectContaining({ id: "sfx-crossing-new-end", sourceEnd: 0.5 }),
     ]);

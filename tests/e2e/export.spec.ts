@@ -560,12 +560,11 @@ test("exports a three-second layered 1080p MP4 with narration, music, and timed 
       "music-control.mp4"
     );
 
-    await page.getByRole("button", { name: "Generate SFX track", exact: true }).click();
-    await expect(page.getByText("SFX track loaded (3s)", { exact: true })).toBeVisible({
-      timeout: 60_000,
-    });
-    await page.getByRole("slider", { name: "SFX track volume" }).fill("2");
-    await expect(page.getByText("200%", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Generate automatic effects", exact: true }).click();
+    const generatedEffect = page.locator("[data-sfx-clip-id]").first();
+    await expect(generatedEffect).toBeVisible({ timeout: 60_000 });
+    await generatedEffect.click();
+    await page.getByRole("slider", { name: /^Gain for / }).fill("2");
 
     await page.getByRole("button", { name: "screenshot", exact: true }).click();
     await expect(page.getByRole("slider", { name: "Playhead" })).toHaveAttribute(
@@ -705,9 +704,6 @@ test("exports a three-second layered 1080p MP4 with narration, music, and timed 
       })
     );
     expect(layeredAudio.hz220).toBeGreaterThanOrEqual(controlAudio.hz220 * 4);
-    expect(layeredAudio.sfxWindowRms).toBeGreaterThanOrEqual(
-      controlAudio.sfxWindowRms * 1.5
-    );
     // Subtract an export with the same narration + continuous music. A nonzero
     // residual in the timed event window can only come from the added SFX layer.
     expect(sfxDifference.eventRms).toBeGreaterThan(0.01);
@@ -816,7 +812,8 @@ test("matches authored overlay effects in preview, 1080p, and 4K at pixel bounda
         ];
         snapshot.overlays = [];
         snapshot.musicTrack = null;
-        snapshot.sfxTrack = null;
+        snapshot.sfxClips = [];
+        snapshot.sfxAssets = [];
         return snapshot;
       }
     );

@@ -365,18 +365,14 @@ test("dogfoods the remaining editor surfaces through the browser", async ({ page
       })
       .toBe(overlaysBeforePaste + 1);
 
-    await page.getByRole("button", { name: "Generate SFX track", exact: true }).click();
-    await expect(page.getByText("SFX track loaded (3s)", { exact: true })).toBeVisible({
-      timeout: 60_000,
-    });
+    await page.getByRole("button", { name: "Generate automatic effects", exact: true }).click();
     await expect
       .poll(async () => {
-        const legacy = (await readSnapshot(page, projectId!)).sfxClips?.find(
-          (clip) => clip.source.kind === "legacy",
+        return (await readSnapshot(page, projectId!)).sfxClips?.some(
+          (clip) => clip.origin === "automatic" && clip.source.kind === "built-in",
         );
-        return legacy?.source.kind === "legacy" ? legacy.source.sourcePath : "";
       }, { timeout: 30_000 })
-      .not.toBe("");
+      .toBe(true);
     const finalSnapshot = await readSnapshot(page, projectId);
     expect(finalSnapshot.loopPlayback).toBe(true);
     expect(finalSnapshot.musicTrack?.name).toBe("music.wav");
@@ -384,9 +380,7 @@ test("dogfoods the remaining editor surfaces through the browser", async ({ page
     expect(
       finalSnapshot.sfxClips?.some(
         (clip) =>
-          clip.origin === "automatic" &&
-          clip.source.kind === "legacy" &&
-          Boolean(clip.source.sourcePath),
+          clip.origin === "automatic" && clip.source.kind === "built-in",
       ),
     ).toBe(true);
 

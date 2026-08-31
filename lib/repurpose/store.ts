@@ -27,7 +27,6 @@ import type {
   SfxAsset,
   SfxClip,
   SfxClipSource,
-  SfxTrack,
   VideoSourceRecord,
   VideoSourceTarget,
   Word,
@@ -36,7 +35,6 @@ import { defaultBuiltInDuration } from "./sfx-effects";
 import {
   constrainSfxClipsToDuration,
   duplicateSfxClip as duplicateSfxClipValue,
-  migrateLegacySfxTrack,
   moveSfxClip as moveSfxClipValue,
   placeSfxClip,
   replaceAutomaticSfxClips as mergeAutomaticSfxClips,
@@ -45,8 +43,6 @@ import {
   trimSfxClipLeft as trimSfxClipLeftValue,
   trimSfxClipRight as trimSfxClipRightValue,
 } from "./sfx-clips";
-import { isAbsoluteLocalMediaPath } from "./local-media-path";
-import { resolveSfxSource } from "./sfx-source";
 import type { EditStats } from "./ingest";
 import { DEFAULT_SMART_TRANSITION, footageUrlForPath } from "./ingest";
 import type {
@@ -418,53 +414,6 @@ function sfxClipContentEqual(a: SfxClip, b: SfxClip): boolean {
   return sfxClipEqual(
     { ...a, id: b.id, origin: b.origin },
     b
-  );
-}
-
-function runtimeSfxTrackFromDocument(
-  clips: readonly SfxClip[],
-  projectDuration: number
-): SfxTrack | null {
-  if (clips.length !== 1) return null;
-  const legacy = clips[0];
-  if (
-    legacy.origin !== "automatic" ||
-    legacy.source.kind !== "legacy" ||
-    legacy.timelineStart !== 0 ||
-    legacy.sourceStart !== 0 ||
-    !Number.isFinite(legacy.sourceEnd) ||
-    !Number.isFinite(legacy.source.srcDuration) ||
-    !Number.isFinite(projectDuration) ||
-    legacy.sourceEnd <= 0 ||
-    legacy.source.srcDuration <= 0 ||
-    !Number.isFinite(legacy.gain) ||
-    legacy.fadeInSec !== 0 ||
-    legacy.fadeOutSec !== 0 ||
-    legacy.muted ||
-    !isAbsoluteLocalMediaPath(legacy.source.sourcePath)
-  ) return null;
-  const expectedSourceEnd = Math.round(
-    Math.min(legacy.source.srcDuration, projectDuration) * 1e12
-  ) / 1e12;
-  if (legacy.sourceEnd !== expectedSourceEnd) return null;
-  const resolved = resolveSfxSource(legacy.source, []);
-  if (!resolved.url) return null;
-  return {
-    src: resolved.url,
-    sourcePath: legacy.source.sourcePath,
-    durationSec: legacy.source.srcDuration,
-    gain: legacy.gain,
-  };
-}
-
-function sfxTrackEqual(a: SfxTrack | null, b: SfxTrack | null): boolean {
-  return a === b || (
-    a !== null &&
-    b !== null &&
-    a.src === b.src &&
-    a.sourcePath === b.sourcePath &&
-    a.durationSec === b.durationSec &&
-    a.gain === b.gain
   );
 }
 
@@ -1151,7 +1100,6 @@ function snapshotToPatch(snap: EditableSnapshot): Partial<RepurposeState> {
     splitRatio: parsePersistedSplitRatio(snap.splitRatio, 0.5),
     duration,
     sfxClips,
-    sfxTrack: runtimeSfxTrackFromDocument(sfxClips, duration),
   };
 }
 
@@ -1222,6 +1170,8 @@ export type SfxGestureKind =
   | "move"
   | "left-trim"
   | "right-trim"
+  | "source-in"
+  | "source-out"
   | "gain"
   | "fade-in"
   | "fade-out";
@@ -1237,6 +1187,13 @@ export interface AddSfxClipInput {
   fadeInSec?: number;
   fadeOutSec?: number;
   muted?: boolean;
+}
+
+export interface AddImportedSfxInput {
+  name: string;
+  sourcePath: string;
+  srcDuration: number;
+  atTime: number;
 }
 
 interface RepurposeState {
@@ -1295,14 +1252,7 @@ interface RepurposeState {
     editStats?: EditStats | null;
   }) => void;
 
-  // --- sound effects (SFX track) --------------------------------------------
-  /**
-   * The reel's generated sound-effects track (a single full-length WAV), or null
-   * when none has been generated. Baked into the preview + exported MP4 audio.
-   * Lives on the Audio row below the clips. NOT part of undo history (it's a
-   * generated artifact, like footageMeta) but IS persisted across reload.
-   */
-  sfxTrack: SfxTrack | null;
+  // --- sound effects ---------------------------------------------------------
   /** Editable output-time sound-effect document. */
   sfxClips: SfxClip[];
   /** Passive imported SFX inventory; deliberately outside Undo history. */
@@ -1313,21 +1263,18 @@ interface RepurposeState {
   sfxDocumentRevision: number;
   /** True while the SFX engine is rendering the track (drives the button spinner). */
   sfxGenerating: boolean;
-  /** Set/replace the generated SFX track (called on a successful render). */
-  setSfxTrack: (track: SfxTrack | null) => void;
-  /** Remove the SFX track (the green block's delete affordance). */
-  clearSfxTrack: () => void;
   /** Toggle the generating flag around a render call. */
   setSfxGenerating: (generating: boolean) => void;
-  /** Adjust the whole SFX bed's playback gain (0..2, 1 = as rendered). */
-  setSfxGain: (gain: number) => void;
   addSfxAsset: (asset: Omit<SfxAsset, "id">) => string;
+  addImportedSfxClip: (input: AddImportedSfxInput) => { assetId: string; clipId: string } | null;
   addSfxClip: (input: AddSfxClipInput) => string | null;
   replaceAutomaticSfxClips: (clips: readonly SfxClip[]) => void;
   selectSfxClip: (id: string | null) => void;
   moveSfxClip: (id: string, timelineStart: number) => void;
   trimSfxClipLeft: (id: string, timelineStart: number) => void;
   trimSfxClipRight: (id: string, timelineEnd: number) => void;
+  setSfxClipSourceStart: (id: string, sourceStart: number) => void;
+  setSfxClipSourceEnd: (id: string, sourceEnd: number) => void;
   setSfxClipGain: (id: string, gain: number) => void;
   setSfxClipFadeIn: (id: string, seconds: number) => void;
   setSfxClipFadeOut: (id: string, seconds: number) => void;
@@ -1348,7 +1295,7 @@ interface RepurposeState {
   /**
    * The reel's manually-added background-music track, or null. Sits on the Music
    * row between the clips and the SFX row. Baked into preview + export audio.
-   * NOT part of undo history (like sfxTrack) but IS persisted across reload.
+   * NOT part of undo history, but IS persisted across reload.
    */
   musicTrack: MusicTrack | null;
   /** Set/replace the background-music track (called after the user picks a file). */
@@ -1473,7 +1420,7 @@ interface RepurposeState {
    * instance (image/video -> overlay at the playhead; audio -> the music track).
    * A passive top-level array like `markers` -- it never draws to the canvas and
    * never ripples with clip edits. NOT part of undo history (an inventory list,
-   * like sfxTrack/musicTrack) but IS persisted in the project snapshot.
+   * like musicTrack) but IS persisted in the project snapshot.
    */
   mediaAssets: MediaAsset[];
   /**
@@ -2060,7 +2007,6 @@ const MAX_PLAYBACK_RATE = PLAYBACK_RATES[PLAYBACK_RATES.length - 1];
 
 export const useRepurposeStore = create<RepurposeState>((set, get) => {
   // A restored array has a distinct identity even when it is explicitly empty.
-  let hydrationSfxClipsBaseline: SfxClip[] | null = null;
   let splitRatioGestureCounter = 0;
   const splitRatioGestureCancellationListeners = new Set<() => void>();
   let activeSplitRatioGesture: {
@@ -2259,7 +2205,6 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     const documentChanged = !sfxDocumentEqual(state.sfxClips, gesture.sfxClips);
     set({
       sfxClips: gesture.sfxClips,
-      sfxTrack: runtimeSfxTrackFromDocument(gesture.sfxClips, state.duration),
       past: gesture.past,
       future: gesture.future,
       sfxDocumentRevision: state.sfxDocumentRevision + (documentChanged ? 1 : 0),
@@ -2302,10 +2247,8 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
   ): Partial<RepurposeState> => {
     const state = get();
     const sfxClips = constrainSfxClipsToDuration(sourceClips, duration);
-    const sfxTrack = runtimeSfxTrackFromDocument(sfxClips, duration);
     const documentChanged = !sfxDocumentEqual(sfxClips, state.sfxClips);
-    const bridgeChanged = !sfxTrackEqual(sfxTrack, state.sfxTrack);
-    if (!documentChanged && !bridgeChanged) return {};
+    if (!documentChanged) return {};
     return {
       ...(documentChanged
         ? {
@@ -2317,7 +2260,6 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
               : null,
           }
         : {}),
-      sfxTrack,
     };
   };
 
@@ -2387,15 +2329,10 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     sfxClips: SfxClip[]
   ): boolean => {
     const state = get();
-    const sfxTrack = runtimeSfxTrackFromDocument(sfxClips, state.duration);
-    if (sfxDocumentEqual(sfxClips, state.sfxClips)) {
-      if (!sfxTrackEqual(sfxTrack, state.sfxTrack)) set({ sfxTrack });
-      return false;
-    }
+    if (sfxDocumentEqual(sfxClips, state.sfxClips)) return false;
     captureHistoryEntry();
     set({
       sfxClips,
-      sfxTrack,
       sfxDocumentRevision: state.sfxDocumentRevision + 1,
       selectedSfxClipId: state.selectedSfxClipId !== null
         && sfxClips.some((clip) => clip.id === state.selectedSfxClipId)
@@ -2440,7 +2377,6 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
   captionStyle: DEFAULT_CAPTION_STYLE,
   captionBlocks: [],
 
-  sfxTrack: null,
   sfxClips: [],
   sfxAssets: [],
   selectedSfxClipId: null,
@@ -2482,42 +2418,10 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
   setHydrating: (hydrating) => {
     if (hydrating) {
       closeActiveHistoryGestures();
-      hydrationSfxClipsBaseline = get().sfxClips;
       set({ hydrating: true });
       return;
     }
-
-    const state = get();
-    const explicitSfxDocument = hydrationSfxClipsBaseline !== null
-      && state.sfxClips !== hydrationSfxClipsBaseline;
-    const shouldMigrateLegacyTrack = hydrationSfxClipsBaseline !== null
-      && !explicitSfxDocument
-      && state.sfxTrack !== null
-      && state.sfxClips.length === 0;
-    const legacyTrack = shouldMigrateLegacyTrack ? state.sfxTrack : null;
-    const legacyClip = legacyTrack !== null
-      ? migrateLegacySfxTrack(
-          legacyTrack,
-          state.duration
-        )
-      : null;
-    const migrated = legacyClip
-      ? {
-          ...legacyClip,
-          id: nextAvailableSfxClipId(new Set(state.sfxClips.map((clip) => clip.id))),
-        }
-      : null;
-    const sfxClips = migrated ? [migrated] : state.sfxClips;
-    const documentChanged = hydrationSfxClipsBaseline !== null
-      && !sfxDocumentEqual(sfxClips, hydrationSfxClipsBaseline);
-    reseedIdCounters({ sfxClips });
-    hydrationSfxClipsBaseline = null;
-    set({
-      hydrating: false,
-      sfxClips,
-      sfxTrack: runtimeSfxTrackFromDocument(sfxClips, state.duration),
-      sfxDocumentRevision: state.sfxDocumentRevision + (documentChanged ? 1 : 0),
-    });
+    set({ hydrating: false });
   },
   projectEpoch: 0,
 
@@ -2546,7 +2450,6 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       captionsEnabled: false,
       captionStyle: DEFAULT_CAPTION_STYLE,
       captionBlocks: [],
-      sfxTrack: null,
       sfxClips: [],
       sfxAssets: [],
       selectedSfxClipId: null,
@@ -2580,7 +2483,6 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       projectEpoch: get().projectEpoch + 1,
       editStats: null,
     });
-    if (get().hydrating) hydrationSfxClipsBaseline = get().sfxClips;
   },
 
   activeSnapGuides: [],
@@ -2689,7 +2591,6 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       duration,
       past,
       future,
-      sfxTrack: runtimeSfxTrackFromDocument(sfxClips, duration),
       ...(sfxChanged
         ? {
             sfxClips,
@@ -2896,7 +2797,6 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       ...constrainCurrentSfxToDuration(duration),
       selectedSfxClipId: null,
     });
-    if (get().hydrating) hydrationSfxClipsBaseline = get().sfxClips;
   },
 
   deleteClip: (id) => {
@@ -3208,7 +3108,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     );
     if (existing) return existing.id;
     const id = nextMediaAssetId();
-    // Not part of undo history -- an inventory list, like sfxTrack/musicTrack.
+    // Not part of undo history: this is passive inventory.
     set((s) => ({
       mediaAssets: [...s.mediaAssets, { ...normalizedAsset, id }],
     }));
@@ -4277,6 +4177,46 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     return id;
   },
 
+  addImportedSfxClip: (input) => {
+    closeActiveHistoryGestures();
+    if (
+      !input.sourcePath
+      || !Number.isFinite(input.srcDuration)
+      || input.srcDuration <= 0
+      || !Number.isFinite(input.atTime)
+    ) return null;
+    const state = get();
+    const assetId = nextAvailableSfxAssetId(new Set(state.sfxAssets.map((asset) => asset.id)));
+    const clipId = nextAvailableSfxClipId(new Set(state.sfxClips.map((clip) => clip.id)));
+    const placed = placeSfxClip({
+      id: clipId,
+      name: input.name,
+      source: { kind: "imported", assetId, srcDuration: input.srcDuration },
+      origin: "manual",
+      timelineStart: 0,
+      sourceStart: 0,
+      sourceEnd: input.srcDuration,
+      gain: 1,
+      fadeInSec: 0,
+      fadeOutSec: 0,
+      muted: false,
+    }, input.atTime, state.duration);
+    if (!placed) return null;
+    captureHistoryEntry();
+    set({
+      sfxAssets: [...state.sfxAssets, {
+        id: assetId,
+        name: input.name,
+        sourcePath: input.sourcePath,
+        srcDuration: input.srcDuration,
+      }],
+      sfxClips: [...state.sfxClips, placed],
+      selectedSfxClipId: clipId,
+      sfxDocumentRevision: state.sfxDocumentRevision + 1,
+    });
+    return { assetId, clipId };
+  },
+
   addSfxClip: (input) => {
     closeActiveHistoryGestures();
     const state = get();
@@ -4354,6 +4294,23 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     updateSfxClip(id, (clip, duration) =>
       trimSfxClipRightValue(clip, timelineEnd, duration, sfxSourceDuration(clip.source))
     );
+  },
+  setSfxClipSourceStart: (id, sourceStart) => {
+    if (!Number.isFinite(sourceStart)) return;
+    updateSfxClip(id, (clip) => ({
+      ...clip,
+      sourceStart: Math.max(0, Math.min(sourceStart, clip.sourceEnd - 1 / 1000)),
+    }));
+  },
+  setSfxClipSourceEnd: (id, sourceEnd) => {
+    if (!Number.isFinite(sourceEnd)) return;
+    updateSfxClip(id, (clip) => ({
+      ...clip,
+      sourceEnd: Math.max(
+        clip.sourceStart + 1 / 1000,
+        Math.min(sourceEnd, sfxSourceDuration(clip.source))
+      ),
+    }));
   },
   setSfxClipGain: (id, gain) => {
     if (!Number.isFinite(gain)) return;
@@ -4439,6 +4396,19 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
         state.duration,
         sfxSourceDuration(target.source)
       );
+    } else if (gesture.kind === "source-in") {
+      updated = {
+        ...target,
+        sourceStart: Math.max(0, Math.min(value, target.sourceEnd - 1 / 1000)),
+      };
+    } else if (gesture.kind === "source-out") {
+      updated = {
+        ...target,
+        sourceEnd: Math.max(
+          target.sourceStart + 1 / 1000,
+          Math.min(value, sfxSourceDuration(target.source))
+        ),
+      };
     } else if (gesture.kind === "gain") {
       updated = { ...target, gain: Math.max(0, Math.min(2, value)) };
     } else if (gesture.kind === "fade-in") {
@@ -4456,7 +4426,6 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     );
     set({
       sfxClips,
-      sfxTrack: runtimeSfxTrackFromDocument(sfxClips, state.duration),
       sfxDocumentRevision: state.sfxDocumentRevision + 1,
     });
   },
@@ -4480,48 +4449,13 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     return () => sfxGestureCancellationListeners.delete(listener);
   },
 
-  // Deprecated compatibility bridge for the old panel/timeline/preview/export.
-  setSfxTrack: (track) => {
-    closeActiveHistoryGestures();
-    const state = get();
-    const currentLegacy = state.sfxClips.find(
-      (clip) => clip.origin === "automatic" && clip.source.kind === "legacy"
-    );
-    const retained = state.sfxClips.filter(
-      (clip) => !(clip.origin === "automatic" && clip.source.kind === "legacy")
-    );
-    const legacy = track
-      ? migrateLegacySfxTrack(
-          track,
-          state.duration,
-          currentLegacy?.id
-            ?? nextAvailableSfxClipId(new Set(state.sfxClips.map((clip) => clip.id)))
-        )
-      : null;
-    commitSfxDocument(legacy ? [...retained, legacy] : retained);
-  },
-  clearSfxTrack: () => get().setSfxTrack(null),
   setSfxGenerating: (generating) => {
     if (generating) closeActiveHistoryGestures();
     set({ sfxGenerating: generating });
   },
-  setSfxGain: (gain) => {
-    if (!Number.isFinite(gain)) return;
-    closeActiveHistoryGestures();
-    const state = get();
-    if (!state.sfxTrack) return;
-    const clamped = Math.max(0, Math.min(2, gain));
-    const sfxClips = state.sfxClips.map((clip) =>
-      clip.origin === "automatic" && clip.source.kind === "legacy"
-        ? { ...clip, gain: clamped }
-        : clip
-    );
-    commitSfxDocument(sfxClips);
-  },
 
   // --- background music (manual) --------------------------------------------
-  // Same "generated artifact" treatment as the SFX track: direct set, no undo
-  // snapshot, persisted separately.
+  // Direct set with no undo snapshot; persisted separately.
   setMusicTrack: (track) => set({ musicTrack: track }),
   clearMusicTrack: () => set({ musicTrack: null }),
   setMusicGain: (gain) => {

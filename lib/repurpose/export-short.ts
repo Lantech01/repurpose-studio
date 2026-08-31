@@ -57,7 +57,58 @@ import { footageUrlForPath } from "./ingest";
 import { overlayUrlForPath } from "./overlay-ingest";
 import { effectiveSplitRatio } from "./split-ratio";
 import { resolveOverlayAppearanceAt } from "./overlay-effects";
-import type { Clip, FootageMeta, MusicTrack, Overlay, SfxTrack } from "./types";
+import type { Clip, FootageMeta, MusicTrack, Overlay, SfxAsset, SfxClip } from "./types";
+import { effectiveSfxFadeDurations } from "./sfx-clips";
+import { loadResolvedSfxAudio, secondsToSample } from "./sfx-audio";
+import { resolveSfxSource } from "./sfx-source";
+
+export interface SfxPcmSource {
+  clip: SfxClip;
+  channels: readonly Float32Array[];
+  sampleRate: number;
+  sourceBaseGain: number;
+}
+
+export function mixSfxClipsPcm(
+  outputChannels: readonly Float32Array[],
+  outputSampleRate: number,
+  sources: readonly SfxPcmSource[]
+): void {
+  for (const { clip, channels, sampleRate, sourceBaseGain } of sources) {
+    if (clip.muted || channels.length === 0 || sampleRate <= 0 || outputSampleRate <= 0) continue;
+    const outputStart = secondsToSample(clip.timelineStart, outputSampleRate);
+    const sourceStart = secondsToSample(clip.sourceStart, sampleRate);
+    const sourceEnd = secondsToSample(clip.sourceEnd, sampleRate);
+    const sourceFrames = Math.max(0, sourceEnd - sourceStart);
+    const outputFrames = secondsToSample(clip.sourceEnd - clip.sourceStart, outputSampleRate);
+    const frames = Math.min(outputFrames, outputChannels[0]?.length - outputStart);
+    if (frames <= 0 || sourceFrames <= 0) continue;
+    const fades = effectiveSfxFadeDurations(clip, clip.sourceEnd - clip.sourceStart);
+    const fadeInFrames = secondsToSample(fades.fadeInSec, outputSampleRate);
+    const fadeOutFrames = secondsToSample(fades.fadeOutSec, outputSampleRate);
+    for (let channel = 0; channel < outputChannels.length; channel += 1) {
+      const source = channels[Math.min(channel, channels.length - 1)];
+      const output = outputChannels[channel];
+      for (let frame = 0; frame < frames; frame += 1) {
+        const sourcePosition = sourceStart + frame * sampleRate / outputSampleRate;
+        const low = Math.min(source.length - 1, Math.floor(sourcePosition));
+        const high = Math.min(source.length - 1, low + 1);
+        const fraction = sourcePosition - low;
+        const sample = source[low] + (source[high] - source[low]) * fraction;
+        const fadeIn = fadeInFrames > 0 ? Math.min(1, frame / fadeInFrames) : 1;
+        const remaining = frames - frame;
+        const fadeOut = fadeOutFrames > 0 ? Math.min(1, remaining / fadeOutFrames) : 1;
+        output[outputStart + frame] +=
+          sample * sourceBaseGain * clip.gain * Math.min(fadeIn, fadeOut);
+      }
+    }
+  }
+  for (const output of outputChannels) {
+    for (let frame = 0; frame < output.length; frame += 1) {
+      output[frame] = Math.max(-1, Math.min(1, output[frame]));
+    }
+  }
+}
 
 /**
  * Output resolution presets. Both are 9:16 vertical. "1080p" is the standard
@@ -157,17 +208,10 @@ export interface ExportShortInput {
    * Omitted/undefined/empty -> byte-identical to a no-overlay export.
    */
   overlays?: Overlay[];
-  /**
-   * The reel's generated SOUND-EFFECTS track (or null/absent for none). A single
-   * full-length WAV, additively mixed INTO the assembled face-cam audio at
-   * `sfxTrack.gain` before muxing -- so the exported MP4 carries VO + SFX, matching
-   * the preview. Decoded/resampled to the assembled buffer's rate+layout and hard-
-   * clamped to [-1,1] after summing. If the face-cam has no audio, the SFX plays
-   * alone over a fresh silent bed so an SFX-only reel still exports. Mixing is
-   * best-effort: any failure logs and falls back to the face-cam-only audio (never
-   * fails the export). Omitted/undefined/null -> byte-identical to a no-SFX export.
-   */
-  sfxTrack?: SfxTrack | null;
+  /** Editable sound-effect clips mixed deterministically into output time. */
+  sfxClips?: SfxClip[];
+  /** Project-owned imported source inventory used by SFX clips. */
+  sfxAssets?: SfxAsset[];
   /**
    * The reel's BACKGROUND-MUSIC bed (or null/absent for none). A single music
    * file added manually, additively mixed INTO the assembled audio the SAME way
@@ -539,7 +583,8 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
     splitRatio,
     footageMeta,
     overlays = [],
-    sfxTrack,
+    sfxClips = [],
+    sfxAssets = [],
     musicTrack,
     fileName = "repurpose-short.mp4",
     onProgress,
@@ -576,6 +621,10 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
       `The ${missing} working source is unreadable. Re-import or reconvert the affected video, then export again.`
     );
   }
+
+  // Resolve and decode every selected SFX source before any encoder/output is
+  // acquired. A missing or corrupt clip therefore fails atomically by name.
+  const preparedSfx = await prepareSfxForExport(sfxClips, sfxAssets, abortSignal);
 
   const acquiredDecodes = new Set<TrackFrameSource>();
   const acquiredVideos = new Set<HTMLVideoElement>();
@@ -1121,16 +1170,13 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
         abortSignal
       );
     }
-    // Additively mix the generated SFX bed on top of the face-cam audio (or,
-    // when the face-cam had no audio, onto a fresh silent bed so an SFX-only
-    // reel still carries sound). Best-effort: on any failure this returns the
-    // untouched face-cam buffer -- SFX must never fail the whole export.
-    if (sfxTrack) {
-      audioBuffer = await mixSfxIntoBuffer(
+    if (sfxClips.length > 0) {
+      audioBuffer = mixPreparedSfxIntoBuffer(
         audioBuffer,
-        sfxTrack,
+        sfxClips,
+        sfxAssets,
+        preparedSfx,
         duration,
-        warnAudio,
         abortSignal
       );
     }
@@ -1379,133 +1425,96 @@ export async function assembleClipAudio(
   }
 }
 
-/**
- * Additively mix the reel's generated SFX WAV into the assembled face-cam
- * buffer and return the (possibly newly-created) result.
- *
- *  - When `base` exists, the SFX is decoded, resampled to the base buffer's
- *    sampleRate + channel layout AND gained (all in one OfflineAudioContext
- *    render pass), then summed into a copy of the base per channel.
- *  - When `base` is null (face-cam had no audio), a fresh silent bed sized
- *    `duration` at 48000/2ch is created so an SFX-only reel still exports.
- *  - After summing, every touched sample is HARD-CLAMPED to [-1, 1] (additive
- *    mixing can push VO + SFX past full-scale; there is no limiter upstream).
- *
- * The SFX bed is already full output-length (0..duration), so it lands at
- * output sample offset 0. Best-effort: any decode/resample failure logs a
- * warning and returns `base` unchanged so SFX never fails the export.
- */
-async function mixSfxIntoBuffer(
-  base: AudioBuffer | null,
-  sfxTrack: SfxTrack,
-  duration: number,
-  onWarning: (message: string) => void,
+interface PreparedSfxSource {
+  buffer: AudioBuffer;
+  sourceBaseGain: number;
+}
+
+async function prepareSfxForExport(
+  clips: readonly SfxClip[],
+  assets: readonly SfxAsset[],
   abortSignal?: AbortSignal
-): Promise<AudioBuffer | null> {
-  abortSignal?.throwIfAborted();
-  if (typeof AudioBuffer === "undefined") {
-    onWarning("The video exported, but the sound-effects layer could not be mixed.");
-    return base;
-  }
-
+): Promise<Map<string, PreparedSfxSource>> {
+  const prepared = new Map<string, PreparedSfxSource>();
+  if (clips.length === 0) return prepared;
   const OfflineCtx =
-    (typeof OfflineAudioContext !== "undefined" && OfflineAudioContext) ||
-    (typeof globalThis !== "undefined" &&
-      (globalThis as { webkitOfflineAudioContext?: typeof OfflineAudioContext })
-        .webkitOfflineAudioContext) ||
-    null;
-  if (!OfflineCtx) {
-    onWarning("The video exported, but the sound-effects layer could not be mixed.");
-    return base;
-  }
-
-  try {
-    // Target layout: match the face-cam bed when present so summing is 1:1;
-    // otherwise a sane stereo/48k default for an SFX-only export.
-    const targetRate = base ? base.sampleRate : 48000;
-    const targetChannels = base ? base.numberOfChannels : 2;
-    const targetFrames = base
-      ? base.length
-      : Math.max(1, Math.ceil(duration * targetRate));
-
-    // Fetch + decode the SFX WAV. Decode happens at the file's own rate; the
-    // render pass below resamples it to targetRate.
-    const res = await fetch(sfxTrack.src, { signal: abortSignal });
-    if (!res.ok) {
-      console.warn(
-        `mixSfxIntoBuffer: SFX fetch failed (${res.status}) -- shipping without SFX.`
+    (typeof OfflineAudioContext !== "undefined" && OfflineAudioContext)
+    || (globalThis as { webkitOfflineAudioContext?: typeof OfflineAudioContext }).webkitOfflineAudioContext;
+  if (!OfflineCtx) throw new Error("Sound effects cannot be decoded in this browser.");
+  const context = new OfflineCtx(1, 1, 48_000);
+  for (const clip of clips) {
+    abortSignal?.throwIfAborted();
+    const resolved = resolveSfxSource(clip.source, assets);
+    const importedAssetId = clip.source.kind === "imported" ? clip.source.assetId : null;
+    const rawPath = importedAssetId !== null
+      ? assets.find((asset) => asset.id === importedAssetId)?.sourcePath
+      : clip.source.kind === "legacy"
+        ? clip.source.sourcePath
+        : null;
+    if (resolved.missing || !resolved.url || rawPath?.startsWith("blob:")) {
+      throw new Error(`Sound effect “${clip.name}” is missing or unavailable.`);
+    }
+    if (prepared.has(resolved.identity)) continue;
+    try {
+      prepared.set(
+        resolved.identity,
+        await loadResolvedSfxAudio(
+          resolved,
+          context,
+          abortSignal ?? new AbortController().signal
+        )
       );
-      onWarning("The video exported, but the sound-effects layer could not be mixed.");
-      return base;
+    } catch (error) {
+      if (isAbortError(error) || abortSignal?.aborted) throw error;
+      throw new Error(`Sound effect “${clip.name}” could not be decoded: ${error instanceof Error ? error.message : "unknown error"}`);
     }
-    const sfxBytes = await res.arrayBuffer();
-    abortSignal?.throwIfAborted();
-
-    // decodeAudioData wants its own context; a tiny scratch ctx at the target
-    // rate is fine -- decodeAudioData ignores the ctx rate and decodes at the
-    // file's native rate (the render pass does the actual resample).
-    const decodeCtx = new OfflineCtx(1, 1, targetRate);
-    const decoded = await decodeCtx.decodeAudioData(sfxBytes);
-    abortSignal?.throwIfAborted();
-
-    // ONE pass: resample decoded -> targetRate AND apply the track's gain.
-    const render = new OfflineCtx(
-      targetChannels,
-      targetFrames,
-      targetRate
-    );
-    const srcNode = render.createBufferSource();
-    srcNode.buffer = decoded;
-    const g = render.createGain();
-    g.gain.value = sfxTrack.gain;
-    srcNode.connect(g).connect(render.destination);
-    srcNode.start(0);
-    const resampled = await render.startRendering();
-    abortSignal?.throwIfAborted();
-
-    // Output = a copy of the base bed (or a fresh silent bed) so we never
-    // mutate the assembled face-cam buffer in place.
-    const outCtx = new OfflineCtx(targetChannels, targetFrames, targetRate);
-    const out = outCtx.createBuffer(targetChannels, targetFrames, targetRate);
-    if (base) {
-      for (let ch = 0; ch < targetChannels; ch++) {
-        out.getChannelData(ch).set(base.getChannelData(ch));
-      }
-    }
-
-    // Additively sum the resampled+gained SFX into the output, per channel,
-    // starting at sample 0. mono SFX -> stereo out reuses channel 0 (mirrors
-    // assembleClipAudio's mono->stereo fallback).
-    const sumLen = Math.min(targetFrames, resampled.length);
-    for (let ch = 0; ch < targetChannels; ch++) {
-      const srcCh = ch < resampled.numberOfChannels ? ch : 0;
-      const srcData = resampled.getChannelData(srcCh);
-      const dstData = out.getChannelData(ch);
-      for (let i = 0; i < sumLen; i++) {
-        // Sum then HARD-CLAMP to [-1, 1] -- additive mix can exceed full scale.
-        let v = dstData[i] + srcData[i];
-        if (v > 1) v = 1;
-        else if (v < -1) v = -1;
-        dstData[i] = v;
-      }
-    }
-
-    return out;
-  } catch (err) {
-    if (isAbortError(err) || abortSignal?.aborted) throw err;
-    console.warn(
-      "mixSfxIntoBuffer: SFX mix failed, shipping face-cam audio only:",
-      err
-    );
-    onWarning("The video exported, but the sound-effects layer could not be mixed.");
-    return base;
   }
+  return prepared;
+}
+
+function mixPreparedSfxIntoBuffer(
+  base: AudioBuffer | null,
+  clips: readonly SfxClip[],
+  assets: readonly SfxAsset[],
+  prepared: ReadonlyMap<string, PreparedSfxSource>,
+  duration: number,
+  abortSignal?: AbortSignal
+): AudioBuffer {
+  abortSignal?.throwIfAborted();
+  const OfflineCtx =
+    (typeof OfflineAudioContext !== "undefined" && OfflineAudioContext)
+    || (globalThis as { webkitOfflineAudioContext?: typeof OfflineAudioContext }).webkitOfflineAudioContext;
+  if (!OfflineCtx) throw new Error("Sound effects cannot be mixed in this browser.");
+  const sampleRate = base?.sampleRate ?? 48_000;
+  const channelCount = base?.numberOfChannels ?? 2;
+  const frameCount = base?.length ?? Math.max(1, secondsToSample(duration, sampleRate));
+  const context = new OfflineCtx(channelCount, frameCount, sampleRate);
+  const output = context.createBuffer(channelCount, frameCount, sampleRate);
+  const channels = Array.from({ length: channelCount }, (_, channel) => output.getChannelData(channel));
+  if (base) channels.forEach((channel, index) => channel.set(base.getChannelData(index)));
+  const sources = clips.map((clip) => {
+    const resolved = resolveSfxSource(clip.source, assets);
+    const source = prepared.get(resolved.identity);
+    if (!source) throw new Error(`Sound effect “${clip.name}” was not prepared for export.`);
+    return {
+      clip,
+      channels: Array.from(
+        { length: source.buffer.numberOfChannels },
+        (_, channel) => source.buffer.getChannelData(channel)
+      ),
+      sampleRate: source.buffer.sampleRate,
+      sourceBaseGain: source.sourceBaseGain,
+    };
+  });
+  mixSfxClipsPcm(channels, sampleRate, sources);
+  abortSignal?.throwIfAborted();
+  return output;
 }
 
 /**
  * Additively mix the reel's manual BACKGROUND-MUSIC file into the assembled
- * audio and return the (possibly newly-created) result. This mirrors
- * {@link mixSfxIntoBuffer} exactly EXCEPT the music lands at an OUTPUT-time
+  * audio and return the (possibly newly-created) result. Unlike SFX clip mixing,
+  * the music lands at an OUTPUT-time
  * START OFFSET instead of at sample 0:
  *
  *  - When `base` exists, the music is decoded, resampled to the base buffer's

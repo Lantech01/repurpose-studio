@@ -538,10 +538,10 @@ export function PreviewCanvas({
   const pause = useRepurposeStore((s) => s.pause);
   const setMediaReadiness = useRepurposeStore((s) => s.setMediaReadiness);
 
-  // Make the generated SFX bed audible during live preview, synced to the
-  // playhead and summing acoustically with the face-cam <video> audio.
-  const sfxTrack = useRepurposeStore((s) => s.sfxTrack);
-  useSfxPreview(sfxTrack);
+  const sfxClips = useRepurposeStore((s) => s.sfxClips);
+  const sfxAssets = useRepurposeStore((s) => s.sfxAssets);
+  const [sfxWarning, setSfxWarning] = useState<string | null>(null);
+  useSfxPreview(sfxClips, sfxAssets, setSfxWarning);
   const musicTrack = useRepurposeStore((s) => s.musicTrack);
   useMusicPreview(musicTrack);
 
@@ -2577,6 +2577,11 @@ export function PreviewCanvas({
       className={`relative w-full select-none overflow-visible shadow-2xl ${className ?? ""}`}
       style={{ aspectRatio: `${width} / ${height}` }}
     >
+      {sfxWarning && (
+        <div role="status" aria-label="Sound effect preview warning" className="absolute left-2 right-2 top-2 z-[90] rounded bg-amber-950/90 px-2 py-1 text-[10px] text-amber-100 shadow">
+          {sfxWarning}
+        </div>
+      )}
       {/* Hidden source videos -- decoded frames only, never displayed directly. */}
       {/* src omitted until footage loads -- passing "" makes the browser try to
           load the page URL and logs an error. undefined leaves the element idle. */}

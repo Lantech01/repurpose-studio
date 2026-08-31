@@ -72,6 +72,13 @@ import {
   type OverlayImportOwner,
   type OverlayImportState,
 } from "@/lib/repurpose/overlay-ingest";
+import {
+  cancelSfxImport,
+  createSfxImportOwner,
+  registerSfxImportOwner,
+  releaseSfxImportOwner,
+  type SfxImportOwner,
+} from "@/lib/repurpose/sfx-ingest-client";
 import { VideoImportProgress } from "./VideoImportProgress";
 
 // ---------------------------------------------------------------------------
@@ -184,9 +191,11 @@ function FramingHelp() {
 
 function InspectorRail({
   overlayImportOwner,
+  sfxImportOwner,
   projectId,
 }: {
   overlayImportOwner: OverlayImportOwner;
+  sfxImportOwner: SfxImportOwner;
   projectId: string;
 }) {
   return (
@@ -216,7 +225,7 @@ function InspectorRail({
           <MusicPanel />
         </div>
         <div className="mt-6 border-t border-border pt-4">
-          <SfxPanel projectId={projectId} />
+          <SfxPanel projectId={projectId} sfxImportOwner={sfxImportOwner} />
         </div>
         <div className="mt-6 border-t border-border pt-4">
           <FramingHelp />
@@ -228,8 +237,10 @@ function InspectorRail({
 
 function TimelinePanel({
   overlayImportOwner,
+  sfxImportOwner,
 }: {
   overlayImportOwner: OverlayImportOwner;
+  sfxImportOwner: SfxImportOwner;
 }) {
   return (
     <div
@@ -239,6 +250,7 @@ function TimelinePanel({
       <Timeline
         className="flex-1 min-h-0"
         overlayImportOwner={overlayImportOwner}
+        sfxImportOwner={sfxImportOwner}
       />
     </div>
   );
@@ -418,6 +430,10 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
     [projectId]
   );
   const overlayImportOwner = overlayImportLifecycle.owner;
+  const sfxImportOwner = useMemo(
+    () => createSfxImportOwner(projectId),
+    [projectId]
+  );
   const [selectedShortId, setSelectedShortId] = useState(SHORT_OPTIONS[0].id);
   const [exporting, setExporting] = useState(false);
   // Live export progress ({label, pct}) or null when idle. Drives the Export
@@ -469,11 +485,17 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
   }, [overlayImportOwner]);
 
   useEffect(() => {
+    registerSfxImportOwner(sfxImportOwner);
+    return () => releaseSfxImportOwner(sfxImportOwner);
+  }, [sfxImportOwner]);
+
+  useEffect(() => {
     if (!editorEnabled) {
       cancelOverlayImport(overlayImportOwner);
       clearOverlayImport(overlayImportOwner);
+      cancelSfxImport(sfxImportOwner);
     }
-  }, [editorEnabled, overlayImportOwner]);
+  }, [editorEnabled, overlayImportOwner, sfxImportOwner]);
 
   // Build the selector options: each Short reads "<Project Title> · Short N".
   // Before a transcript loads there's no title yet, so fall back to the plain
@@ -539,9 +561,9 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
         captionsEnabled: state.captionsEnabled,
         captionStyle: state.captionStyle,
         captionBlocks: state.captionBlocks,
-        // Generated sound-effects track (a full-length WAV) mixed into the export
-        // audio alongside the face-cam. Null when none was generated.
-        sfxTrack: state.sfxTrack,
+        // Editable sound-effect clips mixed into the output timeline.
+        sfxClips: state.sfxClips,
+        sfxAssets: state.sfxAssets,
         musicTrack: state.musicTrack,
         resolution,
         abortSignal: controller.signal,
@@ -790,14 +812,14 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
         </main>
 
         <aside className="flex w-80 min-h-0 shrink-0 flex-col overflow-hidden">
-          <InspectorRail overlayImportOwner={overlayImportOwner} projectId={projectId} />
+          <InspectorRail overlayImportOwner={overlayImportOwner} sfxImportOwner={sfxImportOwner} projectId={projectId} />
         </aside>
       </div>
 
       {/* Timeline docked full-width along the bottom -- always the last thing on
           the page, never pushed below a scroll. */}
       <div className="h-60 min-h-0 shrink-0 overflow-hidden">
-        <TimelinePanel overlayImportOwner={overlayImportOwner} />
+        <TimelinePanel overlayImportOwner={overlayImportOwner} sfxImportOwner={sfxImportOwner} />
       </div>
     </div>
   );

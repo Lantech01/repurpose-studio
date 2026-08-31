@@ -11,7 +11,6 @@ import {
   ArrowsOutLineHorizontal,
   FrameCorners,
   Magnet,
-  Waveform,
   MusicNotes,
   MusicNote,
   X,
@@ -25,13 +24,19 @@ import {
 } from "@/lib/repurpose/time-map";
 import { resolveEffectivePrimaryOverlay } from "@/lib/repurpose/overlay-geometry";
 import { effectiveSplitRatio } from "@/lib/repurpose/split-ratio";
-import type { Clip, Overlay } from "@/lib/repurpose/types";
+import type { Clip, Overlay, SfxAsset, SfxClip } from "@/lib/repurpose/types";
+import { sfxClipTimelineEnd } from "@/lib/repurpose/sfx-clips";
+import { resolveSfxSource } from "@/lib/repurpose/sfx-source";
+import { isApprovedSfxKey, SFX_CATALOG } from "@/lib/repurpose/sfx-effects";
+import { SFX_DRAG_MIME, type SfxDragPayload } from "@/lib/repurpose/sfx-drag";
+import { classifySfxFile, importSfxFile, type SfxImportOwner } from "@/lib/repurpose/sfx-ingest-client";
 import {
   ingestOverlayFiles,
   type OverlayImportOwner,
 } from "@/lib/repurpose/overlay-ingest";
 import { ClipBlock } from "./ClipBlock";
 import { OverlayBlock, useOverlayThumbnails } from "./OverlayBlock";
+import { SfxClipBlock } from "./SfxClipBlock";
 import { TransportBar } from "./TransportBar";
 import {
   useFaceWaveform,
@@ -48,6 +53,8 @@ import {
   TRACK_GAP,
   OVERLAY_LANE_HEIGHT,
   OVERLAY_LANE_GAP,
+  SFX_LANE_HEIGHT,
+  SFX_LANE_GAP,
   RULER_HEIGHT,
   SNAP_PX,
   formatTimecode,
@@ -62,6 +69,8 @@ import {
 export interface TimelineProps {
   /** Optional height override for the whole widget; defaults to fitting 3 tracks + ruler. */
   className?: string;
+  overlayImportOwner?: OverlayImportOwner;
+  sfxImportOwner?: SfxImportOwner;
 }
 
 /**
@@ -99,6 +108,13 @@ type DragKind =
       startClientX: number;
       startTimelineStart: number;
       startTimelineEnd: number;
+    }
+  | {
+      type: "sfx";
+      clip: SfxClip;
+      edge: "body" | "start" | "end";
+      startClientX: number;
+      token: string | null;
     };
 
 // The Screen + Face recordings are FRAME-LOCKED -- one timeline drives both, so
@@ -138,7 +154,8 @@ const TRACK_LABELS: { key: "clip"; label: string; icon: typeof MonitorPlay }[] =
 export function Timeline({
   className,
   overlayImportOwner,
-}: TimelineProps & { overlayImportOwner?: OverlayImportOwner }) {
+  sfxImportOwner,
+}: TimelineProps) {
   const clips = useRepurposeStore((s) => s.clips);
   const playhead = useRepurposeStore((s) => s.playhead);
   const duration = useRepurposeStore((s) => s.duration);
@@ -154,10 +171,16 @@ export function Timeline({
   // words inside its own [srcStart, srcEnd) to draw per-word divider ticks.
   const words = useRepurposeStore((s) => s.words);
 
-  // Generated sound-effects track (a single full-length green block on the Audio
-  // row below the clips), or null when none has been generated yet.
-  const sfxTrack = useRepurposeStore((s) => s.sfxTrack);
-  const clearSfxTrack = useRepurposeStore((s) => s.clearSfxTrack);
+  const sfxClips = useRepurposeStore((s) => s.sfxClips);
+  const sfxAssets = useRepurposeStore((s) => s.sfxAssets);
+  const selectedSfxClipId = useRepurposeStore((s) => s.selectedSfxClipId);
+  const selectSfxClip = useRepurposeStore((s) => s.selectSfxClip);
+  const removeSfxClip = useRepurposeStore((s) => s.removeSfxClip);
+  const duplicateSfxClip = useRepurposeStore((s) => s.duplicateSfxClip);
+  const beginSfxGesture = useRepurposeStore((s) => s.beginSfxGesture);
+  const updateSfxGesture = useRepurposeStore((s) => s.updateSfxGesture);
+  const endSfxGesture = useRepurposeStore((s) => s.endSfxGesture);
+  const cancelSfxGesture = useRepurposeStore((s) => s.cancelSfxGesture);
 
   // Background music bed (a single indigo block on its own row between the clips
   // and the SFX row), or null when none has been loaded yet. Plays UNDER the
@@ -174,7 +197,6 @@ export function Timeline({
   // waveform (Descript-style) instead of a flat colored slab. Same shared decode
   // cache as the face clips; null while decoding -> the block renders plain.
   const musicWaveform = useAudioWaveform(musicTrack?.src ?? null);
-  const sfxWaveform = useAudioWaveform(sfxTrack?.src ?? null);
 
   const deleteClip = useRepurposeStore((s) => s.deleteClip);
   const restoreClip = useRepurposeStore((s) => s.restoreClip);
@@ -311,13 +333,16 @@ export function Timeline({
     for (const o of overlays) {
       targets.push(o.timelineStart, o.timelineEnd);
     }
+    for (const clip of sfxClips) {
+      targets.push(clip.timelineStart, sfxClipTimelineEnd(clip));
+    }
     // Marker pins are snap targets too, so a clip/overlay edge or the playhead
     // clicks to a marked beat -- the drag-side complement to [ / ] marker nav.
     for (const m of markers) {
       targets.push(m.t);
     }
     return targets;
-  }, [clips, overlays, markers, playhead, duration]);
+  }, [clips, overlays, sfxClips, markers, playhead, duration]);
 
   // Snap threshold in seconds -- or -1 (unreachable) when the magnet is OFF, so
   // snapTime never finds a target within range and returns the raw candidate.
@@ -382,6 +407,10 @@ export function Timeline({
     return Array.from(types).includes("Files");
   }, []);
 
+  const dragCarriesSfx = useCallback((e: React.DragEvent): boolean => (
+    Array.from(e.dataTransfer?.types ?? []).includes(SFX_DRAG_MIME)
+  ), []);
+
   const snappedDropTime = useCallback(
     (clientX: number): number => {
       const raw = clientXToTime(clientX);
@@ -393,7 +422,7 @@ export function Timeline({
 
   const handleTrackDragOver = useCallback(
     (e: React.DragEvent) => {
-      if (!dragCarriesFiles(e)) return;
+      if (!dragCarriesFiles(e) && !dragCarriesSfx(e)) return;
       // preventDefault marks this a valid drop target (without it the browser
       // navigates to the file / does nothing on drop).
       e.preventDefault();
@@ -401,7 +430,7 @@ export function Timeline({
       const t = snappedDropTime(e.clientX);
       setDropIndicatorX(timeToPx(t, pixelsPerSecond));
     },
-    [dragCarriesFiles, snappedDropTime, pixelsPerSecond]
+    [dragCarriesFiles, dragCarriesSfx, snappedDropTime, pixelsPerSecond]
   );
 
   const handleTrackDragLeave = useCallback((e: React.DragEvent) => {
@@ -415,20 +444,58 @@ export function Timeline({
 
   const handleTrackDrop = useCallback(
     (e: React.DragEvent) => {
-      if (!dragCarriesFiles(e)) return;
+      const carriesSfx = dragCarriesSfx(e);
+      const carriesFiles = dragCarriesFiles(e);
+      if (!carriesFiles && !carriesSfx) return;
       e.preventDefault();
       setDropIndicatorX(null);
-      const files = e.dataTransfer.files;
-      if (!files || files.length === 0) return;
       const atTime = snappedDropTime(e.clientX);
-      void ingestOverlayFiles(
-        files,
-        atTime,
-        undefined,
-        overlayImportOwner
-      ).catch(() => undefined);
+      if (carriesSfx) {
+        try {
+          const payload = JSON.parse(e.dataTransfer.getData(SFX_DRAG_MIME)) as SfxDragPayload;
+          if ("builtInKey" in payload && isApprovedSfxKey(payload.builtInKey)) {
+            const entry = SFX_CATALOG[payload.builtInKey];
+            useRepurposeStore.getState().addSfxClip({
+              name: entry.displayName,
+              source: { kind: "built-in", key: payload.builtInKey },
+              atTime,
+            });
+          } else if ("assetId" in payload) {
+            const asset = useRepurposeStore.getState().sfxAssets.find((item) => item.id === payload.assetId);
+            if (asset?.sourcePath) {
+              useRepurposeStore.getState().addSfxClip({
+                name: asset.name,
+                source: { kind: "imported", assetId: asset.id, srcDuration: asset.srcDuration },
+                atTime,
+              });
+            }
+          }
+        } catch {
+          // Ignore malformed internal payloads; paths are never accepted here.
+        }
+        return;
+      }
+      const files = Array.from(e.dataTransfer.files ?? []);
+      if (files.length === 0) return;
+      const audioFiles = files.filter(classifySfxFile);
+      const overlayFiles = files.filter((file) => !classifySfxFile(file));
+      if (audioFiles.length > 0 && sfxImportOwner) {
+        void (async () => {
+          for (const file of audioFiles) {
+            await importSfxFile(file, atTime, sfxImportOwner);
+          }
+        })().catch(() => undefined);
+      }
+      if (overlayFiles.length > 0) {
+        void ingestOverlayFiles(
+          overlayFiles,
+          atTime,
+          undefined,
+          overlayImportOwner
+        ).catch(() => undefined);
+      }
     },
-    [dragCarriesFiles, overlayImportOwner, snappedDropTime]
+    [dragCarriesFiles, dragCarriesSfx, overlayImportOwner, sfxImportOwner, snappedDropTime]
   );
 
   // ---- zoom -----------------------------------------------------------------
@@ -705,6 +772,21 @@ export function Timeline({
     [stopCoast]
   );
 
+  const handleSfxBodyDragStart = useCallback((clip: SfxClip, clientX: number) => {
+    stopCoast();
+    dragRef.current = { type: "sfx", clip, edge: "body", startClientX: clientX, token: null };
+  }, [stopCoast]);
+
+  const handleSfxEdgeDragStart = useCallback((clip: SfxClip, edge: "start" | "end", clientX: number) => {
+    stopCoast();
+    dragRef.current = { type: "sfx", clip, edge, startClientX: clientX, token: null };
+  }, [stopCoast]);
+
+  useEffect(() => useRepurposeStore.getState().subscribeSfxGestureCancellation(() => {
+    if (dragRef.current?.type === "sfx") dragRef.current = null;
+    setSnapGuideX(null);
+  }), []);
+
   // ---- scrub-release momentum coast (self-driven) ---------------------------
   // Runs on its OWN rAF, reading pixelsPerSecond / duration from refs so it is
   // NOT tied to the drag effect's lifecycle. A physics-first glide on scrub
@@ -782,6 +864,37 @@ export function Timeline({
         }
         lastScrubClientXRef.current = e.clientX;
         lastScrubTsRef.current = now;
+        return;
+      }
+
+      if (drag.type === "sfx") {
+        const deltaPx = e.clientX - drag.startClientX;
+        if (!drag.token && Math.abs(deltaPx) < 4) return;
+        if (!drag.token) {
+          const kind = drag.edge === "body" ? "move" : drag.edge === "start" ? "left-trim" : "right-trim";
+          drag.token = beginSfxGesture(drag.clip.id, kind);
+        }
+        if (!drag.token) return;
+        const anchor = drag.edge === "end"
+          ? sfxClipTimelineEnd(drag.clip)
+          : drag.clip.timelineStart;
+        const ownEnd = sfxClipTimelineEnd(drag.clip);
+        const liveClip = useRepurposeStore.getState().sfxClips.find(
+          (clip) => clip.id === drag.clip.id
+        );
+        const liveEnd = liveClip ? sfxClipTimelineEnd(liveClip) : ownEnd;
+        const { time, snapped } = snapTime(
+          anchor + pxToTime(deltaPx, pixelsPerSecond),
+          snapTargets.filter((target) => (
+            Math.abs(target - drag.clip.timelineStart) > .001
+            && Math.abs(target - ownEnd) > .001
+            && Math.abs(target - (liveClip?.timelineStart ?? drag.clip.timelineStart)) > .001
+            && Math.abs(target - liveEnd) > .001
+          )),
+          snapThresholdSeconds
+        );
+        setSnapGuideX(snapped ? timeToPx(time, pixelsPerSecond) : null);
+        updateSfxGesture(drag.token, time);
         return;
       }
 
@@ -907,6 +1020,7 @@ export function Timeline({
       const drag = dragRef.current;
       dragRef.current = null;
       setSnapGuideX(null);
+      if (drag?.type === "sfx" && drag.token) endSfxGesture(drag.token);
       if (drag?.type === "playhead") {
         lastScrubClientXRef.current = null;
         // Hand the release velocity to the standalone coast driver. The coast
@@ -917,11 +1031,22 @@ export function Timeline({
       }
     };
 
+    const handleCancel = () => {
+      const drag = dragRef.current;
+      dragRef.current = null;
+      setSnapGuideX(null);
+      if (drag?.type === "sfx" && drag.token) cancelSfxGesture(drag.token);
+    };
+
     window.addEventListener("pointermove", handleMove);
     window.addEventListener("pointerup", handleUp);
+    window.addEventListener("pointercancel", handleCancel);
     return () => {
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleCancel);
+      const drag = dragRef.current;
+      if (drag?.type === "sfx" && drag.token) cancelSfxGesture(drag.token);
       // NOTE: do NOT cancel momentumRafRef here. The coast is owned by its own
       // unmount-only effect (see below); cancelling it on every re-render is
       // exactly the bug this fix removes.
@@ -933,6 +1058,10 @@ export function Timeline({
     trimClip,
     moveOverlay,
     trimOverlay,
+    beginSfxGesture,
+    updateSfxGesture,
+    endSfxGesture,
+    cancelSfxGesture,
   ]);
 
   // ---- keyboard: delete selected clip -----------------------------------------
@@ -948,6 +1077,26 @@ export function Timeline({
       const isEditable =
         target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.isContentEditable;
       if (isEditable) return;
+
+      const sfxState = useRepurposeStore.getState();
+      if ((e.key === "Delete" || e.key === "Backspace") && sfxState.selectedSfxClipId) {
+        e.preventDefault();
+        const index = sfxState.sfxClips.findIndex((clip) => clip.id === sfxState.selectedSfxClipId);
+        const nearest = sfxState.sfxClips[index + 1] ?? sfxState.sfxClips[index - 1] ?? null;
+        removeSfxClip(sfxState.selectedSfxClipId);
+        selectSfxClip(nearest?.id ?? null);
+        if (nearest) requestAnimationFrame(() => document.querySelector<HTMLElement>(`[data-sfx-clip-id="${nearest.id}"]`)?.focus());
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && e.code === "KeyD" && sfxState.selectedSfxClipId) {
+        e.preventDefault();
+        const id = duplicateSfxClip(sfxState.selectedSfxClipId);
+        if (id) {
+          selectSfxClip(id);
+          requestAnimationFrame(() => document.querySelector<HTMLElement>(`[data-sfx-clip-id="${id}"]`)?.focus());
+        }
+        return;
+      }
 
       // Overlay first, and short-circuit: selecting an overlay clears
       // selectedClipId in the store (mutual exclusion), so an overlay-delete and
@@ -1017,6 +1166,9 @@ export function Timeline({
     deleteClip,
     duplicateClip,
     removeOverlay,
+    removeSfxClip,
+    duplicateSfxClip,
+    selectSfxClip,
     fitToWindow,
     zoomToSelection,
   ]);
@@ -1027,7 +1179,8 @@ export function Timeline({
   const handleBackgroundClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     if (e.target !== e.currentTarget) return;
     selectClip(null);
-  }, [selectClip]);
+    selectSfxClip(null);
+  }, [selectClip, selectSfxClip]);
 
   // ---- ruler ticks ------------------------------------------------------------
   const tickInterval = pickTickInterval(pixelsPerSecond);
@@ -1081,6 +1234,15 @@ export function Timeline({
   const overlayRowLanes = Math.max(1, overlayLaneCount);
   const overlayRowHeight =
     overlayRowLanes * OVERLAY_LANE_HEIGHT + (overlayRowLanes - 1) * OVERLAY_LANE_GAP;
+  const { lanes: sfxLanes, laneCount: sfxLaneCount } = useMemo(
+    () => packLanes(sfxClips.map((clip) => ({
+      start: clip.timelineStart,
+      end: sfxClipTimelineEnd(clip),
+    }))),
+    [sfxClips]
+  );
+  const sfxRowLanes = Math.max(1, sfxLaneCount);
+  const sfxRowHeight = sfxRowLanes * SFX_LANE_HEIGHT + (sfxRowLanes - 1) * SFX_LANE_GAP;
 
   // Vertical layout, top -> bottom: Overlays row (media ON TOP of the composite),
   // then the single unified clip track, then the Music row (background bed), then
@@ -1093,7 +1255,7 @@ export function Timeline({
   const clipRowTop = overlayRowHeight + TRACK_GAP;
   const musicRowTop = clipRowTop + TRACK_HEIGHT + TRACK_GAP;
   const audioRowTop = musicRowTop + TRACK_HEIGHT + TRACK_GAP;
-  const totalTracksHeight = audioRowTop + TRACK_HEIGHT;
+  const totalTracksHeight = audioRowTop + sfxRowHeight;
 
   return (
     <div className={`flex flex-col bg-neutral-950 border border-neutral-800 rounded-lg overflow-hidden ${className ?? ""}`}>
@@ -1215,7 +1377,7 @@ export function Timeline({
                 plays UNDER the picture. Last row, so it carries only TRACK_HEIGHT. */}
             <div
               className="flex items-center gap-1.5 px-2 text-[11px] text-emerald-300 border-b border-neutral-800/60"
-              style={{ height: TRACK_HEIGHT }}
+               style={{ height: sfxRowHeight }}
               title="Sound effects (plays under the picture)"
             >
               <MusicNotes size={13} weight="regular" className="shrink-0" />
@@ -1502,64 +1664,30 @@ export function Timeline({
                 })()}
               </div>
 
-              {/* AUDIO row -- the generated sound-effects track, sitting BELOW
-                  the clip + music tracks since audio plays under the picture.
-                  One locked full-length GREEN block
-                  spanning 0..duration; not draggable (it's the whole-reel bed).
-                  Click the X to remove it. Emerald so it reads distinctly from
-                  coral clips and violet overlays. */}
-              <div
-                className="absolute left-0 right-0 border-b border-emerald-500/25"
-                style={{ top: audioRowTop, height: TRACK_HEIGHT }}
-              >
-                {sfxTrack && (() => {
-                  const sfxBlockWidth = timeToPx(safeDuration, pixelsPerSecond);
-                  return (
-                  <div
-                    className="group absolute flex items-center gap-1.5 overflow-hidden rounded-md border border-emerald-400/50 bg-emerald-500/20 px-2 text-[11px] font-medium text-emerald-100 shadow-[0_0_10px_rgba(16,185,129,0.25)]"
-                    style={{
-                      left: timeToPx(0, pixelsPerSecond),
-                      width: sfxBlockWidth,
-                      top: 4,
-                      height: TRACK_HEIGHT - 8,
-                    }}
-                    title="Generated sound-effects track (full reel). Plays in preview + export."
-                  >
-                    {/* Real waveform inside the block (Descript-style): darker
-                        emerald ink, bottom-anchored bars, behind the label. */}
-                    <TrackWaveform
-                      waveform={sfxWaveform}
-                      srcStart={0}
-                      srcEnd={Math.min(sfxTrack.durationSec, safeDuration)}
-                      // Audible span, NOT the block width: if the reel grew
-                      // after the SFX render, bars stop where the audio does.
-                      width={timeToPx(
-                        Math.min(sfxTrack.durationSec, safeDuration),
-                        pixelsPerSecond
-                      )}
-                      height={TRACK_HEIGHT - 8}
-                      color="#00140d"
-                    />
-                    <Waveform size={13} weight="bold" className="relative shrink-0 text-emerald-300" />
-                    <span className="relative truncate">SFX</span>
-                    {/* delete affordance -- appears on hover */}
-                    <button
-                      type="button"
-                      onPointerDown={(e) => e.stopPropagation()}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        clearSfxTrack();
-                      }}
-                      aria-label="Remove sound-effects track"
-                      title="Remove sound-effects track"
-                      className="absolute right-1 top-1/2 hidden h-4 w-4 -translate-y-1/2 place-items-center rounded-full bg-neutral-900/80 text-emerald-200 hover:bg-red-600/80 hover:text-white group-hover:grid"
-                    >
-                      <X size={10} weight="bold" />
-                    </button>
-                  </div>
-                  );
-                })()}
-              </div>
+              {/* AUDIO row -- editable sound-effect clips packed into mini-lanes
+                  below the picture and music tracks. */}
+               <div
+                 data-testid="sfx-row"
+                 className="absolute left-0 right-0 border-b border-emerald-500/25"
+                 style={{ top: audioRowTop, height: sfxRowHeight }}
+               >
+                 {sfxClips.map((clip, index) => (
+                   <TimelineSfxBlock
+                     key={clip.id}
+                     clip={clip}
+                     assets={sfxAssets}
+                     left={timeToPx(clip.timelineStart, pixelsPerSecond)}
+                     width={timeToPx(sfxClipTimelineEnd(clip) - clip.timelineStart, pixelsPerSecond)}
+                     top={(sfxLanes[index] ?? 0) * (SFX_LANE_HEIGHT + SFX_LANE_GAP)}
+                     height={SFX_LANE_HEIGHT}
+                     selected={selectedSfxClipId === clip.id}
+                     onSelect={selectSfxClip}
+                     onBodyPointerDown={handleSfxBodyDragStart}
+                     onEdgePointerDown={handleSfxEdgeDragStart}
+                     onDelete={removeSfxClip}
+                   />
+                 ))}
+               </div>
 
               {/* scene-cut dividers -- a vertical line at every clip boundary
                   so each cut in the assembled short reads at a glance (matches
@@ -1669,6 +1797,28 @@ export function Timeline({
       </div>
     </div>
   );
+}
+
+function TimelineSfxBlock({
+  clip,
+  assets,
+  ...props
+}: {
+  clip: SfxClip;
+  assets: SfxAsset[];
+  left: number;
+  width: number;
+  top: number;
+  height: number;
+  selected: boolean;
+  onSelect: (id: string) => void;
+  onBodyPointerDown: (clip: SfxClip, clientX: number) => void;
+  onEdgePointerDown: (clip: SfxClip, edge: "start" | "end", clientX: number) => void;
+  onDelete: (id: string) => void;
+}) {
+  const source = resolveSfxSource(clip.source, assets);
+  const waveform = useAudioWaveform(source.url);
+  return <SfxClipBlock clip={clip} missing={source.missing} waveform={waveform} {...props} />;
 }
 
 

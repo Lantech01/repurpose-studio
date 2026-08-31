@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { Timeline } from "@/app/repurpose-studio/_components/Timeline";
 import { useRepurposeStore } from "@/lib/repurpose/store";
-import type { Clip, Overlay } from "@/lib/repurpose/types";
+import type { Clip, Overlay, SfxClip } from "@/lib/repurpose/types";
 
 vi.mock("@/app/repurpose-studio/_components/ClipBlock", () => ({
   ClipBlock: () => null,
@@ -13,6 +13,11 @@ vi.mock("@/app/repurpose-studio/_components/OverlayBlock", () => ({
 }));
 vi.mock("@/app/repurpose-studio/_components/TransportBar", () => ({
   TransportBar: () => null,
+}));
+vi.mock("@/app/repurpose-studio/_components/SfxClipBlock", () => ({
+  SfxClipBlock: ({ clip, top, onSelect, onBodyPointerDown }: { clip: SfxClip; top: number; onSelect: (id: string) => void; onBodyPointerDown: (clip: SfxClip, clientX: number) => void }) => (
+    <button data-testid={`sfx-${clip.id}`} data-top={top} data-sfx-clip-id={clip.id} onClick={() => onSelect(clip.id)} onPointerDown={(event) => { event.stopPropagation(); onBodyPointerDown(clip, event.clientX); }}>{clip.name}</button>
+  ),
 }));
 vi.mock("@/app/repurpose-studio/_components/useFaceWaveform", () => ({
   useFaceWaveform: () => null,
@@ -122,3 +127,59 @@ test.each([
     expect(useRepurposeStore.getState().selectedOverlayIds).toEqual(selectedIds);
   }
 );
+
+test("renders overlapping SFX in deterministic mini-lanes and grows the row", () => {
+  const sfx = (id: string, start: number, end: number): SfxClip => ({
+    id, name: id, source: { kind: "built-in", key: "ding" }, origin: "manual",
+    timelineStart: start, sourceStart: 0, sourceEnd: end - start, gain: 1,
+    fadeInSec: 0, fadeOutSec: 0, muted: false,
+  });
+  useRepurposeStore.setState({ duration: 5, sfxClips: [sfx("a", 0, 2), sfx("b", 1, 3), sfx("c", 2, 4)] });
+  const { getByTestId } = render(<Timeline />);
+  expect(getByTestId("sfx-a")).toHaveAttribute("data-top", "0");
+  expect(getByTestId("sfx-b")).not.toHaveAttribute("data-top", "0");
+  expect(getByTestId("sfx-c")).toHaveAttribute("data-top", "0");
+  expect(getByTestId("sfx-row")).toHaveStyle({ height: "63px" });
+});
+
+test("Delete and Cmd+D target selected SFX before scene, word, and overlay paths", () => {
+  const effect: SfxClip = {
+    id: "sfx", name: "Hit", source: { kind: "built-in", key: "ding" }, origin: "manual",
+    timelineStart: 0, sourceStart: 0, sourceEnd: 1, gain: 1, fadeInSec: 0,
+    fadeOutSec: 0, muted: false,
+  };
+  const removeSfxClip = vi.fn();
+  const duplicateSfxClip = vi.fn().mockReturnValue("copy");
+  const deleteClip = vi.fn();
+  const removeOverlay = vi.fn();
+  useRepurposeStore.setState({
+    duration: 2, clips, sfxClips: [effect], selectedSfxClipId: effect.id,
+    selectedClipId: "incoming", selectedOverlayId: "overlay", selectedOverlayIds: ["overlay"],
+    removeSfxClip, duplicateSfxClip, deleteClip, removeOverlay,
+  });
+  const { container } = render(<Timeline />);
+  fireEvent.keyDown(container.firstElementChild!, { key: "Delete", code: "Delete" });
+  useRepurposeStore.setState({ selectedSfxClipId: "sfx" });
+  fireEvent.keyDown(container.firstElementChild!, { key: "d", code: "KeyD", ctrlKey: true });
+  expect(removeSfxClip).toHaveBeenCalledWith("sfx");
+  expect(duplicateSfxClip).toHaveBeenCalledWith("sfx");
+  expect(deleteClip).not.toHaveBeenCalled();
+  expect(removeOverlay).not.toHaveBeenCalled();
+});
+
+test("an SFX drag does not snap back to its own live edge", () => {
+  const effect: SfxClip = {
+    id: "sfx", name: "Hit", source: { kind: "built-in", key: "ding" }, origin: "manual",
+    timelineStart: 0, sourceStart: 0, sourceEnd: 1, gain: 1, fadeInSec: 0,
+    fadeOutSec: 0, muted: false,
+  };
+  useRepurposeStore.setState({ duration: 2, clips, sfxClips: [effect], snapEnabled: true });
+  const { getByTestId } = render(<Timeline />);
+
+  fireEvent.pointerDown(getByTestId("sfx-sfx"), { button: 0, clientX: 0 });
+  fireEvent.pointerMove(window, { clientX: 10 });
+  fireEvent.pointerMove(window, { clientX: 15 });
+  fireEvent.pointerUp(window);
+
+  expect(useRepurposeStore.getState().sfxClips[0].timelineStart).toBeCloseTo(15 / 90, 5);
+});

@@ -1,240 +1,260 @@
 "use client";
 
-// ===========================================================================
-// SfxPanel -- the "Sound Effects" generator (Inspector rail)
-// ===========================================================================
-// One button that, ON CLICK ONLY, generates a sound-effects track for the
-// current reel and auto-loads it onto the timeline's Audio row (a green block
-// below the clips). The intelligence (which sound on which beat) is computed in
-// the browser by `planSfxEvents` against the reel's OUTPUT-time transcript, then
-// POSTed to /api/repurpose/sfx, which runs the existing Python SFX engine and
-// returns a playable WAV. The track is baked into BOTH the live preview and the
-// exported MP4 (see useSfxPreview + export-short).
-//
-// Re-clicking regenerates against the current edits (replacing the track). A
-// gain slider pulls the whole SFX bed up/down under the VO without re-rendering.
-// ===========================================================================
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArrowClockwise, MusicNotes, Pause, Play, Trash, Upload, Warning } from "@phosphor-icons/react";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { MusicNotes, Waveform, ArrowClockwise, Trash, Warning } from "@phosphor-icons/react";
-import { useRepurposeStore } from "@/lib/repurpose/store";
+import { useRepurposeStore, type SfxGestureKind } from "@/lib/repurpose/store";
+import { APPROVED_SFX_KEYS, SFX_CATALOG, type ApprovedSfxKey } from "@/lib/repurpose/sfx-effects";
+import { sfxClipsFromEvents, sfxSourceDuration } from "@/lib/repurpose/sfx-clips";
 import { planSfxEvents } from "@/lib/repurpose/sfx-placement";
+import { resolveSfxSource } from "@/lib/repurpose/sfx-source";
+import { loadResolvedSfxAudio } from "@/lib/repurpose/sfx-audio";
+import { importSfxFile, type SfxImportOwner } from "@/lib/repurpose/sfx-ingest-client";
+import type { SfxAsset, SfxClipSource } from "@/lib/repurpose/types";
+import { SFX_DRAG_MIME, type SfxDragPayload } from "@/lib/repurpose/sfx-drag";
 
-export function SfxPanel({ projectId }: { projectId: string }) {
-  const sfxTrack = useRepurposeStore((s) => s.sfxTrack);
-  const sfxGenerating = useRepurposeStore((s) => s.sfxGenerating);
-  const clips = useRepurposeStore((s) => s.clips);
-  const words = useRepurposeStore((s) => s.words);
-  const duration = useRepurposeStore((s) => s.duration);
-  const projectEpoch = useRepurposeStore((s) => s.projectEpoch);
-  const sfxDocumentRevision = useRepurposeStore((s) => s.sfxDocumentRevision);
-  const setSfxTrack = useRepurposeStore((s) => s.setSfxTrack);
-  const setSfxGenerating = useRepurposeStore((s) => s.setSfxGenerating);
-  const clearSfxTrack = useRepurposeStore((s) => s.clearSfxTrack);
-  const setSfxGain = useRepurposeStore((s) => s.setSfxGain);
+function dragPayload(event: React.DragEvent, payload: SfxDragPayload): void {
+  event.dataTransfer.effectAllowed = "copy";
+  event.dataTransfer.setData(SFX_DRAG_MIME, JSON.stringify(payload));
+}
 
+function sourceForAsset(asset: SfxAsset): SfxClipSource {
+  return { kind: "imported", assetId: asset.id, srcDuration: asset.srcDuration };
+}
+
+function Slider({
+  clipId,
+  kind,
+  label,
+  value,
+  min,
+  max,
+  step,
+}: {
+  clipId: string;
+  kind: SfxGestureKind;
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+}) {
+  const tokenRef = useRef<string | null>(null);
+  const begin = () => {
+    tokenRef.current = useRepurposeStore.getState().beginSfxGesture(clipId, kind);
+  };
+  const end = () => {
+    if (tokenRef.current) useRepurposeStore.getState().endSfxGesture(tokenRef.current);
+    tokenRef.current = null;
+  };
+  const cancel = () => {
+    if (tokenRef.current) useRepurposeStore.getState().cancelSfxGesture(tokenRef.current);
+    tokenRef.current = null;
+  };
+  useEffect(() => cancel, []);
+  return (
+    <label className="block text-[10px] text-muted-foreground">
+      <span className="flex justify-between"><span>{label}</span><span className="tabular-nums">{Math.round(value * 100) / 100}</span></span>
+      <input type="range" aria-label={`${label} for ${useRepurposeStore.getState().sfxClips.find((clip) => clip.id === clipId)?.name ?? "effect"}`}
+        min={min} max={max} step={step} value={value} className="w-full accent-emerald-400"
+        onPointerDown={begin} onChange={(event) => {
+          if (!tokenRef.current) begin();
+          if (tokenRef.current) useRepurposeStore.getState().updateSfxGesture(tokenRef.current, Number(event.target.value));
+        }} onPointerUp={end} onPointerCancel={cancel} onBlur={end} />
+    </label>
+  );
+}
+
+export function SfxPanel({ projectId, sfxImportOwner }: { projectId: string; sfxImportOwner: SfxImportOwner }) {
+  const clips = useRepurposeStore((state) => state.clips);
+  const words = useRepurposeStore((state) => state.words);
+  const duration = useRepurposeStore((state) => state.duration);
+  const playhead = useRepurposeStore((state) => state.playhead);
+  const projectEpoch = useRepurposeStore((state) => state.projectEpoch);
+  const revision = useRepurposeStore((state) => state.sfxDocumentRevision);
+  const sfxClips = useRepurposeStore((state) => state.sfxClips);
+  const assets = useRepurposeStore((state) => state.sfxAssets);
+  const selectedId = useRepurposeStore((state) => state.selectedSfxClipId);
+  const generating = useRepurposeStore((state) => state.sfxGenerating);
+  const selected = sfxClips.find((clip) => clip.id === selectedId) ?? null;
+  const selectedImportedAssetId = selected?.source.kind === "imported"
+    ? selected.source.assetId
+    : null;
+  const [query, setQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const mountedRef = useRef(false);
-  const projectIdRef = useRef(projectId);
-  const generationRef = useRef(0);
-  const controllerRef = useRef<AbortController | null>(null);
-  projectIdRef.current = projectId;
+  const [auditionIdentity, setAuditionIdentity] = useState<string | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const generationRef = useRef<{ token: number; controller: AbortController } | null>(null);
+  const tokenRef = useRef(0);
 
-  const cancelGeneration = useCallback(() => {
-    generationRef.current += 1;
-    controllerRef.current?.abort();
-    controllerRef.current = null;
-    const current = useRepurposeStore.getState();
-    if (current.sfxGenerating) current.setSfxGenerating(false);
+  const stopAudition = useCallback(() => {
+    audioRef.current?.pause();
+    if (audioRef.current) audioRef.current.currentTime = 0;
+    audioRef.current = null;
+    setAuditionIdentity(null);
   }, []);
 
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-      cancelGeneration();
-    };
-  }, [cancelGeneration]);
-
+  useEffect(() => stopAudition, [stopAudition]);
   useEffect(() => () => {
-    cancelGeneration();
-  }, [
-    cancelGeneration,
-    clips,
-    duration,
-    projectEpoch,
-    projectId,
-    sfxDocumentRevision,
-    sfxTrack,
-    words,
-  ]);
+    const operation = generationRef.current;
+    if (!operation) return;
+    operation.controller.abort();
+    generationRef.current = null;
+    useRepurposeStore.getState().setSfxGenerating(false);
+  }, [clips, duration, projectEpoch, projectId, revision, words]);
+  useEffect(() => () => {
+    generationRef.current?.controller.abort();
+    generationRef.current = null;
+    useRepurposeStore.getState().setSfxGenerating(false);
+  }, []);
 
-  const generate = useCallback(async () => {
+  const builtIns = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return APPROVED_SFX_KEYS.filter((key) => {
+      const entry = SFX_CATALOG[key];
+      return !needle || `${entry.displayName} ${entry.category}`.toLowerCase().includes(needle);
+    });
+  }, [query]);
+  const imported = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return assets.filter((asset) => !needle || `${asset.name} project imports`.toLowerCase().includes(needle));
+  }, [assets, query]);
+  const grouped = useMemo(() => {
+    const groups = new Map<string, ApprovedSfxKey[]>();
+    for (const key of builtIns) {
+      const category = SFX_CATALOG[key].category;
+      groups.set(category, [...(groups.get(category) ?? []), key]);
+    }
+    return groups;
+  }, [builtIns]);
+
+  const audition = (identity: string, url: string | null, unavailable: boolean) => {
+    if (auditionIdentity === identity) {
+      stopAudition();
+      return;
+    }
+    stopAudition();
+    if (unavailable || !url) {
+      setError("That imported sound effect is unavailable. Re-import it to audition.");
+      return;
+    }
+    const audio = new Audio(url);
+    audioRef.current = audio;
+    setAuditionIdentity(identity);
+    void audio.play().catch(() => {
+      if (audioRef.current === audio) {
+        stopAudition();
+        setError("Could not audition that sound effect.");
+      }
+    });
+  };
+
+  const add = (name: string, source: SfxClipSource) => {
+    const id = useRepurposeStore.getState().addSfxClip({ name, source, atTime: playhead });
+    if (id) useRepurposeStore.getState().selectSfxClip(id);
+  };
+
+  const generate = async () => {
     const state = useRepurposeStore.getState();
-    if (state.duration <= 0 || state.words.length === 0 || state.sfxGenerating) return;
-
-    controllerRef.current?.abort();
+    if (state.duration <= 0 || state.sfxGenerating) return;
     const controller = new AbortController();
-    controllerRef.current = controller;
-    const generation = generationRef.current + 1;
-    generationRef.current = generation;
+    const token = ++tokenRef.current;
+    generationRef.current?.controller.abort();
+    generationRef.current = { token, controller };
     const operation = {
       projectId,
       projectEpoch: state.projectEpoch,
       clips: state.clips,
       words: state.words,
       duration: state.duration,
-      sfxDocumentRevision: state.sfxDocumentRevision,
-      sfxTrack: state.sfxTrack,
+      revision: state.sfxDocumentRevision,
     };
-    const ownsGeneration = () => {
+    const owns = () => {
       const current = useRepurposeStore.getState();
-      return mountedRef.current &&
-        !controller.signal.aborted &&
-        generationRef.current === generation &&
-        projectIdRef.current === operation.projectId &&
-        current.projectEpoch === operation.projectEpoch &&
-        current.clips === operation.clips &&
-        current.words === operation.words &&
-        current.duration === operation.duration &&
-        current.sfxDocumentRevision === operation.sfxDocumentRevision &&
-        current.sfxTrack === operation.sfxTrack;
+      return generationRef.current?.token === token && !controller.signal.aborted
+        && projectId === operation.projectId && current.projectEpoch === operation.projectEpoch
+        && current.clips === operation.clips && current.words === operation.words
+        && current.duration === operation.duration && current.sfxDocumentRevision === operation.revision;
     };
-
     setError(null);
-    setSfxGenerating(true);
+    state.setSfxGenerating(true);
     try {
-      // 1. Plan placements from the reel's OUTPUT-time transcript (in-browser).
       const events = planSfxEvents(operation.words, operation.clips, operation.duration);
-      if (events.length === 0) {
-        if (ownsGeneration()) setError("No sound-effect beats found in this reel.");
-        return;
+      if (events.length === 0) throw new Error("No automatic sound-effect beats were found in this reel.");
+      const automatic = sfxClipsFromEvents(events, operation.duration);
+      const context = new AudioContext();
+      try {
+        const keys = [...new Set(automatic.flatMap((clip) => clip.source.kind === "built-in" ? [clip.source.key] : []))];
+        for (const key of keys) {
+          if (!owns()) return;
+          await loadResolvedSfxAudio(resolveSfxSource({ kind: "built-in", key }, []), context, controller.signal);
+          if (!owns()) return;
+        }
+      } finally {
+        await context.close().catch(() => undefined);
       }
-      // 2. Render the WAV via the local engine route.
-      const res = await fetch("/api/repurpose/sfx", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ events, durationMs: Math.round(operation.duration * 1000) }),
-        signal: controller.signal,
-      });
-      if (!res.ok) {
-        const body = (await res.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(body?.error ?? `SFX render failed (${res.status})`);
+      if (!owns()) return;
+      generationRef.current = null;
+      state.setSfxGenerating(false);
+      useRepurposeStore.getState().replaceAutomaticSfxClips(automatic);
+    } catch (cause) {
+      if (!controller.signal.aborted && owns()) {
+        setError(cause instanceof Error ? cause.message : "Automatic SFX generation failed.");
       }
-      const data = (await res.json()) as { path: string; url: string };
-      if (!ownsGeneration()) return;
-      // 3. Auto-load onto the Audio row (preview + export read this).
-      controllerRef.current = null;
-      setSfxGenerating(false);
-      setSfxTrack({
-        src: data.url,
-        sourcePath: data.path,
-        durationSec: operation.duration,
-        gain: operation.sfxTrack?.gain ?? 1,
-      });
-    } catch (err) {
-      if (controller.signal.aborted || !ownsGeneration()) return;
-      setError(err instanceof Error ? err.message : "SFX generation failed.");
     } finally {
-      if (ownsGeneration()) {
-        controllerRef.current = null;
-        setSfxGenerating(false);
+      if (generationRef.current?.token === token) {
+        generationRef.current = null;
+        useRepurposeStore.getState().setSfxGenerating(false);
       }
     }
-  }, [projectId, setSfxGenerating, setSfxTrack]);
+  };
+
+  const renderBuiltIn = (key: ApprovedSfxKey) => {
+    const entry = SFX_CATALOG[key];
+    const resolved = resolveSfxSource({ kind: "built-in", key }, assets);
+    return (
+      <div key={key} draggable onDragStart={(event) => dragPayload(event, { builtInKey: key })} className="flex items-center gap-1 rounded border border-border px-1.5 py-1">
+        <span className="min-w-0 flex-1 truncate text-[11px]">{entry.displayName}</span>
+        <button type="button" aria-label={`${auditionIdentity === resolved.identity ? "Stop" : "Audition"} ${entry.displayName}`} onClick={() => audition(resolved.identity, resolved.url, false)}>{auditionIdentity === resolved.identity ? <Pause size={12} /> : <Play size={12} />}</button>
+        <button type="button" aria-label={`Add ${entry.displayName} at playhead`} onClick={() => add(entry.displayName, { kind: "built-in", key })} className="text-[10px]">Add</button>
+        {selected && <button type="button" aria-label={`Replace ${selected.name} with ${entry.displayName}`} onClick={() => useRepurposeStore.getState().replaceSfxClipSource(selected.id, { name: entry.displayName, source: { kind: "built-in", key } })} className="text-[10px]">Replace</button>}
+      </div>
+    );
+  };
 
   return (
-    <div>
-      <div className="mb-2.5 flex items-center gap-1.5">
-        <MusicNotes size={14} weight="bold" className="text-emerald-400" />
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          Sound Effects
-        </h3>
+    <section className="space-y-3">
+      <div className="flex items-center gap-1.5"><MusicNotes size={14} className="text-emerald-400" /><h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Sound Effects</h3></div>
+      <div className="flex gap-1.5">
+        <button type="button" onClick={() => void generate()} disabled={generating} aria-label="Generate automatic effects" className="flex flex-1 items-center justify-center gap-1 rounded border border-emerald-500/50 bg-emerald-500/15 px-2 py-1.5 text-[11px] text-emerald-100"><ArrowClockwise size={12} className={generating ? "animate-spin" : ""} />{sfxClips.some((clip) => clip.origin === "automatic") ? "Regenerate" : "Generate"}</button>
+        <label className="flex items-center gap-1 rounded border border-border px-2 py-1.5 text-[11px]"><Upload size={12} />Import<input type="file" accept=".wav,.mp3,.m4a,audio/wav,audio/mpeg,audio/mp4" className="sr-only" aria-label="Import sound effect" onChange={(event) => {
+          const file = event.target.files?.[0];
+          event.target.value = "";
+          if (!file) return;
+          setError(null);
+          void importSfxFile(file, playhead, sfxImportOwner).catch((cause) => {
+            if (!(cause instanceof DOMException && cause.name === "AbortError")) setError(cause instanceof Error ? cause.message : "Sound-effect import failed.");
+          });
+        }} /></label>
       </div>
-
-      {!sfxTrack ? (
-        <>
-          <button
-            type="button"
-            onClick={generate}
-            disabled={sfxGenerating}
-            className="flex w-full items-center justify-center gap-2 rounded-md border border-emerald-500/50 bg-emerald-500/15 px-3 py-2 text-xs font-semibold text-emerald-100 transition-colors hover:bg-emerald-500/25 disabled:cursor-default disabled:opacity-60"
-          >
-            {sfxGenerating ? (
-              <>
-                <Waveform size={15} weight="bold" className="animate-pulse" />
-                Generating&hellip;
-              </>
-            ) : (
-              <>
-                <Waveform size={15} weight="bold" />
-                Generate SFX track
-              </>
-            )}
-          </button>
-          <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
-            Auto-maps digital readouts, whooshes on cuts, and contextual hits to
-            the reel, then drops a green track on the timeline. Plays in the
-            preview and bakes into the MP4.
-          </p>
-        </>
-      ) : (
-        <div className="space-y-3">
-          <div className="flex items-center gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-2 text-[11px] text-emerald-200">
-            <Waveform size={14} weight="bold" className="shrink-0 text-emerald-400" />
-            <span className="flex-1 truncate">SFX track loaded ({Math.round(sfxTrack.durationSec)}s)</span>
-          </div>
-
-          {/* Whole-bed gain (0-200%, 100% = as rendered). Live, no re-render. */}
-          <label className="block">
-            <span className="mb-1 flex items-center justify-between text-[11px] text-muted-foreground">
-              <span>SFX volume</span>
-              <span className="tabular-nums text-emerald-300">
-                {Math.round(sfxTrack.gain * 100)}%
-              </span>
-            </span>
-            <input
-              type="range"
-              min={0}
-              max={2}
-              step={0.05}
-              value={sfxTrack.gain}
-              onChange={(e) => setSfxGain(Number(e.target.value))}
-              className="w-full accent-emerald-400"
-              aria-label="SFX track volume"
-            />
-          </label>
-
-          <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={generate}
-              disabled={sfxGenerating}
-              className="flex flex-1 items-center justify-center gap-1.5 rounded-md border border-border bg-secondary px-2.5 py-1.5 text-[11px] font-medium text-foreground transition-colors hover:bg-secondary/70 disabled:opacity-60"
-              title="Re-generate against the current edits"
-            >
-              <ArrowClockwise size={13} weight="bold" className={sfxGenerating ? "animate-spin" : ""} />
-              {sfxGenerating ? "Generating…" : "Regenerate"}
-            </button>
-            <button
-              type="button"
-              onClick={() => clearSfxTrack()}
-              className="flex items-center justify-center gap-1.5 rounded-md border border-border bg-secondary px-2.5 py-1.5 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-red-500/15 hover:text-red-300"
-              title="Remove the SFX track"
-              aria-label="Remove SFX track"
-            >
-              <Trash size={13} weight="bold" />
-            </button>
-          </div>
-        </div>
-      )}
-
-      {error && (
-        <p className="mt-2 flex items-start gap-1.5 text-[11px] leading-relaxed text-red-300">
-          <Warning size={13} weight="fill" className="mt-px shrink-0 text-red-500" />
-          {error}
-        </p>
-      )}
-    </div>
+      <input type="search" aria-label="Search sound effects" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search library" className="w-full rounded border border-border bg-secondary px-2 py-1.5 text-[11px]" />
+      <div className="max-h-64 space-y-2 overflow-y-auto">
+        {[...grouped].map(([category, keys]) => <div key={category}><h4 className="mb-1 text-[10px] font-semibold uppercase text-muted-foreground">{category}</h4><div className="space-y-1">{keys.map(renderBuiltIn)}</div></div>)}
+        {imported.length > 0 && <div><h4 className="mb-1 text-[10px] font-semibold uppercase text-muted-foreground">Project imports</h4><div className="space-y-1">{imported.map((asset) => {
+          const unavailable = !asset.sourcePath || asset.srcDuration <= 0;
+          const resolved = resolveSfxSource(sourceForAsset(asset), assets);
+          return <div key={asset.id} draggable={!unavailable} onDragStart={(event) => dragPayload(event, { assetId: asset.id })} className="flex items-center gap-1 rounded border border-border px-1.5 py-1"><span className="min-w-0 flex-1 truncate text-[11px]">{asset.name}</span>{unavailable && <span className="text-[9px] text-amber-300">Unavailable</span>}<button type="button" disabled={unavailable} aria-label={`Audition ${asset.name}`} onClick={() => audition(resolved.identity, resolved.url, unavailable)}><Play size={12} /></button><button type="button" disabled={unavailable} aria-label={`Add ${asset.name} at playhead`} onClick={() => add(asset.name, sourceForAsset(asset))} className="text-[10px]">Add</button>{selected && <button type="button" disabled={unavailable} aria-label={`Replace ${selected.name} with ${asset.name}`} onClick={() => useRepurposeStore.getState().replaceSfxClipSource(selected.id, { name: asset.name, source: sourceForAsset(asset) })} className="text-[10px]">Replace</button>}</div>;
+        })}</div></div>}
+      </div>
+      {selected && <div className="space-y-2 rounded border border-emerald-500/30 bg-emerald-500/5 p-2"><div className="flex items-center justify-between"><strong className="truncate text-[11px]">{selected.name}</strong>{selectedImportedAssetId !== null && !assets.some((asset) => asset.id === selectedImportedAssetId && asset.sourcePath) && <span className="text-[9px] text-amber-300">Unavailable</span>}</div>
+        <Slider clipId={selected.id} kind="gain" label="Gain" value={selected.gain} min={0} max={2} step={0.01} />
+        <Slider clipId={selected.id} kind="source-in" label="Source in" value={selected.sourceStart} min={0} max={Math.max(0, selected.sourceEnd - .001)} step={.01} />
+        <Slider clipId={selected.id} kind="source-out" label="Source out" value={selected.sourceEnd} min={selected.sourceStart + .001} max={sfxSourceDuration(selected.source)} step={.01} />
+        <Slider clipId={selected.id} kind="fade-in" label="Fade in" value={selected.fadeInSec} min={0} max={2} step={.01} />
+        <Slider clipId={selected.id} kind="fade-out" label="Fade out" value={selected.fadeOutSec} min={0} max={2} step={.01} />
+        <div className="flex flex-wrap gap-1"><button type="button" aria-label={`${selected.muted ? "Unmute" : "Mute"} ${selected.name}`} onClick={() => useRepurposeStore.getState().setSfxClipMuted(selected.id, !selected.muted)} className="rounded border border-border px-1.5 py-1 text-[10px]">{selected.muted ? "Unmute" : "Mute"}</button><button type="button" aria-label={`Duplicate ${selected.name}`} onClick={() => { const id = useRepurposeStore.getState().duplicateSfxClip(selected.id); if (id) useRepurposeStore.getState().selectSfxClip(id); }} className="rounded border border-border px-1.5 py-1 text-[10px]">Duplicate</button><button type="button" aria-label={`Delete ${selected.name}`} onClick={() => useRepurposeStore.getState().removeSfxClip(selected.id)} className="rounded border border-red-500/30 px-1.5 py-1 text-[10px] text-red-300"><Trash size={11} /></button></div>
+      </div>}
+      {error && <p role="alert" className="flex gap-1 text-[10px] text-red-300"><Warning size={12} />{error}</p>}
+    </section>
   );
 }

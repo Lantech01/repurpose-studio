@@ -24,6 +24,8 @@ export const SNAP_PX = 8; // snap threshold in screen pixels, independent of zoo
 // overlay lane is a thin media strip, not a waveform-bearing scene track.
 export const OVERLAY_LANE_HEIGHT = 30;
 export const OVERLAY_LANE_GAP = 3;
+export const SFX_LANE_HEIGHT = 30;
+export const SFX_LANE_GAP = 3;
 
 /** Format seconds as mm:ss (or mm:ss.d when sub-second precision matters). */
 export function formatTimecode(seconds: number, withTenths = false): string {

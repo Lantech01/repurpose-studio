@@ -455,7 +455,6 @@ describe("SFX project persistence", () => {
           selected: true,
           error: "stale",
         })) as unknown as SfxClip[],
-        sfxTrack: persistedLegacyTrack,
         selectedSfxClipId: "sfx-clip-43",
         sfxGenerating: true,
       });
@@ -484,43 +483,10 @@ describe("SFX project persistence", () => {
     expect(useRepurposeStore.getState()).toMatchObject({
       sfxAssets: [asset],
       sfxClips: authoredClips,
-      sfxTrack: null,
       past: [],
       future: [],
     });
     reopened.unmount();
-  });
-
-  test("serializes a runtime-only track as an automatic legacy clip", async () => {
-    const persistence = installSfxRoundTrip(snapshot({ footageMeta: null }));
-    const rendered = await loadProject();
-
-    act(() => {
-      useRepurposeStore.setState({ sfxClips: [], sfxTrack: persistedLegacyTrack });
-    });
-
-    await waitFor(() => expect(persistence.saved()).not.toBeNull());
-    expect(persistence.saved()).not.toHaveProperty("sfxTrack");
-    expect(persistence.saved()?.sfxClips).toEqual([
-      {
-        id: "sfx-legacy",
-        name: "Legacy Sound Effects",
-        source: {
-          kind: "legacy",
-          sourcePath: persistedLegacyTrack.sourcePath,
-          srcDuration: persistedLegacyTrack.durationSec,
-        },
-        origin: "automatic",
-        timelineStart: 0,
-        sourceStart: 0,
-        sourceEnd: 5,
-        gain: persistedLegacyTrack.gain,
-        fadeInSec: 0,
-        fadeOutSec: 0,
-        muted: false,
-      },
-    ]);
-    rendered.unmount();
   });
 
   test("does not serialize URL-like or query-bearing SFX source paths", async () => {
@@ -547,10 +513,6 @@ describe("SFX project persistence", () => {
           name: `Invalid ${index}`,
           source: { kind: "legacy", sourcePath, srcDuration: 2 },
         })),
-        sfxTrack: {
-          ...persistedLegacyTrack,
-          sourcePath: invalidPaths[0],
-        },
       });
     });
 
@@ -572,7 +534,6 @@ describe("SFX project persistence", () => {
     expect(useRepurposeStore.getState()).toMatchObject({
       sfxClips: [],
       sfxAssets: [],
-      sfxTrack: null,
       past: [],
     });
     rendered.unmount();
@@ -612,7 +573,6 @@ describe("SFX project persistence", () => {
     ]);
     expect(state.sfxClips[0].sourceEnd).toBe(2.951854167);
     expect(isSfxClipSourceAvailable(state.sfxClips[1].source, state.sfxAssets)).toBe(false);
-    expect(state.sfxTrack).toBeNull();
     rendered.unmount();
   });
 
@@ -669,7 +629,6 @@ describe("SFX project persistence", () => {
     expect(useRepurposeStore.getState()).toMatchObject({
       sfxAssets: [asset],
       sfxClips: [clip],
-      sfxTrack: { sourcePath },
     });
     rendered.unmount();
   });
@@ -698,12 +657,6 @@ describe("SFX project persistence", () => {
         fadeOutSec: 0,
         muted: false,
       }],
-      sfxTrack: {
-        src: `/api/repurpose/sfx?path=${encodeURIComponent(persistedLegacyTrack.sourcePath)}`,
-        sourcePath: persistedLegacyTrack.sourcePath,
-        durationSec: 8,
-        gain: 1.25,
-      },
       past: [],
     });
     act(() => useRepurposeStore.getState().addMarker(1));
@@ -715,10 +668,7 @@ describe("SFX project persistence", () => {
 
     const reopened = await loadProject();
     expect(useRepurposeStore.getState().sfxClips).toEqual(persistence.saved()?.sfxClips);
-    expect(useRepurposeStore.getState().sfxTrack).toMatchObject({
-      sourcePath: persistedLegacyTrack.sourcePath,
-      gain: 1.25,
-    });
+    expect(useRepurposeStore.getState()).not.toHaveProperty("sfxTrack");
     reopened.unmount();
   });
 
@@ -735,7 +685,7 @@ describe("SFX project persistence", () => {
 
     const rendered = await loadProject();
 
-    expect(useRepurposeStore.getState()).toMatchObject({ sfxClips: [], sfxTrack: null });
+    expect(useRepurposeStore.getState()).toMatchObject({ sfxClips: [] });
     rendered.unmount();
   });
 

@@ -299,11 +299,6 @@ function snapshotFromStore(): ProjectSnapshot {
     s.sfxClips,
     s.duration
   );
-  const runtimeTrack = normalizeLegacySfxTrack(s.sfxTrack);
-  const fallbackLegacyClip =
-    s.sfxClips.length === 0 && runtimeTrack
-      ? migrateLegacySfxTrack(runtimeTrack, s.duration)
-      : null;
   return {
     // Per-scene framing (screenFraming / faceFraming) rides inside each clip, so
     // persisting `clips` persists it too -- no separate keyframe/global fields.
@@ -335,7 +330,7 @@ function snapshotFromStore(): ProjectSnapshot {
     markers: s.markers,
     deletedWordIndices: s.deletedWordIndices,
     overlays,
-    sfxClips: fallbackLegacyClip ? [fallbackLegacyClip] : normalizedSfxClips,
+    sfxClips: normalizedSfxClips,
     sfxAssets: normalizeSfxAssets(s.sfxAssets),
     musicTrack:
       s.musicTrack?.sourcePath
@@ -1020,15 +1015,18 @@ function hydrateSnapshot(snapshot: ProjectSnapshot): boolean {
 
   const authoritativeSfxDocument = snapshot.sfxClips !== undefined;
   const restoredSfxAssets = normalizeSfxAssets(snapshot.sfxAssets);
-  const restoredSfxClips = authoritativeSfxDocument
-    ? normalizePersistedSfxClips(
-        snapshot.sfxClips,
-        useRepurposeStore.getState().duration
-      )
-    : undefined;
-  const restoredSfxTrack = authoritativeSfxDocument
+  const restoredDuration = useRepurposeStore.getState().duration;
+  const legacySfxTrack = authoritativeSfxDocument
     ? null
     : normalizeLegacySfxTrack(snapshot.sfxTrack);
+  const migratedLegacyClip = legacySfxTrack
+    ? migrateLegacySfxTrack(legacySfxTrack, restoredDuration)
+    : null;
+  const restoredSfxClips = authoritativeSfxDocument
+    ? normalizePersistedSfxClips(snapshot.sfxClips, restoredDuration)
+    : migratedLegacyClip
+      ? [migratedLegacyClip]
+      : [];
 
   // MUSIC track -- same safe pattern; music is served by the asset route.
   const restoredMusicTrack: MusicTrack | null | undefined =
@@ -1091,8 +1089,7 @@ function hydrateSnapshot(snapshot: ProjectSnapshot): boolean {
       : {}),
     ...(restoredOverlays !== undefined ? { overlays: restoredOverlays } : {}),
     sfxAssets: restoredSfxAssets,
-    ...(restoredSfxClips !== undefined ? { sfxClips: restoredSfxClips } : {}),
-    sfxTrack: restoredSfxTrack,
+    sfxClips: restoredSfxClips,
     ...(restoredMusicTrack !== undefined ? { musicTrack: restoredMusicTrack } : {}),
     ...(restoredMediaAssets !== undefined ? { mediaAssets: restoredMediaAssets } : {}),
   });
