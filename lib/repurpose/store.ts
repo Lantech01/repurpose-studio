@@ -33,6 +33,7 @@ import type {
 } from "./types";
 import { defaultBuiltInDuration } from "./sfx-effects";
 import {
+  clampSfxSourceEnd,
   constrainSfxClipsToDuration,
   duplicateSfxClip as duplicateSfxClipValue,
   moveSfxClip as moveSfxClipValue,
@@ -4304,12 +4305,9 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
   },
   setSfxClipSourceEnd: (id, sourceEnd) => {
     if (!Number.isFinite(sourceEnd)) return;
-    updateSfxClip(id, (clip) => ({
+    updateSfxClip(id, (clip, duration) => ({
       ...clip,
-      sourceEnd: Math.max(
-        clip.sourceStart + 1 / 1000,
-        Math.min(sourceEnd, sfxSourceDuration(clip.source))
-      ),
+      sourceEnd: clampSfxSourceEnd(clip, sourceEnd, duration),
     }));
   },
   setSfxClipGain: (id, gain) => {
@@ -4404,10 +4402,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     } else if (gesture.kind === "source-out") {
       updated = {
         ...target,
-        sourceEnd: Math.max(
-          target.sourceStart + 1 / 1000,
-          Math.min(value, sfxSourceDuration(target.source))
-        ),
+        sourceEnd: clampSfxSourceEnd(target, value, state.duration),
       };
     } else if (gesture.kind === "gain") {
       updated = { ...target, gain: Math.max(0, Math.min(2, value)) };

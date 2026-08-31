@@ -89,10 +89,11 @@ export async function prepareSfxForExport(
   abortSignal?: AbortSignal
 ): Promise<Map<string, PreparedSfxSource>> {
   const prepared = new Map<string, PreparedSfxSource>();
-  if (clips.length === 0) return prepared;
+  const audibleClips = clips.filter((clip) => !clip.muted);
+  if (audibleClips.length === 0) return prepared;
   const context = offlineAudioContext();
   const signal = abortSignal ?? new AbortController().signal;
-  for (const clip of clips) {
+  for (const clip of audibleClips) {
     signal.throwIfAborted();
     assertAuthoritativeSource(clip, assets);
     const resolved = resolveSfxSource(clip.source, assets);
@@ -192,6 +193,8 @@ export function mixPreparedSfxIntoBuffer(
   abortSignal?: AbortSignal
 ): AudioBuffer {
   abortSignal?.throwIfAborted();
+  const audibleClips = clips.filter((clip) => !clip.muted);
+  if (audibleClips.length === 0 && base) return base;
   const context = offlineAudioContext();
   const sampleRate = base?.sampleRate ?? 48_000;
   const channelCount = base?.numberOfChannels ?? 2;
@@ -199,7 +202,7 @@ export function mixPreparedSfxIntoBuffer(
   const output = context.createBuffer(channelCount, frameCount, sampleRate);
   const channels = Array.from({ length: channelCount }, (_, channel) => output.getChannelData(channel));
   if (base) channels.forEach((channel, index) => channel.set(base.getChannelData(index)));
-  const sources = clips.map((clip) => {
+  const sources = audibleClips.map((clip) => {
     const resolved = resolveSfxSource(clip.source, assets);
     const source = prepared.get(resolved.identity);
     if (!source) throw new Error(`Sound effect “${clip.name}” was not prepared for export.`);

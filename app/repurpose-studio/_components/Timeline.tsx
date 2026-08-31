@@ -25,7 +25,7 @@ import {
 import { resolveEffectivePrimaryOverlay } from "@/lib/repurpose/overlay-geometry";
 import { effectiveSplitRatio } from "@/lib/repurpose/split-ratio";
 import type { Clip, Overlay, SfxAsset, SfxClip } from "@/lib/repurpose/types";
-import { sfxClipTimelineEnd } from "@/lib/repurpose/sfx-clips";
+import { sfxClipTimelineEnd, sfxSourceDuration } from "@/lib/repurpose/sfx-clips";
 import { resolveSfxSource } from "@/lib/repurpose/sfx-source";
 import { isApprovedSfxKey, SFX_CATALOG } from "@/lib/repurpose/sfx-effects";
 import { SFX_DRAG_MIME, type SfxDragPayload } from "@/lib/repurpose/sfx-drag";
@@ -37,6 +37,7 @@ import {
 import { ClipBlock } from "./ClipBlock";
 import { OverlayBlock, useOverlayThumbnails } from "./OverlayBlock";
 import { SfxClipBlock } from "./SfxClipBlock";
+import { useSfxWaveform } from "./useSfxWaveform";
 import { TransportBar } from "./TransportBar";
 import {
   useFaceWaveform,
@@ -176,6 +177,7 @@ export function Timeline({
   const sfxClips = useRepurposeStore((s) => s.sfxClips);
   const sfxAssets = useRepurposeStore((s) => s.sfxAssets);
   const selectedSfxClipId = useRepurposeStore((s) => s.selectedSfxClipId);
+  const projectEpoch = useRepurposeStore((s) => s.projectEpoch);
   const selectSfxClip = useRepurposeStore((s) => s.selectSfxClip);
   const removeSfxClip = useRepurposeStore((s) => s.removeSfxClip);
   const duplicateSfxClip = useRepurposeStore((s) => s.duplicateSfxClip);
@@ -489,7 +491,7 @@ export function Timeline({
             try {
               await importSfxFile(file, atTime, sfxImportOwner);
             } catch (error) {
-              if (error instanceof DOMException && error.name === "AbortError") continue;
+              if (error instanceof DOMException && error.name === "AbortError") return;
               const message = error instanceof Error ? error.message : "Sound-effect import failed.";
               setSfxDropError(`${file.name}: ${message}`);
               break;
@@ -518,6 +520,24 @@ export function Timeline({
     selectSfxClip(nearest?.id ?? null);
     focusSfxTimelineTarget(nearest?.id ?? null);
   }, [removeSfxClip, selectSfxClip]);
+
+  const handleSfxKeyboardMove = useCallback((id: string, delta: number) => {
+    const state = useRepurposeStore.getState();
+    const clip = state.sfxClips.find((candidate) => candidate.id === id);
+    if (clip) state.moveSfxClip(id, clip.timelineStart + delta);
+  }, []);
+
+  const handleSfxKeyboardTrim = useCallback((
+    id: string,
+    edge: "start" | "end",
+    delta: number
+  ) => {
+    const state = useRepurposeStore.getState();
+    const clip = state.sfxClips.find((candidate) => candidate.id === id);
+    if (!clip) return;
+    if (edge === "start") state.trimSfxClipLeft(id, clip.timelineStart + delta);
+    else state.trimSfxClipRight(id, sfxClipTimelineEnd(clip) + delta);
+  }, []);
 
   // ---- zoom -----------------------------------------------------------------
   // Zoom ANCHORED ON THE PLAYHEAD: the frame under the play mark must stay put on
@@ -1716,8 +1736,14 @@ export function Timeline({
                      width={timeToPx(sfxClipTimelineEnd(clip) - clip.timelineStart, pixelsPerSecond)}
                      top={(sfxLanes[index] ?? 0) * (SFX_LANE_HEIGHT + SFX_LANE_GAP)}
                      height={SFX_LANE_HEIGHT}
-                     selected={selectedSfxClipId === clip.id}
-                     onSelect={selectSfxClip}
+                      selected={selectedSfxClipId === clip.id}
+                      projectDuration={duration}
+                      projectEpoch={projectEpoch}
+                      sourceDuration={sfxSourceDuration(clip.source)}
+                      timelineStep={1 / Math.max(1, Math.round(footageMeta?.fps || 30))}
+                      onSelect={selectSfxClip}
+                      onMoveBy={handleSfxKeyboardMove}
+                      onTrimBy={handleSfxKeyboardTrim}
                      onBodyPointerDown={handleSfxBodyDragStart}
                      onEdgePointerDown={handleSfxEdgeDragStart}
                      onDelete={deleteSfxClipAndRestoreFocus}
@@ -1847,13 +1873,19 @@ function TimelineSfxBlock({
   top: number;
   height: number;
   selected: boolean;
+  projectDuration: number;
+  projectEpoch: number;
+  sourceDuration: number;
+  timelineStep: number;
   onSelect: (id: string) => void;
+  onMoveBy: (id: string, delta: number) => void;
+  onTrimBy: (id: string, edge: "start" | "end", delta: number) => void;
   onBodyPointerDown: (clip: SfxClip, clientX: number) => void;
   onEdgePointerDown: (clip: SfxClip, edge: "start" | "end", clientX: number) => void;
   onDelete: (id: string) => void;
 }) {
   const source = resolveSfxSource(clip.source, assets);
-  const waveform = useAudioWaveform(source.url);
+  const waveform = useSfxWaveform(source.url, props.selected, props.projectEpoch);
   return <SfxClipBlock clip={clip} missing={source.missing} waveform={waveform} {...props} />;
 }
 

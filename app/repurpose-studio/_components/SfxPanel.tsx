@@ -5,7 +5,7 @@ import { ArrowClockwise, MusicNotes, Pause, Play, Trash, Upload, Warning } from 
 
 import { useRepurposeStore, type SfxGestureKind } from "@/lib/repurpose/store";
 import { APPROVED_SFX_KEYS, SFX_CATALOG, type ApprovedSfxKey } from "@/lib/repurpose/sfx-effects";
-import { sfxClipsFromEvents, sfxSourceDuration } from "@/lib/repurpose/sfx-clips";
+import { maximumSfxSourceEnd, sfxClipsFromEvents } from "@/lib/repurpose/sfx-clips";
 import { planSfxEvents } from "@/lib/repurpose/sfx-placement";
 import { resolveSfxSource } from "@/lib/repurpose/sfx-source";
 import { loadResolvedSfxAudio } from "@/lib/repurpose/sfx-audio";
@@ -52,7 +52,15 @@ function Slider({
     if (tokenRef.current) useRepurposeStore.getState().cancelSfxGesture(tokenRef.current);
     tokenRef.current = null;
   };
-  useEffect(() => cancel, []);
+  useEffect(() => {
+    const unsubscribe = useRepurposeStore.getState().subscribeSfxGestureCancellation(() => {
+      tokenRef.current = null;
+    });
+    return () => {
+      unsubscribe();
+      cancel();
+    };
+  }, []);
   return (
     <label className="block text-[10px] text-muted-foreground">
       <span className="flex justify-between"><span>{label}</span><span className="tabular-nums">{Math.round(value * 100) / 100}</span></span>
@@ -105,7 +113,7 @@ export function SfxPanel({ projectId, sfxImportOwner }: { projectId: string; sfx
     if (audio) retireAudition(audio, true);
   }, [retireAudition]);
 
-  useEffect(() => stopAudition, [stopAudition]);
+  useEffect(() => () => stopAudition(), [projectId, stopAudition]);
   useEffect(() => () => {
     const operation = generationRef.current;
     if (!operation) return;
@@ -257,7 +265,7 @@ export function SfxPanel({ projectId, sfxImportOwner }: { projectId: string; sfx
     return (
       <div key={key} draggable onDragStart={(event) => dragPayload(event, { builtInKey: key })} className="flex items-center gap-1 rounded border border-border px-1.5 py-1">
         <span className="min-w-0 flex-1 truncate text-[11px]">{entry.displayName}</span>
-        <button type="button" aria-label={`${auditionIdentity === resolved.identity ? "Stop" : "Audition"} ${entry.displayName}`} onClick={() => audition(resolved.identity, resolved.url, false)}>{auditionIdentity === resolved.identity ? <Pause size={12} /> : <Play size={12} />}</button>
+        <button type="button" aria-label={`${auditionIdentity === resolved.identity ? "Stop" : "Audition"} ${entry.displayName}`} title={`${auditionIdentity === resolved.identity ? "Stop" : "Audition"} ${entry.displayName}`} onClick={() => audition(resolved.identity, resolved.url, false)}>{auditionIdentity === resolved.identity ? <Pause size={12} /> : <Play size={12} />}</button>
         <button type="button" aria-label={`Add ${entry.displayName} at playhead`} onClick={() => add(entry.displayName, { kind: "built-in", key })} className="text-[10px]">Add</button>
         {selected && <button type="button" aria-label={`Replace ${selected.name} with ${entry.displayName}`} onClick={() => replace(selected.id, entry.displayName, { kind: "built-in", key })} className="text-[10px]">Replace</button>}
       </div>
@@ -285,13 +293,15 @@ export function SfxPanel({ projectId, sfxImportOwner }: { projectId: string; sfx
         {imported.length > 0 && <div><h4 className="mb-1 text-[10px] font-semibold uppercase text-muted-foreground">Project imports</h4><div className="space-y-1">{imported.map((asset) => {
           const unavailable = !asset.sourcePath || asset.srcDuration <= 0;
           const resolved = resolveSfxSource(sourceForAsset(asset), assets);
-          return <div key={asset.id} draggable={!unavailable} onDragStart={(event) => dragPayload(event, { assetId: asset.id })} className="flex items-center gap-1 rounded border border-border px-1.5 py-1"><span className="min-w-0 flex-1 truncate text-[11px]">{asset.name}</span>{unavailable && <span className="text-[9px] text-amber-300">Unavailable</span>}<button type="button" disabled={unavailable} aria-label={`Audition ${asset.name}`} onClick={() => audition(resolved.identity, resolved.url, unavailable)}><Play size={12} /></button><button type="button" disabled={unavailable} aria-label={`Add ${asset.name} at playhead`} onClick={() => add(asset.name, sourceForAsset(asset))} className="text-[10px]">Add</button>{selected && <button type="button" disabled={unavailable} aria-label={`Replace ${selected.name} with ${asset.name}`} onClick={() => replace(selected.id, asset.name, sourceForAsset(asset))} className="text-[10px]">Replace</button>}</div>;
+          const active = auditionIdentity === resolved.identity;
+          const auditionLabel = `${active ? "Stop" : "Audition"} ${asset.name}`;
+          return <div key={asset.id} draggable={!unavailable} onDragStart={(event) => dragPayload(event, { assetId: asset.id })} className="flex items-center gap-1 rounded border border-border px-1.5 py-1"><span className="min-w-0 flex-1 truncate text-[11px]">{asset.name}</span>{unavailable && <span className="text-[9px] text-amber-300">Unavailable</span>}<button type="button" disabled={unavailable} aria-label={auditionLabel} title={auditionLabel} onClick={() => audition(resolved.identity, resolved.url, unavailable)}>{active ? <Pause size={12} /> : <Play size={12} />}</button><button type="button" disabled={unavailable} aria-label={`Add ${asset.name} at playhead`} onClick={() => add(asset.name, sourceForAsset(asset))} className="text-[10px]">Add</button>{selected && <button type="button" disabled={unavailable} aria-label={`Replace ${selected.name} with ${asset.name}`} onClick={() => replace(selected.id, asset.name, sourceForAsset(asset))} className="text-[10px]">Replace</button>}</div>;
         })}</div></div>}
       </div>
       {selected && <div className="space-y-2 rounded border border-emerald-500/30 bg-emerald-500/5 p-2"><div className="flex items-center justify-between"><strong className="truncate text-[11px]">{selected.name}</strong>{selectedImportedAssetId !== null && !assets.some((asset) => asset.id === selectedImportedAssetId && asset.sourcePath) && <span className="text-[9px] text-amber-300">Unavailable</span>}</div>
         <Slider clipId={selected.id} kind="gain" label="Gain" value={selected.gain} min={0} max={2} step={0.01} />
         <Slider clipId={selected.id} kind="source-in" label="Source in" value={selected.sourceStart} min={0} max={Math.max(0, selected.sourceEnd - .001)} step={.01} />
-        <Slider clipId={selected.id} kind="source-out" label="Source out" value={selected.sourceEnd} min={selected.sourceStart + .001} max={sfxSourceDuration(selected.source)} step={.01} />
+        <Slider clipId={selected.id} kind="source-out" label="Source out" value={selected.sourceEnd} min={Math.min(selected.sourceStart + .001, maximumSfxSourceEnd(selected, duration))} max={maximumSfxSourceEnd(selected, duration)} step={.01} />
         <Slider clipId={selected.id} kind="fade-in" label="Fade in" value={selected.fadeInSec} min={0} max={2} step={.01} />
         <Slider clipId={selected.id} kind="fade-out" label="Fade out" value={selected.fadeOutSec} min={0} max={2} step={.01} />
         <div className="flex flex-wrap gap-1"><button type="button" aria-label={`${selected.muted ? "Unmute" : "Mute"} ${selected.name}`} onClick={() => useRepurposeStore.getState().setSfxClipMuted(selected.id, !selected.muted)} className="rounded border border-border px-1.5 py-1 text-[10px]">{selected.muted ? "Unmute" : "Mute"}</button><button type="button" aria-label={`Duplicate ${selected.name}`} onClick={() => duplicate(selected.id)} className="rounded border border-border px-1.5 py-1 text-[10px]">Duplicate</button><button type="button" aria-label={`Delete ${selected.name}`} onClick={() => remove(selected.id)} className="rounded border border-red-500/30 px-1.5 py-1 text-[10px] text-red-300"><Trash size={11} /></button></div>

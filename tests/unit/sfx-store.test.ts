@@ -216,6 +216,24 @@ describe("SFX inventory and IDs", () => {
 });
 
 describe("discrete SFX edits", () => {
+  it("clamps source-out to the remaining reel duration near the tail", () => {
+    useRepurposeStore.setState({
+      duration: 10,
+      sfxClips: [sfx({ timelineStart: 9, sourceStart: 1, sourceEnd: 1.25 })],
+      past: [],
+      future: [],
+    });
+
+    useRepurposeStore.getState().setSfxClipSourceEnd("sfx-test", 4);
+
+    expect(useRepurposeStore.getState().sfxClips[0]).toMatchObject({
+      timelineStart: 9,
+      sourceStart: 1,
+      sourceEnd: 2,
+    });
+    expect(useRepurposeStore.getState().past).toHaveLength(1);
+  });
+
   it("adds, moves, trims, mixes, replaces, duplicates, and removes clips", () => {
     const id = useRepurposeStore.getState().addSfxClip({
       name: "Hit",
@@ -489,6 +507,22 @@ describe("SFX gesture ownership", () => {
     useRepurposeStore.getState().updateSfxGesture(token, value);
     useRepurposeStore.getState().endSfxGesture(token);
     expect(useRepurposeStore.getState().sfxClips[0]).toMatchObject(expected);
+    expect(useRepurposeStore.getState().past).toHaveLength(1);
+  });
+
+  it("clamps a source-out gesture to the remaining reel duration near the tail", () => {
+    useRepurposeStore.setState({
+      duration: 10,
+      sfxClips: [sfx({ timelineStart: 9, sourceStart: 1, sourceEnd: 1.25 })],
+      past: [],
+      future: [],
+    });
+    const token = useRepurposeStore.getState().beginSfxGesture("sfx-test", "source-out") as string;
+
+    useRepurposeStore.getState().updateSfxGesture(token, 4);
+    useRepurposeStore.getState().endSfxGesture(token);
+
+    expect(useRepurposeStore.getState().sfxClips[0].sourceEnd).toBe(2);
     expect(useRepurposeStore.getState().past).toHaveLength(1);
   });
 

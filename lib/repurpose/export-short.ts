@@ -556,6 +556,7 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
 
   if (duration <= 0) return null;
   abortSignal?.throwIfAborted();
+  const audibleSfxClips = sfxClips.filter((clip) => !clip.muted);
 
   const exportSources = resolveExportSources(footageMeta);
 
@@ -578,9 +579,9 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
     );
   }
 
-  // Resolve and decode every selected SFX source before any encoder/output is
-  // acquired. A missing or corrupt clip therefore fails atomically by name.
-  const preparedSfx = await prepareSfxForExport(sfxClips, sfxAssets, abortSignal);
+  // Resolve and decode every audible SFX source before any encoder/output is
+  // acquired. A missing or corrupt unmuted clip therefore fails atomically by name.
+  const preparedSfx = await prepareSfxForExport(audibleSfxClips, sfxAssets, abortSignal);
 
   const acquiredDecodes = new Set<TrackFrameSource>();
   const acquiredVideos = new Set<HTMLVideoElement>();
@@ -1126,10 +1127,10 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
         abortSignal
       );
     }
-    if (sfxClips.length > 0) {
+    if (audibleSfxClips.length > 0) {
       audioBuffer = mixPreparedSfxIntoBuffer(
         audioBuffer,
-        sfxClips,
+        audibleSfxClips,
         sfxAssets,
         preparedSfx,
         duration,

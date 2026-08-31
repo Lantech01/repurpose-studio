@@ -413,6 +413,40 @@ afterEach(() => {
 });
 
 describe("SFX project persistence", () => {
+  test("saves and reopens a near-tail source-out edit without silently shortening it", async () => {
+    const nearTail = sfxClip({
+      id: "sfx-near-tail",
+      source: { kind: "imported", assetId: "near-tail-asset", srcDuration: 4 },
+      timelineStart: 4.5,
+      sourceStart: 1,
+      sourceEnd: 1.25,
+    });
+    const asset: SfxAsset = {
+      id: "near-tail-asset",
+      name: "Near tail.wav",
+      sourcePath: "C:\\audio\\near-tail.wav",
+      srcDuration: 4,
+    };
+    const persistence = installSfxRoundTrip(snapshot({
+      footageMeta: null,
+      sfxAssets: [asset],
+      sfxClips: [nearTail],
+    }));
+    const firstMount = await loadProject();
+
+    act(() => useRepurposeStore.getState().setSfxClipSourceEnd(nearTail.id, 4));
+    expect(useRepurposeStore.getState().sfxClips[0].sourceEnd).toBe(1.5);
+    await waitFor(() => expect(persistence.saved()?.sfxClips?.[0].sourceEnd).toBe(1.5));
+    const savedClip = persistence.saved()!.sfxClips![0];
+    firstMount.unmount();
+    useRepurposeStore.setState(useRepurposeStore.getInitialState(), true);
+
+    const reopened = await loadProject();
+    expect(useRepurposeStore.getState().sfxClips[0]).toEqual(savedClip);
+    expect(useRepurposeStore.getState().sfxClips[0].sourceEnd).toBe(1.5);
+    reopened.unmount();
+  });
+
   test("writes normalized clips and assets without legacy or transient fields, then reopens every source kind", async () => {
     const persistence = installSfxRoundTrip(snapshot({ footageMeta: null }));
     const firstMount = await loadProject();

@@ -95,6 +95,26 @@ export function sfxClipTimelineEnd(clip: SfxClip): number {
   return clip.timelineStart + sfxClipDuration(clip);
 }
 
+export function maximumSfxSourceEnd(clip: SfxClip, projectDuration: number): number {
+  return Math.min(
+    sfxSourceDuration(clip.source),
+    clip.sourceStart + Math.max(0, projectDuration - clip.timelineStart)
+  );
+}
+
+export function clampSfxSourceEnd(
+  clip: SfxClip,
+  requestedSourceEnd: number,
+  projectDuration: number
+): number {
+  const maximum = maximumSfxSourceEnd(clip, projectDuration);
+  const positiveStep = Math.min(1 / 1000, Math.max(0, maximum - clip.sourceStart));
+  return cleanTime(Math.max(
+    clip.sourceStart + positiveStep,
+    Math.min(requestedSourceEnd, maximum)
+  ));
+}
+
 export function normalizeSfxClip(value: unknown, projectDuration: number): SfxClip | null {
   if (!isRecord(value) || !isFiniteNumber(projectDuration) || projectDuration <= 0) return null;
   if (

@@ -19,6 +19,14 @@ const clip: SfxClip = {
   muted: true,
 };
 
+const editProps = {
+  projectDuration: 3,
+  sourceDuration: 2,
+  timelineStep: 0.1,
+  onMoveBy: vi.fn(),
+  onTrimBy: vi.fn(),
+};
+
 afterEach(cleanup);
 
 describe("SfxClipBlock", () => {
@@ -26,7 +34,7 @@ describe("SfxClipBlock", () => {
     const onSelect = vi.fn();
     render(<SfxClipBlock clip={clip} left={10} width={90} top={3} height={28}
       selected missing waveform={null} onSelect={onSelect} onBodyPointerDown={vi.fn()}
-      onEdgePointerDown={vi.fn()} onDelete={vi.fn()} />);
+      onEdgePointerDown={vi.fn()} onDelete={vi.fn()} {...editProps} />);
 
     const block = screen.getByRole("group", { name: /Whoosh.*automatic.*0:01.0.*0:02.0.*muted.*missing/i });
     expect(block).toHaveAttribute("data-sfx-clip-id", "sfx-1");
@@ -43,7 +51,7 @@ describe("SfxClipBlock", () => {
     const onDelete = vi.fn();
     render(<SfxClipBlock clip={clip} left={0} width={100} top={0} height={30}
       selected={false} missing={false} waveform={null} onSelect={onSelect}
-      onBodyPointerDown={vi.fn()} onEdgePointerDown={vi.fn()} onDelete={onDelete} />);
+      onBodyPointerDown={vi.fn()} onEdgePointerDown={vi.fn()} onDelete={onDelete} {...editProps} />);
 
     await user.tab();
     expect(screen.getByRole("button", { name: /Select Whoosh/ })).toHaveFocus();
@@ -62,7 +70,7 @@ describe("SfxClipBlock", () => {
     const onSelect = vi.fn();
     render(<SfxClipBlock clip={clip} left={0} width={100} top={0} height={30}
       selected={false} missing={false} waveform={null} onSelect={onSelect}
-      onBodyPointerDown={vi.fn()} onEdgePointerDown={vi.fn()} onDelete={vi.fn()} />);
+      onBodyPointerDown={vi.fn()} onEdgePointerDown={vi.fn()} onDelete={vi.fn()} {...editProps} />);
 
     screen.getByRole("button", { name: /Select Whoosh/ }).focus();
 
@@ -78,7 +86,7 @@ describe("SfxClipBlock", () => {
     render(<SfxClipBlock clip={clip} left={0} width={100} top={0} height={30}
       selected={false} missing={false} waveform={null} onSelect={onSelect}
       onBodyPointerDown={onBodyPointerDown} onEdgePointerDown={onEdgePointerDown}
-      onDelete={onDelete} />);
+      onDelete={onDelete} {...editProps} />);
 
     fireEvent.click(screen.getByRole("button", { name: /Select Whoosh/ }));
     fireEvent.pointerDown(screen.getByLabelText("Trim Whoosh start"), { clientX: 4 });
@@ -88,5 +96,58 @@ describe("SfxClipBlock", () => {
     expect(onEdgePointerDown).toHaveBeenNthCalledWith(1, clip, "start", 4);
     expect(onEdgePointerDown).toHaveBeenNthCalledWith(2, clip, "end", 90);
     expect(onDelete).toHaveBeenCalledWith("sfx-1");
+  });
+
+  it("moves by deterministic keyboard steps and accelerates with Shift", () => {
+    const onMoveBy = vi.fn();
+    render(<SfxClipBlock clip={clip} left={0} width={100} top={0} height={30}
+      selected={false} missing={false} waveform={null} onSelect={vi.fn()}
+      onBodyPointerDown={vi.fn()} onEdgePointerDown={vi.fn()} onDelete={vi.fn()}
+      {...editProps} onMoveBy={onMoveBy} />);
+    const selection = screen.getByRole("button", { name: /Select Whoosh/ });
+
+    fireEvent.keyDown(selection, { key: "ArrowRight" });
+    fireEvent.keyDown(selection, { key: "ArrowLeft", shiftKey: true });
+
+    expect(onMoveBy).toHaveBeenNthCalledWith(1, "sfx-1", 0.1);
+    expect(onMoveBy).toHaveBeenNthCalledWith(2, "sfx-1", -1);
+  });
+
+  it("exposes keyboard-adjustable trim sliders with meaningful ranges", () => {
+    const onSelect = vi.fn();
+    const onTrimBy = vi.fn();
+    render(<SfxClipBlock clip={clip} left={0} width={100} top={0} height={30}
+      selected={false} missing={false} waveform={null} onSelect={onSelect}
+      onBodyPointerDown={vi.fn()} onEdgePointerDown={vi.fn()} onDelete={vi.fn()}
+      {...editProps} onTrimBy={onTrimBy} />);
+    const start = screen.getByRole("slider", { name: "Trim Whoosh start" });
+    const end = screen.getByRole("slider", { name: "Trim Whoosh end" });
+
+    expect(start).toHaveAttribute("aria-valuemin", "0.75");
+    expect(start).toHaveAttribute("aria-valuemax", "1.999");
+    expect(start).toHaveAttribute("aria-valuenow", "1");
+    expect(end).toHaveAttribute("aria-valuemin", "1.001");
+    expect(end).toHaveAttribute("aria-valuemax", "2.75");
+    expect(end).toHaveAttribute("aria-valuenow", "2");
+    fireEvent.keyDown(start, { key: "ArrowRight" });
+    fireEvent.keyDown(end, { key: "ArrowLeft" });
+    fireEvent.keyDown(start, { key: "Enter" });
+
+    expect(onTrimBy).toHaveBeenNthCalledWith(1, "sfx-1", "start", 0.1);
+    expect(onTrimBy).toHaveBeenNthCalledWith(2, "sfx-1", "end", -0.1);
+    expect(onSelect).toHaveBeenCalledWith("sfx-1");
+  });
+
+  it("ignores non-primary pointer presses on both trim handles", () => {
+    const onEdgePointerDown = vi.fn();
+    render(<SfxClipBlock clip={clip} left={0} width={100} top={0} height={30}
+      selected={false} missing={false} waveform={null} onSelect={vi.fn()}
+      onBodyPointerDown={vi.fn()} onEdgePointerDown={onEdgePointerDown} onDelete={vi.fn()}
+      {...editProps} />);
+
+    fireEvent.pointerDown(screen.getByLabelText("Trim Whoosh start"), { button: 1, clientX: 4 });
+    fireEvent.pointerDown(screen.getByLabelText("Trim Whoosh end"), { button: 2, clientX: 90 });
+
+    expect(onEdgePointerDown).not.toHaveBeenCalled();
   });
 });

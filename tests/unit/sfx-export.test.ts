@@ -67,6 +67,59 @@ afterEach(() => {
 });
 
 describe("SFX export preflight", () => {
+  it("short-circuits an all-muted mix without an audio context or prepared lookup", async () => {
+    const muted = clip({
+      muted: true,
+      source: { kind: "imported", assetId: "missing", srcDuration: 1 },
+    });
+    const base = audioBuffer(1, 4, 0);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const prepared = await prepareSfxForExport([muted], [asset]);
+
+    expect(mixPreparedSfxIntoBuffer(base, [muted], [asset], prepared, 1)).toBe(base);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: "missing",
+      muted: clip({
+        muted: true,
+        name: "Muted missing",
+        source: { kind: "imported", assetId: "missing", srcDuration: 1 },
+      }),
+      assets: [asset],
+      unmutedCode: "missing-source",
+    },
+    {
+      label: "corrupt",
+      muted: clip({ muted: true, name: "Muted corrupt" }),
+      assets: [asset],
+      unmutedCode: "decode-failed",
+    },
+  ])("does not resolve or prepare a muted $label clip", async ({ muted, assets, unmutedCode }) => {
+    const { decodeAudioData } = installAudioContext();
+    decodeAudioData.mockRejectedValue(new Error("bad codec"));
+    const fetchMock = vi.fn().mockResolvedValue(new Response(new ArrayBuffer(4), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const prepared = await prepareSfxForExport([muted], assets);
+    const mixed = mixPreparedSfxIntoBuffer(audioBuffer(1, 4, 0), [muted], assets, prepared, 1);
+
+    expect(prepared).toHaveProperty("size", 0);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(decodeAudioData).not.toHaveBeenCalled();
+    expect(Array.from(mixed.getChannelData(0))).toEqual([0, 0, 0, 0]);
+
+    await expect(prepareSfxForExport([{ ...muted, muted: false }], assets)).rejects.toMatchObject({
+      name: "SfxExportPreflightError",
+      code: unmutedCode,
+      clipId: muted.id,
+    });
+  });
+
   it("decodes each authoritative identity once and mixes every referencing clip", async () => {
     const { decodeAudioData } = installAudioContext();
     const fetchMock = vi.fn().mockResolvedValue(new Response(new ArrayBuffer(4), { status: 200 }));

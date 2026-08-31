@@ -19,6 +19,10 @@ vi.mock("@/app/repurpose-studio/_components/useFaceWaveform", () => ({
   useAudioWaveform: () => null,
   sliceClipPeaks: () => [],
 }));
+const useSfxWaveformMock = vi.hoisted(() => vi.fn().mockReturnValue(null));
+vi.mock("@/app/repurpose-studio/_components/useSfxWaveform", () => ({
+  useSfxWaveform: useSfxWaveformMock,
+}));
 
 const scenes: Clip[] = [
   {
@@ -42,6 +46,7 @@ function effect(overrides: Partial<SfxClip> = {}): SfxClip {
 }
 
 beforeEach(() => {
+  useSfxWaveformMock.mockClear();
   useRepurposeStore.setState(useRepurposeStore.getInitialState(), true);
   useRepurposeStore.setState({ clips: scenes, duration: 10, sfxClips: [effect()], past: [], future: [] });
 });
@@ -54,7 +59,7 @@ describe("Timeline real SFX interactions", () => {
     { edge: "end", moveTo: 225, expected: { timelineStart: 1, sourceStart: 0, sourceEnd: 1.5 } },
   ] as const)("commits one Undo entry for the $edge trim", ({ edge, moveTo, expected }) => {
     render(<Timeline />);
-    const handle = screen.getByRole("button", { name: `Trim Impact ${edge}` });
+    const handle = screen.getByRole("slider", { name: `Trim Impact ${edge}` });
     fireEvent.pointerDown(handle, { button: 0, clientX: edge === "start" ? 90 : 270 });
     fireEvent.pointerMove(window, { clientX: moveTo });
     fireEvent.pointerUp(window);
@@ -213,6 +218,106 @@ describe("Timeline real SFX interactions", () => {
       await waitFor(() => expect(document.activeElement).toHaveAttribute("data-sfx-select-id", "effect"));
     } finally {
       releaseSfxImportOwner(owner);
+    }
+  });
+
+  it("moves and trims from the keyboard with one Undo step per keypress", () => {
+    render(<Timeline />);
+    const selection = screen.getByRole("button", { name: /Select Impact/ });
+
+    fireEvent.keyDown(selection, { key: "ArrowRight" });
+    expect(useRepurposeStore.getState().sfxClips[0].timelineStart).toBeCloseTo(1 + 1 / 30);
+    expect(useRepurposeStore.getState().past).toHaveLength(1);
+    useRepurposeStore.getState().undo();
+    expect(useRepurposeStore.getState().sfxClips[0]).toMatchObject(effect());
+
+    const start = screen.getByRole("slider", { name: "Trim Impact start" });
+    fireEvent.keyDown(start, { key: "ArrowRight" });
+    const leftTrimmed = useRepurposeStore.getState().sfxClips[0];
+    expect(leftTrimmed.timelineStart).toBeCloseTo(1 + 1 / 30);
+    expect(leftTrimmed.sourceStart).toBeCloseTo(1 / 30);
+    expect(leftTrimmed.timelineStart + leftTrimmed.sourceEnd - leftTrimmed.sourceStart).toBeCloseTo(3);
+    expect(useRepurposeStore.getState().past).toHaveLength(1);
+    useRepurposeStore.getState().undo();
+
+    const end = screen.getByRole("slider", { name: "Trim Impact end" });
+    fireEvent.keyDown(end, { key: "ArrowLeft" });
+    expect(useRepurposeStore.getState().sfxClips[0]).toMatchObject({ timelineStart: 1 });
+    expect(useRepurposeStore.getState().sfxClips[0].sourceEnd).toBeCloseTo(2 - 1 / 30);
+    expect(useRepurposeStore.getState().past).toHaveLength(1);
+    useRepurposeStore.getState().undo();
+    expect(useRepurposeStore.getState().sfxClips[0]).toMatchObject(effect());
+  });
+
+  it("requests an SFX waveform only for the selected placed source", () => {
+    useRepurposeStore.setState({
+      sfxClips: [
+        effect({ id: "unselected", name: "Unselected", source: { kind: "built-in", key: "ding" } }),
+        effect({ id: "selected", name: "Selected", source: { kind: "built-in", key: "whoosh" } }),
+      ],
+      selectedSfxClipId: "selected",
+    });
+
+    render(<Timeline />);
+
+    const enabledCalls = useSfxWaveformMock.mock.calls.filter((call) => call[1] === true);
+    expect(enabledCalls).toHaveLength(1);
+    expect(enabledCalls[0][0]).toContain("whoosh");
+  });
+
+  it("stops an older multi-file drop after a newer batch aborts its active file", async () => {
+    const owner = registerSfxImportOwner(createSfxImportOwner("batch-project"));
+    const uploads: string[] = [];
+    let oldStarted!: () => void;
+    const oldStartedPromise = new Promise<void>((resolve) => { oldStarted = resolve; });
+    class AudioContextMock {
+      decodeAudioData = vi.fn().mockResolvedValue({ duration: 1 });
+      close = vi.fn().mockResolvedValue(undefined);
+    }
+    vi.stubGlobal("AudioContext", AudioContextMock);
+    vi.stubGlobal("fetch", vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "/api/repurpose/asset") {
+        const file = (init?.body as FormData).get("file") as File;
+        uploads.push(file.name);
+        if (file.name === "old-first.wav") {
+          oldStarted();
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+          });
+        }
+        return Promise.resolve(new Response(JSON.stringify({
+          ok: true,
+          path: `C:\\audio\\${file.name}`,
+        }), { status: 200, headers: { "Content-Type": "application/json" } }));
+      }
+      return Promise.resolve(new Response(new ArrayBuffer(4), { status: 200 }));
+    }));
+    try {
+      useRepurposeStore.setState({ sfxClips: [], past: [], future: [] });
+      render(<Timeline sfxImportOwner={owner} />);
+      const target = screen.getByTestId("sfx-row").parentElement as HTMLElement;
+      const drop = (files: File[]) => {
+        const event = createEvent.drop(target, {
+          dataTransfer: { types: ["Files"], files, getData: () => "", dropEffect: "none" },
+        });
+        Object.defineProperty(event, "clientX", { value: 90 });
+        fireEvent(target, event);
+      };
+
+      drop([
+        new File(["x"], "old-first.wav", { type: "audio/wav" }),
+        new File(["x"], "old-second.wav", { type: "audio/wav" }),
+      ]);
+      await oldStartedPromise;
+      drop([new File(["x"], "new.wav", { type: "audio/wav" })]);
+
+      await waitFor(() => expect(useRepurposeStore.getState().sfxClips).toEqual([
+        expect.objectContaining({ name: "new.wav" }),
+      ]));
+      expect(uploads).toEqual(["old-first.wav", "new.wav"]);
+    } finally {
+      releaseSfxImportOwner(owner);
+      vi.unstubAllGlobals();
     }
   });
 });

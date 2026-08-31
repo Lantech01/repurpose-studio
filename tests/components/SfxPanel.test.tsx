@@ -74,6 +74,30 @@ describe("SfxPanel workspace", () => {
     expect(pause).toHaveBeenCalledTimes(2);
   });
 
+  it("retires audition audio and active UI when projectId changes without unmounting", () => {
+    const instances: AudioMock[] = [];
+    class AudioMock {
+      pause = vi.fn();
+      play = vi.fn().mockResolvedValue(undefined);
+      currentTime = 0;
+      onended: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor() { instances.push(this); }
+    }
+    vi.stubGlobal("Audio", AudioMock);
+    const rendered = render(<SfxPanel projectId="project-a" sfxImportOwner={owner} />);
+    fireEvent.click(screen.getByRole("button", { name: "Audition Mouse Click" }));
+    expect(screen.getByRole("button", { name: "Stop Mouse Click" })).toBeInTheDocument();
+
+    rendered.rerender(<SfxPanel projectId="project-b" sfxImportOwner={owner} />);
+
+    expect(instances[0].pause).toHaveBeenCalledOnce();
+    expect(instances[0].currentTime).toBe(0);
+    expect(instances[0].onended).toBeNull();
+    expect(instances[0].onerror).toBeNull();
+    expect(screen.getByRole("button", { name: "Audition Mouse Click" })).toBeInTheDocument();
+  });
+
   it("clears audition ownership and UI when audio ends naturally", () => {
     const instances: AudioMock[] = [];
     class AudioMock {
@@ -231,6 +255,40 @@ describe("SfxPanel workspace", () => {
 
     expect(constructed).toEqual([`/api/repurpose/asset?path=${encodeURIComponent("C:\\audio\\hit.wav")}`]);
     expect(play).toHaveBeenCalledOnce();
+    const stop = screen.getByRole("button", { name: "Stop Imported hit" });
+    expect(stop).toHaveAttribute("title", "Stop Imported hit");
+    expect(stop.querySelector("svg")).not.toBeNull();
+  });
+
+  it("caps the near-tail source-out slider at the remaining reel duration", () => {
+    useRepurposeStore.setState({
+      sfxClips: [{ ...manual, timelineStart: 4.5, sourceStart: 1, sourceEnd: 1.25 }],
+      selectedSfxClipId: manual.id,
+      past: [],
+      future: [],
+    });
+    render(<SfxPanel projectId="project-a" sfxImportOwner={owner} />);
+
+    const sourceOut = screen.getByRole("slider", { name: "Source out for Manual ding" });
+    expect(sourceOut).toHaveAttribute("max", "1.5");
+    fireEvent.change(sourceOut, { target: { value: "2.5" } });
+
+    expect(useRepurposeStore.getState().sfxClips[0].sourceEnd).toBe(1.5);
+  });
+
+  it("starts a fresh slider gesture after external Undo cancels local ownership", () => {
+    useRepurposeStore.setState({ sfxClips: [manual], selectedSfxClipId: manual.id, past: [], future: [] });
+    render(<SfxPanel projectId="project-a" sfxImportOwner={owner} />);
+    const gain = screen.getByRole("slider", { name: "Gain for Manual ding" });
+    fireEvent.pointerDown(gain);
+    fireEvent.change(gain, { target: { value: "1.5" } });
+
+    act(() => useRepurposeStore.getState().undo());
+    expect(useRepurposeStore.getState().sfxClips[0].gain).toBe(1);
+    fireEvent.change(gain, { target: { value: "1.25" } });
+
+    expect(useRepurposeStore.getState().sfxClips[0].gain).toBe(1.25);
+    expect(useRepurposeStore.getState().past).toHaveLength(1);
   });
 
   it("edits selected clip controls with one gesture history entry and supports replace, duplicate, mute, and delete", () => {
