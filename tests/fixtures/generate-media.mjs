@@ -118,6 +118,19 @@ runFfmpeg(
   "music fixture",
 );
 
+runFfmpeg(
+  [
+    "-f", "lavfi", "-i", "sine=frequency=660:sample_rate=48000:duration=0.5",
+    "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=1",
+    "-f", "lavfi", "-i", "sine=frequency=1100:sample_rate=48000:duration=0.5",
+    "-filter_complex",
+    "[0:a]volume=0.1[a0];[1:a]volume=0.1[a1];[2:a]volume=0.1[a2];[a0][a1][a2]concat=n=3:v=0:a=1[out]",
+    "-map", "[out]", "-ac", "2", "-c:a", "pcm_s16le", "-map_metadata", "-1",
+    join(fixtureDir, "editable-sfx.wav"),
+  ],
+  "segmented editable SFX fixture",
+);
+
 writeFileSync(join(fixtureDir, "invalid.mov"), Buffer.from("repurpose-studio-invalid-media\n", "utf8"));
 writeFileSync(
   join(fixtureDir, "raw.srt"),

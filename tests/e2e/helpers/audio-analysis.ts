@@ -42,6 +42,14 @@ export interface AudioDifferenceMeasurements extends TimedSfxWindowMeasurement {
   fullRms: number;
 }
 
+export interface AudioDifferenceWindow {
+  centerSec: number;
+  rms: number;
+  hz660: number;
+  hz880: number;
+  hz1100: number;
+}
+
 function spawnToBuffer(command: string, args: string[]): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -190,6 +198,37 @@ export async function analyzeAudioDifference(
     ...measureTimedSfxWindow(difference, sfxCenterSec),
     fullRms: rms(difference),
   };
+}
+
+export async function analyzeAudioDifferenceWindows(
+  referencePath: string,
+  candidatePath: string,
+  centersSec: readonly number[]
+): Promise<AudioDifferenceWindow[]> {
+  const [reference, candidate] = await Promise.all([
+    decodeMonoFloat48k(referencePath),
+    decodeMonoFloat48k(candidatePath),
+  ]);
+  const length = Math.min(reference.length, candidate.length);
+  const difference = new Float32Array(length);
+  for (let index = 0; index < length; index += 1) {
+    difference[index] = candidate[index] - reference[index];
+  }
+  const halfWindow = Math.round(0.05 * 48_000);
+  return centersSec.map((centerSec) => {
+    const center = Math.round(centerSec * 48_000);
+    const window = difference.subarray(
+      Math.max(0, center - halfWindow),
+      Math.min(difference.length, center + halfWindow)
+    );
+    return {
+      centerSec,
+      rms: rms(window),
+      hz660: goertzelMagnitude(window, 660),
+      hz880: goertzelMagnitude(window, 880),
+      hz1100: goertzelMagnitude(window, 1100),
+    };
+  });
 }
 
 export function frameRate(stream: ProbeStream): number {

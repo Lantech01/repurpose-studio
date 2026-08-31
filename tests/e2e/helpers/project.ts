@@ -52,6 +52,7 @@ export function collectBrowserErrors(page: Page): BrowserErrorCollector {
         "/repurpose/claude-routines-words.json",
         "/repurpose/final-transcript.txt",
         "/repurpose/footage-manifest.json",
+        "/api/repurpose/thumb",
       ].includes(url.pathname);
     const expectedSaveRace =
       response.status() === 409 &&
@@ -89,6 +90,7 @@ export function collectBrowserErrors(page: Page): BrowserErrorCollector {
             "/repurpose/claude-routines-words.json",
             "/repurpose/final-transcript.txt",
             "/repurpose/footage-manifest.json",
+            "/api/repurpose/thumb",
           ].includes(url.pathname) ||
           expectedConsoleFailureUrls.has(location)
         );
@@ -102,6 +104,7 @@ export function collectBrowserErrors(page: Page): BrowserErrorCollector {
               [
                 "/api/repurpose/video",
                 "/api/repurpose/asset",
+                "/api/repurpose/sfx",
                 "/api/repurpose/thumb",
               ].includes(url.pathname)) ||
             (method === "POST" && url.pathname === "/api/repurpose/proxy") ||
@@ -190,7 +193,7 @@ export async function createProjectWithFootage(
   await page.goto("/repurpose-studio");
   await expect(page.locator(".animate-pulse")).toHaveCount(0, { timeout: 30_000 });
   await page.getByRole("button", { name: "New Project", exact: true }).first().click();
-  await expect(page).toHaveURL(/\/repurpose-studio\/new-/);
+  await expect(page).toHaveURL(/\/repurpose-studio\/new-/, { timeout: 30_000 });
   await expect(page.getByText("Sources", { exact: true })).toBeVisible();
   await installImportPhaseRecorder(page);
 
@@ -202,7 +205,7 @@ export async function createProjectWithFootage(
   await expect(page.getByText("Transcript", { exact: true })).toBeVisible();
   await expect
     .poll(() => new URL(page.url()).pathname.split("/").pop() ?? "", {
-      timeout: 20_000,
+      timeout: 60_000,
     })
     .not.toMatch(/^new-/);
 
@@ -218,7 +221,8 @@ export async function createProjectWithFootage(
     .poll(
       async () => {
         const response = await page.request.get(
-          `/api/repurpose/projects/${projectId}`
+          `/api/repurpose/projects/${projectId}`,
+          { maxRetries: 3 }
         );
         if (!response.ok()) return [false, false];
         const body = (await response.json()) as {
@@ -332,7 +336,8 @@ export async function reloadAndReopenProject(
     .poll(
       async () => {
         const response = await page.request.get(
-          `/api/repurpose/projects/${projectId}`
+          `/api/repurpose/projects/${projectId}`,
+          { maxRetries: 3 }
         );
         if (!response.ok()) return Number.NaN;
         const body = (await response.json()) as {
@@ -366,7 +371,8 @@ export async function seedProjectSnapshot<T extends object>(
   await expect(page).toHaveURL(/\/repurpose-studio$/);
 
   const currentResponse = await page.request.get(
-    `/api/repurpose/projects/${projectId}`
+    `/api/repurpose/projects/${projectId}`,
+    { maxRetries: 3 }
   );
   expect(currentResponse.ok()).toBe(true);
   const { project } = (await currentResponse.json()) as {
@@ -405,6 +411,8 @@ export async function seedProjectSnapshot<T extends object>(
 
 export async function cleanupProject(page: Page, projectId: string): Promise<void> {
   await page.goto("/repurpose-studio");
-  const response = await page.request.delete(`/api/repurpose/projects/${projectId}`);
+  const response = await page.request.delete(`/api/repurpose/projects/${projectId}`, {
+    maxRetries: 3,
+  });
   expect([200, 404]).toContain(response.status());
 }

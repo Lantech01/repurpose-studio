@@ -108,16 +108,20 @@ This repo is a starting point. Open your AI coding agent in the project folder a
 
 You describe the feature, the agent writes the code, you approve it. That is the whole workflow.
 
-## Optional: automatic sound effects engine
+## Sound effects
 
-The offline sound-effects engine and its sound library are included under `scripts/sfx-engine/`. Install the pinned `uv` release and synchronize its committed lockfile before using "Generate SFX track":
+**Generate** and **Regenerate** map the included catalog directly to independent, editable timeline clips. Normal sound-effect generation does not require Python or `uv`.
+
+You can also import `.wav`, `.mp3`, and `.m4a` effects. Imports are copied into the current project's sound-effect library and remain scoped to that project.
+
+The pinned Python environment is retained only for legacy POST renderer and integration compatibility tests. To run those compatibility tests, install the pinned `uv` release and synchronize the committed lockfile:
 
 ```bash
 python -m pip install uv==0.11.2
 uv sync --frozen --project scripts/sfx-engine
 ```
 
-To use a different compatible engine, point the app at it with an environment variable:
+To run those tests against a compatible legacy renderer directory, set:
 
 ```bash
 REPURPOSE_SFX_ENGINE_DIR=/path/to/your/sfx-engine npm run dev
