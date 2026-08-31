@@ -12,6 +12,7 @@
 // create is harmless.
 import type { CaptionStyle, CaptionBlock } from "./captions";
 import type { MediaInspection } from "./media-types";
+import type { ApprovedSfxKey } from "./sfx-effects";
 
 export const VIDEO_TIMELINE_CLIP_ID = "video-full-span";
 
@@ -448,24 +449,7 @@ export interface Marker {
   color?: string;
 }
 
-/**
- * The reel's generated SOUND-EFFECTS track -- a single full-length WAV rendered
- * by the /soundeffects engine and baked into the preview + exported MP4. Created
- * on demand when Manthan clicks the "Sound Effects" button; there is at most ONE
- * (the store keeps `sfxTrack: SfxTrack | null`), spanning the whole output
- * timeline (0..duration) rather than a set of draggable per-effect blocks.
- *
- * It sits on the Audio row BELOW the clip track (Overlays on top -> Clips ->
- * Audio at the bottom) and is rendered as a green block so it reads distinctly
- * from coral clips / violet overlays. Purely an audio layer -- it never draws to
- * the canvas and never ripples with clip/word edits (like {@link Overlay}, it is
- * placed in OUTPUT time and clamped to the reel bounds).
- *
- * PERSISTENCE (mirrors {@link Overlay}): `src` is a STABLE proxied URL
- * (`/api/repurpose/sfx?path=...`) so the track survives reload -- never a bare
- * blob: URL. `sourcePath` is the absolute on-disk WAV, so persistence can
- * re-derive a fresh proxy URL after a reload.
- */
+/** READ-ONLY legacy snapshot input. New documents use independent {@link SfxClip}s. */
 export interface SfxTrack {
   /** Stable proxied streaming URL the preview/export loads (never a blob: URL). */
   src: string;
@@ -479,6 +463,34 @@ export interface SfxTrack {
    * Lets Manthan pull the whole SFX bed up/down under the VO without re-rendering.
    */
   gain: number;
+}
+
+export type SfxClipOrigin = "automatic" | "manual";
+
+export type SfxClipSource =
+  | { kind: "built-in"; key: ApprovedSfxKey }
+  | { kind: "imported"; assetId: string; srcDuration: number }
+  | { kind: "legacy"; sourcePath: string; srcDuration: number };
+
+export interface SfxAsset {
+  id: string;
+  name: string;
+  sourcePath: string;
+  srcDuration: number;
+}
+
+export interface SfxClip {
+  id: string;
+  name: string;
+  source: SfxClipSource;
+  origin: SfxClipOrigin;
+  timelineStart: number;
+  sourceStart: number;
+  sourceEnd: number;
+  gain: number;
+  fadeInSec: number;
+  fadeOutSec: number;
+  muted: boolean;
 }
 
 /**
@@ -631,8 +643,10 @@ export interface ProjectSnapshot {
   // is a stable proxied /api/... path after copy-to-disk import; a leftover blob: src
   // is dead after reload and flags a reconnect. Optional for a pre-overlay snapshot.
   overlays?: Overlay[];
-  // The generated sound-effects track. `src` is a proxied /api/repurpose/sfx path;
-  // on restore it is RE-DERIVED fresh from `sourcePath`. Optional for pre-SFX.
+  // Editable sound-effect document and project-owned imported inventory.
+  sfxClips?: SfxClip[];
+  sfxAssets?: SfxAsset[];
+  // READ-ONLY legacy migration input. New snapshots do not write this field.
   sfxTrack?: SfxTrack | null;
   // The manually-added background-music track. `src` is a proxied
   // /api/repurpose/asset path; RE-DERIVED from `sourcePath` on restore. Optional.

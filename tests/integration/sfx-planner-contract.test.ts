@@ -2,24 +2,9 @@
 
 import { describe, expect, it } from "vitest";
 
-import { APPROVED_SFX_KEYS } from "@/lib/repurpose/sfx-effects";
+import { APPROVED_SFX_KEYS, SFX_CATALOG } from "@/lib/repurpose/sfx-effects";
 import { planSfxEvents } from "@/lib/repurpose/sfx-placement";
 import type { Clip, Word } from "@/lib/repurpose/types";
-
-const expectedKeys = [
-  "mouse_click",
-  "double_click",
-  "keyboard",
-  "whoosh",
-  "air_hit",
-  "ding",
-  "notification",
-  "camera_shutter",
-  "digital_shutter",
-  "riser",
-  "impact",
-  "digital_readout",
-] as const;
 
 function clip(id: string, srcStart: number, timelineStart: number): Clip {
   return {
@@ -39,7 +24,7 @@ function clip(id: string, srcStart: number, timelineStart: number): Clip {
 
 describe("planner-to-route SFX contract", () => {
   it("keeps typical multi-clip planner output inside the route's exact allowlist", () => {
-    expect(APPROVED_SFX_KEYS).toEqual(expectedKeys);
+    expect(APPROVED_SFX_KEYS).toEqual(Object.keys(SFX_CATALOG));
     const clips = [clip("one", 0, 0), clip("two", 10, 4), clip("three", 20, 8), clip("four", 30, 12)];
     const words: Word[] = [
       { text: "switch", start: 1, end: 1.2 },

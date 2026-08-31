@@ -13,23 +13,14 @@ from typing import Any
 from pydub import AudioSegment
 
 
-SFX_DIR = Path(__file__).resolve().parent / "sfx"
+ENGINE_DIR = Path(__file__).resolve().parent
+SFX_DIR = ENGINE_DIR / "sfx"
+with (ENGINE_DIR / "sfx-catalog.json").open("r", encoding="utf-8") as source:
+    SFX_CATALOG = json.load(source)
 SFX_LIBRARY = {
-    "mouse_click": SFX_DIR / "Mouse Click.wav",
-    "double_click": SFX_DIR / "mixkit-fast-double-click-on-mouse-275.wav",
-    "keyboard": SFX_DIR / "Keyboard-Button-Click-06-c-FesliyanStudios.com_.wav",
-    "whoosh": SFX_DIR / "Whoosh 1.wav",
-    "air_hit": SFX_DIR / "mixkit-air-in-a-hit-2161.wav",
-    "ding": SFX_DIR / "Correct Ding.wav",
-    "notification": SFX_DIR / "mixkit-bike-notification-bell-590.wav",
-    "camera_shutter": SFX_DIR / "Camera Shutter 5.wav",
-    "digital_shutter": SFX_DIR / "mixkit-camera-digital-shutter-1432.wav",
-    "riser": SFX_DIR / "Riser 3.wav",
-    "impact": SFX_DIR / "Impact 7.wav",
-    "digital_readout": SFX_DIR / "textdigitalreadout.wav",
+    name: SFX_DIR / metadata["filename"]
+    for name, metadata in SFX_CATALOG.items()
 }
-
-CLICK_SFX = {"mouse_click", "double_click"}
 
 
 def amplitude_to_db(amplitude: float) -> float:
@@ -96,7 +87,7 @@ def load_sfx(name: str) -> AudioSegment:
     if effect.max_dBFS == float("-inf"):
         raise ValueError(f"effect {name} contains no audio")
     effect = effect.apply_gain(-effect.max_dBFS)
-    amplitude = 0.5 if name in CLICK_SFX else 0.3 if name == "whoosh" else 0.2
+    amplitude = SFX_CATALOG[name]["targetAmplitude"]
     effect = effect.apply_gain(amplitude_to_db(amplitude))
     return effect
 

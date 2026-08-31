@@ -1,16 +1,19 @@
-export const APPROVED_SFX_KEYS = [
-  "mouse_click",
-  "double_click",
-  "keyboard",
-  "whoosh",
-  "air_hit",
-  "ding",
-  "notification",
-  "camera_shutter",
-  "digital_shutter",
-  "riser",
-  "impact",
-  "digital_readout",
-] as const;
+import catalog from "@/scripts/sfx-engine/sfx-catalog.json";
 
-export type ApprovedSfxKey = (typeof APPROVED_SFX_KEYS)[number];
+export const SFX_CATALOG = catalog;
+
+export type ApprovedSfxKey = keyof typeof SFX_CATALOG;
+
+export const APPROVED_SFX_KEYS = Object.keys(SFX_CATALOG) as ApprovedSfxKey[];
+
+export function isApprovedSfxKey(value: unknown): value is ApprovedSfxKey {
+  return typeof value === "string" && Object.hasOwn(SFX_CATALOG, value);
+}
+
+export function getSfxCatalogEntry(value: unknown) {
+  return isApprovedSfxKey(value) ? SFX_CATALOG[value] : null;
+}
+
+export function defaultBuiltInDuration(key: ApprovedSfxKey): number {
+  return Math.min(SFX_CATALOG[key].sourceDuration, 1);
+}

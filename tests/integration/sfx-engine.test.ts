@@ -7,25 +7,12 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { APPROVED_SFX_KEYS, SFX_CATALOG } from "@/lib/repurpose/sfx-effects";
+
 const execFileAsync = promisify(execFile);
 const engineDir = path.join(process.cwd(), "scripts", "sfx-engine");
 const scriptPath = path.join(engineDir, "build_sfx_track.py");
 const tempRoots: string[] = [];
-
-const effectKeys = [
-  "mouse_click",
-  "double_click",
-  "keyboard",
-  "whoosh",
-  "air_hit",
-  "ding",
-  "notification",
-  "camera_shutter",
-  "digital_shutter",
-  "riser",
-  "impact",
-  "digital_readout",
-] as const;
 
 interface WavInfo {
   channels: number;
@@ -135,7 +122,7 @@ describe("offline SFX engine", () => {
   });
 
   it("resolves every approved effect key", async () => {
-    const events = effectKeys.map((sfx, index) => ({ sfx, at_ms: index * 100 }));
+    const events = APPROVED_SFX_KEYS.map((sfx, index) => ({ sfx, at_ms: index * 100 }));
     const invocation = await runEngine(JSON.stringify(events), 2500);
 
     await invocation.run();
@@ -144,8 +131,8 @@ describe("offline SFX engine", () => {
     expect(peak(info.samples)).toBeGreaterThan(0);
   });
 
-  it("normalizes clicks to 50%, whoosh to 30%, and other effects to 20% amplitude", async () => {
-    const names = ["mouse_click", "double_click", "whoosh", "ding"] as const;
+  it("normalizes every effect to its catalog target amplitude", async () => {
+    const names = APPROVED_SFX_KEYS;
     const invocations = await Promise.all(names.map((name) => runEngine(
       JSON.stringify([{ sfx: name, at_ms: 0 }]),
       1000,
@@ -157,10 +144,9 @@ describe("offline SFX engine", () => {
     const amplitudes = await Promise.all(invocations.map(async (invocation) => (
       peak(inspectWav(await readFile(invocation.outputPath)).samples) / 32767
     )));
-    expect(amplitudes[0]).toBeCloseTo(0.5, 2);
-    expect(amplitudes[1]).toBeCloseTo(0.5, 2);
-    expect(amplitudes[2]).toBeCloseTo(0.3, 2);
-    expect(amplitudes[3]).toBeCloseTo(0.2, 2);
+    amplitudes.forEach((amplitude, index) => {
+      expect(amplitude).toBeCloseTo(SFX_CATALOG[names[index]].targetAmplitude, 2);
+    });
   });
 
   it.each([
