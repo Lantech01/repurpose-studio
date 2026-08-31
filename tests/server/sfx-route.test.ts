@@ -6,6 +6,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { APPROVED_SFX_KEYS, SFX_CATALOG } from "@/lib/repurpose/sfx-effects";
 
 vi.mock("server-only", () => ({}));
 
@@ -16,20 +17,7 @@ const originalCacheMaxBytes = process.env.REPURPOSE_SFX_CACHE_MAX_BYTES;
 const originalCacheTtlMs = process.env.REPURPOSE_SFX_CACHE_TTL_MS;
 const originalMaxQueuedRenders = process.env.REPURPOSE_SFX_MAX_QUEUED_RENDERS;
 const originalMaxWaitersPerJob = process.env.REPURPOSE_SFX_MAX_WAITERS_PER_JOB;
-const assetNames = [
-  "Mouse Click.wav",
-  "mixkit-fast-double-click-on-mouse-275.wav",
-  "Keyboard-Button-Click-06-c-FesliyanStudios.com_.wav",
-  "Whoosh 1.wav",
-  "mixkit-air-in-a-hit-2161.wav",
-  "Correct Ding.wav",
-  "mixkit-bike-notification-bell-590.wav",
-  "Camera Shutter 5.wav",
-  "mixkit-camera-digital-shutter-1432.wav",
-  "Riser 3.wav",
-  "Impact 7.wav",
-  "textdigitalreadout.wav",
-] as const;
+const assetNames = APPROVED_SFX_KEYS.map((key) => SFX_CATALOG[key].filename);
 
 async function tempDir(prefix: string): Promise<string> {
   const root = await mkdtemp(path.join(os.tmpdir(), prefix));
@@ -72,6 +60,17 @@ function wavBuffer(durationMs: number): Buffer {
   wav.write("data", 36, "ascii");
   wav.writeUInt32LE(dataSize, 40);
   return wav;
+}
+
+async function installBuiltIns(engineDir: string): Promise<Map<string, Buffer>> {
+  const installed = new Map<string, Buffer>();
+  await mkdir(path.join(engineDir, "sfx"), { recursive: true });
+  await Promise.all(APPROVED_SFX_KEYS.map(async (key, index) => {
+    const content = Buffer.from(`raw-wav-variant-${index}-${key}`);
+    installed.set(key, content);
+    await writeFile(path.join(engineDir, "sfx", SFX_CATALOG[key].filename), content);
+  }));
+  return installed;
 }
 
 function installTimedEngine(delayMs = 40): {
@@ -136,6 +135,160 @@ afterEach(async () => {
 });
 
 describe("SFX route", () => {
+  it("serves every catalog key without requiring generated-WAV format", async () => {
+    const cacheDir = path.join(await tempDir("repurpose-sfx-built-in-cache-"), "missing-cache");
+    const engineDir = path.join(await tempDir("repurpose-sfx-built-in-engine-"), "engine");
+    const installed = await installBuiltIns(engineDir);
+    const route = await loadRoute(cacheDir, engineDir);
+
+    for (const key of APPROVED_SFX_KEYS) {
+      const response = await route.GET(new Request(
+        `http://localhost/api/repurpose/sfx?key=${encodeURIComponent(key)}`
+      ));
+      expect(response.status, key).toBe(200);
+      expect(response.headers.get("content-type"), key).toBe("audio/wav");
+      expect(Buffer.from(await response.arrayBuffer()), key).toEqual(installed.get(key));
+    }
+    await expect(stat(cacheDir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("supports HEAD and full, prefix, open-ended, and suffix built-in ranges", async () => {
+    const cacheDir = path.join(await tempDir("repurpose-sfx-built-in-range-cache-"), "cache");
+    const engineDir = path.join(await tempDir("repurpose-sfx-built-in-range-engine-"), "engine");
+    const installed = await installBuiltIns(engineDir);
+    const route = await loadRoute(cacheDir, engineDir);
+    const content = installed.get("ding")!;
+    const url = "http://localhost/api/repurpose/sfx?key=ding";
+
+    const head = await route.HEAD(new Request(url, { method: "HEAD" }));
+    expect(head.status).toBe(200);
+    expect(head.headers.get("content-length")).toBe(String(content.length));
+    expect((await head.arrayBuffer()).byteLength).toBe(0);
+
+    const cases = [
+      ["bytes=0-3", 0, 3],
+      ["bytes=4-", 4, content.length - 1],
+      ["bytes=-5", content.length - 5, content.length - 1],
+    ] as const;
+    for (const [header, start, end] of cases) {
+      const response = await route.GET(new Request(url, { headers: { range: header } }));
+      expect(response.status, header).toBe(206);
+      expect(response.headers.get("content-range"), header).toBe(`bytes ${start}-${end}/${content.length}`);
+      expect(Buffer.from(await response.arrayBuffer()), header).toEqual(content.subarray(start, end + 1));
+    }
+  });
+
+  it.each(["bytes=", "bytes=9-2", "bytes=999-", "items=0-1", "bytes=-0", "bytes=0-1,3-4"])(
+    "returns 416 for malformed or unsatisfiable built-in range %s",
+    async (range) => {
+      const cacheDir = path.join(await tempDir("repurpose-sfx-built-in-416-cache-"), "cache");
+      const engineDir = path.join(await tempDir("repurpose-sfx-built-in-416-engine-"), "engine");
+      const installed = await installBuiltIns(engineDir);
+      const route = await loadRoute(cacheDir, engineDir);
+      const response = await route.GET(new Request("http://localhost/api/repurpose/sfx?key=ding", {
+        headers: { range },
+      }));
+
+      expect(response.status).toBe(416);
+      expect(response.headers.get("content-range")).toBe(`bytes */${installed.get("ding")!.length}`);
+    }
+  );
+
+  it.each([
+    ["neither mode", ""],
+    ["both modes", "?key=ding&path=C%3A%5Cprivate.wav"],
+  ])("returns 400 for %s", async (_name, query) => {
+    const cacheDir = path.join(await tempDir("repurpose-sfx-built-in-mode-cache-"), "cache");
+    const engineDir = path.join(await tempDir("repurpose-sfx-built-in-mode-engine-"), "engine");
+    await installBuiltIns(engineDir);
+    const route = await loadRoute(cacheDir, engineDir);
+
+    expect((await route.GET(new Request(`http://localhost/api/repurpose/sfx${query}`))).status).toBe(400);
+  });
+
+  it.each([
+    "unknown",
+    "../ding",
+    "ding/../../private",
+    "ding%00",
+    "ding&path=C:\\private.wav",
+    "",
+  ])("returns a path-free 404 for malformed built-in key %j", async (key) => {
+    const cacheDir = path.join(await tempDir("repurpose-sfx-built-in-key-cache-"), "cache");
+    const engineDir = path.join(await tempDir("repurpose-sfx-built-in-key-engine-"), "private-engine");
+    await installBuiltIns(engineDir);
+    const route = await loadRoute(cacheDir, engineDir);
+    const response = await route.GET(new Request(
+      `http://localhost/api/repurpose/sfx?key=${encodeURIComponent(key)}`
+    ));
+    const body = await response.text();
+
+    expect(response.status).toBe(404);
+    expect(body).not.toContain(engineDir);
+    expect(body).not.toContain(SFX_CATALOG.ding.filename);
+  });
+
+  it("returns a path-free 404 when a catalog built-in file is missing", async () => {
+    const cacheDir = path.join(await tempDir("repurpose-sfx-built-in-missing-cache-"), "cache");
+    const engineDir = path.join(await tempDir("repurpose-sfx-built-in-missing-engine-"), "private-engine");
+    await installBuiltIns(engineDir);
+    await rm(path.join(engineDir, "sfx", SFX_CATALOG.ding.filename));
+    const route = await loadRoute(cacheDir, engineDir);
+    const response = await route.GET(new Request("http://localhost/api/repurpose/sfx?key=ding"));
+    const body = await response.text();
+
+    expect(response.status).toBe(404);
+    expect(body).not.toContain(engineDir);
+    expect(body).not.toContain(SFX_CATALOG.ding.filename);
+  });
+
+  it("rejects a catalog target whose real path escapes the built-in root", async () => {
+    const cacheDir = path.join(await tempDir("repurpose-sfx-built-in-realpath-cache-"), "cache");
+    const engineDir = path.join(await tempDir("repurpose-sfx-built-in-realpath-engine-"), "private-engine");
+    const outsidePath = path.join(await tempDir("repurpose-sfx-built-in-realpath-outside-"), "private.wav");
+    await installBuiltIns(engineDir);
+    await writeFile(outsidePath, "private audio");
+    vi.doMock("node:fs/promises", async (importOriginal) => {
+      const original = await importOriginal<typeof import("node:fs/promises")>();
+      return {
+        ...original,
+        realpath: vi.fn(async (candidate: string) => (
+          path.basename(candidate) === SFX_CATALOG.ding.filename
+            ? outsidePath
+            : original.realpath(candidate)
+        )),
+      };
+    });
+    const route = await loadRoute(cacheDir, engineDir);
+    const response = await route.GET(new Request("http://localhost/api/repurpose/sfx?key=ding"));
+    const body = await response.text();
+
+    expect(response.status).toBe(404);
+    expect(body).not.toContain(engineDir);
+    expect(body).not.toContain(outsidePath);
+  });
+
+  it("does not enter generated cache sweep or project-reference coordination for built-ins", async () => {
+    const cacheDir = path.join(await tempDir("repurpose-sfx-built-in-side-effect-cache-"), "missing-cache");
+    const engineDir = path.join(await tempDir("repurpose-sfx-built-in-side-effect-engine-"), "engine");
+    await installBuiltIns(engineDir);
+    const coordinatedSnapshot = vi.fn();
+    vi.doMock("@/lib/repurpose/projects", () => ({
+      withProjectReferenceSnapshot: coordinatedSnapshot,
+      normalizeProjectMediaPath: vi.fn(),
+      ProjectReferenceSnapshotUnavailableError: class extends Error {},
+    }));
+    const route = await loadRoute(cacheDir, engineDir);
+
+    const response = await route.GET(new Request("http://localhost/api/repurpose/sfx?key=ding"));
+    await response.arrayBuffer();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(response.status).toBe(200);
+    expect(coordinatedSnapshot).not.toHaveBeenCalled();
+    await expect(stat(cacheDir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it.each([
     ["malformed JSON", "{"],
     ["a non-object payload", "null"],

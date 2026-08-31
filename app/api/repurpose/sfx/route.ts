@@ -15,7 +15,11 @@ import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
-import { APPROVED_SFX_KEYS } from "@/lib/repurpose/sfx-effects";
+import {
+  APPROVED_SFX_KEYS,
+  SFX_CATALOG,
+  getSfxCatalogEntry,
+} from "@/lib/repurpose/sfx-effects";
 import {
   normalizeProjectMediaPath,
   ProjectReferenceSnapshotUnavailableError,
@@ -49,20 +53,7 @@ const CACHE_MAX_BYTES = positiveEnvInteger("REPURPOSE_SFX_CACHE_MAX_BYTES", 2 * 
 const PUBLICATION_GRACE_MS = 60_000;
 const FINAL_FILE_PATTERN = /^sfx-[a-f0-9]{64}\.wav$/;
 const EFFECT_KEYS = new Set<string>(APPROVED_SFX_KEYS);
-const SFX_ASSET_NAMES = [
-  "Mouse Click.wav",
-  "mixkit-fast-double-click-on-mouse-275.wav",
-  "Keyboard-Button-Click-06-c-FesliyanStudios.com_.wav",
-  "Whoosh 1.wav",
-  "mixkit-air-in-a-hit-2161.wav",
-  "Correct Ding.wav",
-  "mixkit-bike-notification-bell-590.wav",
-  "Camera Shutter 5.wav",
-  "mixkit-camera-digital-shutter-1432.wav",
-  "Riser 3.wav",
-  "Impact 7.wav",
-  "textdigitalreadout.wav",
-] as const;
+const SFX_ASSET_NAMES = APPROVED_SFX_KEYS.map((key) => SFX_CATALOG[key].filename);
 
 interface ValidatedEvent {
   sfx: string;
@@ -710,9 +701,78 @@ function leasedFileStream(
   });
 }
 
+function fileStream(
+  filePath: string,
+  range?: { start: number; end: number }
+): ReadableStream<Uint8Array> {
+  return Readable.toWeb(createReadStream(filePath, range)) as unknown as ReadableStream<Uint8Array>;
+}
+
+function wavResponse(
+  request: Request,
+  size: number,
+  createBody: (range?: { start: number; end: number }) => ReadableStream<Uint8Array>
+): Response {
+  const rangeHeader = request.headers.get("range");
+  const range = rangeHeader ? parseRange(rangeHeader, size) : null;
+  const headers: Record<string, string> = {
+    "Content-Type": "audio/wav",
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "private, max-age=3600",
+  };
+
+  if (rangeHeader && !range) {
+    return new Response(null, {
+      status: 416,
+      headers: { ...headers, "Content-Range": `bytes */${size}` },
+    });
+  }
+  const responseHeaders = !range
+    ? { ...headers, "Content-Length": String(size) }
+    : {
+        ...headers,
+        "Content-Range": `bytes ${range.start}-${range.end}/${size}`,
+        "Content-Length": String(range.end - range.start + 1),
+      };
+  const status = range ? 206 : 200;
+  if (request.method === "HEAD") return new Response(null, { status, headers: responseHeaders });
+  return new Response(createBody(range ?? undefined), { status, headers: responseHeaders });
+}
+
+async function resolveBuiltInWav(rawKey: string): Promise<{ filePath: string; size: number } | null> {
+  const metadata = getSfxCatalogEntry(rawKey);
+  if (!metadata) return null;
+  try {
+    const sfxRoot = await realpath(path.join(ENGINE_DIR, "sfx"));
+    const filePath = await realpath(path.join(sfxRoot, metadata.filename));
+    if (!isUnder(sfxRoot, filePath)) return null;
+    const info = await stat(filePath);
+    return info.isFile() ? { filePath, size: info.size } : null;
+  } catch {
+    return null;
+  }
+}
+
+async function serveBuiltInWav(request: Request, rawKey: string): Promise<Response> {
+  const asset = await resolveBuiltInWav(rawKey);
+  if (!asset) return new Response("Not found", { status: 404 });
+  return wavResponse(request, asset.size, (range) => fileStream(asset.filePath, range));
+}
+
 export async function GET(request: Request): Promise<Response> {
-  const rawPath = new URL(request.url).searchParams.get("path");
-  if (!rawPath) return new Response("Missing ?path", { status: 400 });
+  const params = new URL(request.url).searchParams;
+  const hasKey = params.has("key");
+  const hasPath = params.has("path");
+  if (hasKey === hasPath) return new Response("Supply exactly one SFX source", { status: 400 });
+  if (hasKey) {
+    const keys = params.getAll("key");
+    return keys.length === 1
+      ? serveBuiltInWav(request, keys[0])
+      : new Response("Not found", { status: 404 });
+  }
+
+  const rawPath = params.get("path");
+  if (rawPath === null) return new Response("Supply exactly one SFX source", { status: 400 });
   const candidate = generatedWavCandidate(rawPath);
   if (!candidate) return new Response("Not found", { status: 404 });
   let leasedPath = candidate;
@@ -734,37 +794,21 @@ export async function GET(request: Request): Promise<Response> {
       return json({ code: "SFX_INVALID_CACHE_ENTRY", error: "Cached SFX track is invalid" }, 404);
     }
     validAsset = true;
-    const rangeHeader = request.headers.get("range");
-    const range = rangeHeader ? parseRange(rangeHeader, wav.size) : null;
-    const headers: Record<string, string> = {
-      "Content-Type": "audio/wav",
-      "Accept-Ranges": "bytes",
-      "Cache-Control": "private, max-age=3600",
-    };
-
-    if (rangeHeader && !range) {
-      return new Response(null, {
-        status: 416,
-        headers: { ...headers, "Content-Range": `bytes */${wav.size}` },
-      });
-    }
-    const responseHeaders = !range
-      ? { ...headers, "Content-Length": String(wav.size) }
-      : {
-          ...headers,
-          "Content-Range": `bytes ${range.start}-${range.end}/${wav.size}`,
-          "Content-Length": String(range.end - range.start + 1),
-        };
-    const status = range ? 206 : 200;
-    if (request.method === "HEAD") return new Response(null, { status, headers: responseHeaders });
-
-    const stream = leasedFileStream(filePath, release, range ?? undefined);
-    const response = new Response(stream, { status, headers: responseHeaders });
+    const response = wavResponse(
+      request,
+      wav.size,
+      (range) => leasedFileStream(filePath, release, range)
+    );
+    if (request.method === "HEAD" || !response.body) return response;
     streamOwnsLease = true;
     return response;
   } finally {
     if (!streamOwnsLease) release(validAsset);
   }
+}
+
+export async function HEAD(request: Request): Promise<Response> {
+  return GET(request);
 }
 
 function json(value: unknown, status = 200, headers?: Record<string, string>): Response {
