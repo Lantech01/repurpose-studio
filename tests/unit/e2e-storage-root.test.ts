@@ -2,7 +2,7 @@
 
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   e2eStoragePaths,
@@ -35,5 +35,26 @@ describe("Playwright storage isolation", () => {
       REPURPOSE_PROJECTS_DIR: paths.projectsDir,
     })).toThrow(/contained/i);
     expect(() => validateReusedE2eStorage({})).toThrow(/REPURPOSE_E2E_ROOT/);
+  });
+
+  it("runs its managed server from a production build", async () => {
+    const paths = e2eStoragePaths(path.join(os.tmpdir(), "caller-owned-repurpose-e2e"));
+    vi.stubEnv("REPURPOSE_E2E_REUSE_SERVER", "1");
+    vi.stubEnv("REPURPOSE_E2E_ROOT", paths.root);
+    vi.stubEnv("REPURPOSE_ASSET_DIR", paths.assetDir);
+    vi.stubEnv("REPURPOSE_SFX_CACHE_DIR", paths.sfxDir);
+    vi.stubEnv("REPURPOSE_PROJECTS_DIR", paths.projectsDir);
+    vi.stubEnv("REPURPOSE_E2E_OWNS_ROOT", "0");
+    vi.resetModules();
+
+    try {
+      const config = (await import("../../playwright.config")).default;
+      expect(config.webServer).toMatchObject({
+        command: "npm run build && npm run start -- --port 3001",
+      });
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
   });
 });
