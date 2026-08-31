@@ -165,6 +165,19 @@ describe("SFX route", () => {
     expect(head.headers.get("content-length")).toBe(String(content.length));
     expect((await head.arrayBuffer()).byteLength).toBe(0);
 
+    for (const range of ["bytes=0-3", "bytes=999-", "not-a-range"]) {
+      const rangedHead = await route.HEAD(new Request(url, {
+        method: "HEAD",
+        headers: { range },
+      }));
+      expect(rangedHead.status, range).toBe(200);
+      expect(rangedHead.headers.get("content-length"), range).toBe(String(content.length));
+      expect(rangedHead.headers.get("content-range"), range).toBeNull();
+      expect(rangedHead.headers.get("accept-ranges"), range).toBe("bytes");
+      expect(rangedHead.headers.get("content-type"), range).toBe("audio/wav");
+      expect((await rangedHead.arrayBuffer()).byteLength, range).toBe(0);
+    }
+
     const cases = [
       ["bytes=0-3", 0, 3],
       ["bytes=4-", 4, content.length - 1],
@@ -214,6 +227,39 @@ describe("SFX route", () => {
 
     expect(response.status).toBe(400);
     expect(await response.text()).toBe("Missing ?path");
+  });
+
+  it("ignores Range on HEAD for a valid legacy generated WAV", async () => {
+    const cacheDir = await tempDir("repurpose-sfx-legacy-head-");
+    const filePath = path.join(cacheDir, `sfx-${"a".repeat(64)}.wav`);
+    const content = wavBuffer(1000);
+    await writeFile(filePath, content);
+    const route = await loadRoute(cacheDir);
+    const response = await route.HEAD(new Request(
+      `http://localhost/api/repurpose/sfx?path=${encodeURIComponent(filePath)}`,
+      { method: "HEAD", headers: { range: "bytes=0-3" } }
+    ));
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-length")).toBe(String(content.length));
+    expect(response.headers.get("content-range")).toBeNull();
+    expect(response.headers.get("accept-ranges")).toBe("bytes");
+    expect(response.headers.get("content-type")).toBe("audio/wav");
+    expect((await response.arrayBuffer()).byteLength).toBe(0);
+  });
+
+  it("returns a bodyless 404 for an unknown built-in HEAD request", async () => {
+    const cacheDir = path.join(await tempDir("repurpose-sfx-unknown-head-cache-"), "cache");
+    const engineDir = path.join(await tempDir("repurpose-sfx-unknown-head-engine-"), "engine");
+    await installBuiltIns(engineDir);
+    const route = await loadRoute(cacheDir, engineDir);
+    const response = await route.HEAD(new Request(
+      "http://localhost/api/repurpose/sfx?key=unknown",
+      { method: "HEAD" }
+    ));
+
+    expect(response.status).toBe(404);
+    expect((await response.arrayBuffer()).byteLength).toBe(0);
   });
 
   it.each([

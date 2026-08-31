@@ -713,14 +713,20 @@ function wavResponse(
   size: number,
   createBody: (range?: { start: number; end: number }) => ReadableStream<Uint8Array>
 ): Response {
-  const rangeHeader = request.headers.get("range");
-  const range = rangeHeader ? parseRange(rangeHeader, size) : null;
   const headers: Record<string, string> = {
     "Content-Type": "audio/wav",
     "Accept-Ranges": "bytes",
     "Cache-Control": "private, max-age=3600",
   };
+  if (request.method === "HEAD") {
+    return new Response(null, {
+      status: 200,
+      headers: { ...headers, "Content-Length": String(size) },
+    });
+  }
 
+  const rangeHeader = request.headers.get("range");
+  const range = rangeHeader ? parseRange(rangeHeader, size) : null;
   if (rangeHeader && !range) {
     return new Response(null, {
       status: 416,
@@ -735,7 +741,6 @@ function wavResponse(
         "Content-Length": String(range.end - range.start + 1),
       };
   const status = range ? 206 : 200;
-  if (request.method === "HEAD") return new Response(null, { status, headers: responseHeaders });
   return new Response(createBody(range ?? undefined), { status, headers: responseHeaders });
 }
 
@@ -809,7 +814,15 @@ export async function GET(request: Request): Promise<Response> {
 }
 
 export async function HEAD(request: Request): Promise<Response> {
-  return GET(request);
+  const headRequest = request.method === "HEAD"
+    ? request
+    : new Request(request, { method: "HEAD" });
+  const response = await GET(headRequest);
+  return new Response(null, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
 }
 
 function json(value: unknown, status = 200, headers?: Record<string, string>): Response {
