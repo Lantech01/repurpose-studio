@@ -85,6 +85,14 @@ describe("SFX clip normalization", () => {
       null,
     ], 10)).toEqual([clip()]);
   });
+
+  it("keeps the first valid clip when persisted entries repeat an id", () => {
+    const first = clip({ id: "duplicate", name: "First" });
+    const repeated = clip({ id: "duplicate", name: "Repeated" });
+
+    expect(normalizeSfxDocument([first, repeated, clip({ id: "unique" })], 10))
+      .toEqual([first, clip({ id: "unique" })]);
+  });
 });
 
 describe("SFX fades and resolution", () => {
@@ -214,11 +222,54 @@ describe("automatic clips and legacy migration", () => {
     ]);
   });
 
+  it("repairs repeated ids from a caller-provided automatic id allocator", () => {
+    const generated = sfxClipsFromEvents([
+      { sfx: "ding", atMs: 500 },
+      { sfx: "impact", atMs: 1500 },
+    ], 10, () => "generated");
+
+    expect(generated.map((entry) => entry.id)).toEqual(["generated", "generated-2"]);
+  });
+
+  it("does not consume an automatic id for an event rejected by normalization", () => {
+    const generated = sfxClipsFromEvents([
+      { sfx: "ding", atMs: 10_000 },
+      { sfx: "impact", atMs: 1000 },
+    ], 10, () => "generated");
+
+    expect(generated.map((entry) => entry.id)).toEqual(["generated"]);
+  });
+
+  it("does not repair an invalid empty automatic id into a valid id", () => {
+    const generated = sfxClipsFromEvents([
+      { sfx: "ding", atMs: 500 },
+      { sfx: "impact", atMs: 1500 },
+    ], 10, () => "");
+
+    expect(generated).toEqual([]);
+  });
+
   it("partitions regeneration by replacing automatic clips and preserving manual clips", () => {
     const manual = clip({ id: "manual", origin: "manual" });
     const generated = clip({ id: "new-auto" });
     expect(replaceAutomaticSfxClips([clip({ id: "old-auto" }), manual], [generated]))
       .toEqual([manual, generated]);
+  });
+
+  it("repairs regenerated ids that collide with replaced manual clips", () => {
+    const replaced = replaceSfxClipSource(
+      clip({ id: "sfx-auto-1" }),
+      { name: "Impact", source: { kind: "built-in", key: "impact" } },
+      10
+    );
+    const generated = sfxClipsFromEvents([{ sfx: "ding", atMs: 1000 }], 10);
+
+    expect(replaced).not.toBeNull();
+    const regenerated = replaceAutomaticSfxClips([replaced!], generated);
+    expect(regenerated.map((entry) => entry.id)).toEqual(["sfx-auto-1", "sfx-auto-1-2"]);
+    expect(new Set(regenerated.map((entry) => entry.id))).toHaveLength(regenerated.length);
+    expect(regenerated[0]).toBe(replaced);
+    expect(regenerated[1].origin).toBe("automatic");
   });
 
   it("migrates a legacy track with its timing and gain", () => {

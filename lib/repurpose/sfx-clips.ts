@@ -31,6 +31,17 @@ function cleanTime(value: number): number {
   return Object.is(rounded, -0) ? 0 : rounded;
 }
 
+function claimUniqueId(preferredId: string, usedIds: Set<string>): string {
+  let id = preferredId;
+  let suffix = 2;
+  while (usedIds.has(id)) {
+    id = `${preferredId}-${suffix}`;
+    suffix += 1;
+  }
+  usedIds.add(id);
+  return id;
+}
+
 function normalizeSource(value: unknown): SfxClipSource | null {
   if (!isRecord(value)) return null;
   if (value.kind === "built-in" && isApprovedSfxKey(value.key)) {
@@ -128,10 +139,15 @@ export function normalizeSfxClip(value: unknown, projectDuration: number): SfxCl
 
 export function normalizeSfxDocument(value: unknown, projectDuration: number): SfxClip[] {
   if (!Array.isArray(value)) return [];
-  return value.flatMap((entry) => {
+  const clips: SfxClip[] = [];
+  const usedIds = new Set<string>();
+  for (const entry of value) {
     const normalized = normalizeSfxClip(entry, projectDuration);
-    return normalized ? [normalized] : [];
-  });
+    if (!normalized || usedIds.has(normalized.id)) continue;
+    usedIds.add(normalized.id);
+    clips.push(normalized);
+  }
+  return clips;
 }
 
 export function effectiveSfxFadeDurations(
@@ -334,6 +350,7 @@ export function sfxClipsFromEvents(
   projectDuration: number,
   idForIndex: (index: number) => string = (index) => `sfx-auto-${index + 1}`
 ): SfxClip[] {
+  const usedIds = new Set<string>();
   return events.flatMap((event, index) => {
     const metadata = SFX_CATALOG[event.sfx];
     const candidate: SfxClip = {
@@ -350,7 +367,9 @@ export function sfxClipsFromEvents(
       muted: false,
     };
     const normalized = normalizeSfxClip(candidate, projectDuration);
-    return normalized ? [normalized] : [];
+    return normalized
+      ? [{ ...normalized, id: claimUniqueId(normalized.id, usedIds) }]
+      : [];
   });
 }
 
@@ -358,9 +377,15 @@ export function replaceAutomaticSfxClips(
   current: readonly SfxClip[],
   automatic: readonly SfxClip[]
 ): SfxClip[] {
+  const manual = current.filter((clip) => clip.origin === "manual");
+  const usedIds = new Set(manual.map((clip) => clip.id));
   return [
-    ...current.filter((clip) => clip.origin === "manual"),
-    ...automatic.map((clip) => ({ ...clip, origin: "automatic" as const })),
+    ...manual,
+    ...automatic.map((clip) => ({
+      ...clip,
+      id: claimUniqueId(clip.id, usedIds),
+      origin: "automatic" as const,
+    })),
   ];
 }
 

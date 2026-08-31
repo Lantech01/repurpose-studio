@@ -274,6 +274,7 @@ async function engineIsInstalled(): Promise<boolean> {
       stat(path.join(ENGINE_DIR, "build_sfx_track.py")),
       stat(path.join(ENGINE_DIR, "pyproject.toml")),
       stat(path.join(ENGINE_DIR, "uv.lock")),
+      stat(path.join(ENGINE_DIR, "sfx-catalog.json")),
       ...SFX_ASSET_NAMES.map((name) => stat(path.join(ENGINE_DIR, "sfx", name))),
     ]);
     return files.every((file) => file.isFile());

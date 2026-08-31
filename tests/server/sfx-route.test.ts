@@ -222,7 +222,44 @@ describe("SFX route", () => {
       writeFile(path.join(engineDir, "build_sfx_track.py"), "pass"),
       writeFile(path.join(engineDir, "pyproject.toml"), "[project]"),
       writeFile(path.join(engineDir, "uv.lock"), "version = 1"),
+      writeFile(path.join(engineDir, "sfx-catalog.json"), "{}"),
       ...assetNames.slice(0, -1).map((name) => writeFile(path.join(engineDir, "sfx", name), "wav")),
+    ]);
+    const mockedExecFile = vi.fn((
+      _file: string,
+      _args: readonly string[],
+      _options: unknown,
+      callback: (error: Error) => void
+    ) => {
+      callback(Object.assign(new Error("engine should not launch"), { code: "MOCK_LAUNCHED" }));
+      return { kill: vi.fn() };
+    });
+    vi.doMock("node:child_process", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("node:child_process")>()),
+      execFile: mockedExecFile as unknown as typeof execFile,
+    }));
+    const route = await loadRoute(cacheDir, engineDir);
+
+    const response = await route.POST(post(JSON.stringify({
+      events: [{ sfx: "ding", atMs: 0 }],
+      durationMs: 1000,
+    })));
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ code: "SFX_ENGINE_UNAVAILABLE" });
+    expect(mockedExecFile).not.toHaveBeenCalled();
+    await expect(stat(cacheDir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("reports the engine unavailable before launch when the SFX catalog is missing", async () => {
+    const cacheDir = path.join(await tempDir("repurpose-sfx-route-catalog-cache-"), "cache");
+    const engineDir = path.join(await tempDir("repurpose-sfx-route-catalog-engine-"), "engine");
+    await mkdir(path.join(engineDir, "sfx"), { recursive: true });
+    await Promise.all([
+      writeFile(path.join(engineDir, "build_sfx_track.py"), "pass"),
+      writeFile(path.join(engineDir, "pyproject.toml"), "[project]"),
+      writeFile(path.join(engineDir, "uv.lock"), "version = 1"),
+      ...assetNames.map((name) => writeFile(path.join(engineDir, "sfx", name), "wav")),
     ]);
     const mockedExecFile = vi.fn((
       _file: string,
