@@ -34,6 +34,7 @@ interface PreviewParityFrame {
   frame: number;
   time: number;
   dataUrl: string;
+  captureMode: "canvas" | "screenshot";
 }
 
 interface PixelParity {
@@ -158,27 +159,56 @@ async function capturePreviewParityFrame(
     const dataUrl = await canvas.evaluate((element: HTMLCanvasElement) =>
       element.toDataURL("image/png")
     );
-    return { frame, time, dataUrl };
+    return { frame, time, dataUrl, captureMode: "canvas" };
   } catch (error) {
     if (!(error instanceof Error) || !/SecurityError|tainted by cross-origin data/i.test(error.message)) {
       throw error;
     }
   }
 
+  await page.evaluate(() => {
+    const source = document.querySelector<HTMLCanvasElement>("#preview-panel canvas");
+    if (!source) throw new Error("Preview canvas is unavailable");
+    const capture = document.createElement("canvas");
+    capture.id = "e2e-preview-parity-capture";
+    capture.width = source.width;
+    capture.height = source.height;
+    capture.style.position = "fixed";
+    capture.style.left = "0";
+    capture.style.top = "0";
+    capture.style.width = `${source.width}px`;
+    capture.style.height = `${source.height}px`;
+    capture.style.zIndex = "2147483647";
+    document.body.append(capture);
+  });
+  const nativeCapture = page.locator("#e2e-preview-parity-capture");
   let previous: Buffer | null = null;
   let current: Buffer | null = null;
   let stableCount = 0;
-  for (let attempt = 0; attempt < 30 && stableCount < 2; attempt += 1) {
-    current = await canvas.screenshot({ animations: "disabled" });
-    stableCount = previous?.equals(current) ? stableCount + 1 : 0;
-    previous = current;
-    if (stableCount < 2) await page.waitForTimeout(100);
+  try {
+    for (let attempt = 0; attempt < 30 && stableCount < 2; attempt += 1) {
+      await page.evaluate(() => {
+        const source = document.querySelector<HTMLCanvasElement>("#preview-panel canvas");
+        const capture = document.querySelector<HTMLCanvasElement>("#e2e-preview-parity-capture");
+        const context = capture?.getContext("2d");
+        if (!source || !capture || !context) throw new Error("Preview capture canvas is unavailable");
+        context.clearRect(0, 0, capture.width, capture.height);
+        context.drawImage(source, 0, 0);
+      });
+      current = await nativeCapture.screenshot({ animations: "disabled" });
+      stableCount = previous?.equals(current) ? stableCount + 1 : 0;
+      previous = current;
+      if (stableCount < 2) await page.waitForTimeout(100);
+    }
+  } finally {
+    await page.evaluate(() => document.querySelector("#e2e-preview-parity-capture")?.remove());
   }
   expect(stableCount, `preview frame ${frame} did not settle`).toBe(2);
   return {
     frame,
     time,
     dataUrl: `data:image/png;base64,${current!.toString("base64")}`,
+    captureMode: "screenshot",
   };
 }
 
@@ -188,18 +218,27 @@ async function comparePreviewToExport(
   fps = 30,
   analysis?: PixelAnalysis
 ): Promise<PixelParity> {
+  await video.evaluate(async (element: HTMLVideoElement, seekTime) => {
+    element.currentTime = seekTime;
+    await new Promise<void>((resolve, reject) => {
+      element.addEventListener("seeked", () => resolve(), { once: true });
+      element.addEventListener("error", () => reject(element.error), { once: true });
+    });
+    element.pause();
+  }, (preview.frame + 0.5) / fps);
+  const exportScreenshotDataUrl = preview.captureMode === "screenshot"
+    ? `data:image/png;base64,${(await video.screenshot({ animations: "disabled" })).toString("base64")}`
+    : null;
   return video.evaluate(
-    async (element: HTMLVideoElement, { previewDataUrl, seekTime, analysis }) => {
-      element.currentTime = seekTime;
-      await new Promise<void>((resolve, reject) => {
-        element.addEventListener("seeked", () => resolve(), { once: true });
-        element.addEventListener("error", () => reject(element.error), { once: true });
-      });
-      element.pause();
-
+    async (element: HTMLVideoElement, { previewDataUrl, exportScreenshotDataUrl, analysis }) => {
       const previewImage = new Image();
       previewImage.src = previewDataUrl;
       await previewImage.decode();
+      const exportImage = exportScreenshotDataUrl ? new Image() : null;
+      if (exportImage && exportScreenshotDataUrl) {
+        exportImage.src = exportScreenshotDataUrl;
+        await exportImage.decode();
+      }
       const width = Math.min(540, element.videoWidth);
       const height = Math.round((element.videoHeight / element.videoWidth) * width);
       const makeCanvas = () => {
@@ -214,7 +253,7 @@ async function comparePreviewToExport(
       const exportContext = exportCanvas.getContext("2d", { willReadFrequently: true });
       if (!previewContext || !exportContext) throw new Error("2D canvas is unavailable");
       previewContext.drawImage(previewImage, 0, 0, width, height);
-      exportContext.drawImage(element, 0, 0, width, height);
+      exportContext.drawImage(exportImage ?? element, 0, 0, width, height);
       const left = previewContext.getImageData(0, 0, width, height).data;
       const right = exportContext.getImageData(0, 0, width, height).data;
       let fullSum = 0;
@@ -307,9 +346,7 @@ async function comparePreviewToExport(
     },
     {
       previewDataUrl: preview.dataUrl,
-      // Seek halfway through the encoded frame so Chrome cannot select the
-      // preceding frame at an exact timestamp boundary.
-      seekTime: (preview.frame + 0.5) / fps,
+      exportScreenshotDataUrl,
       analysis,
     }
   );
@@ -597,6 +634,15 @@ test("exports representative editable SFX with narration and music in a layered 
     const importedId = beforeRegeneration.sfxClips!.find(
       (clip) => clip.origin === "manual" && clip.source.kind === "imported"
     )!.id;
+    const importedAsset = beforeRegeneration.sfxAssets!.find((asset) =>
+      beforeRegeneration.sfxClips!.some(
+        (clip) => clip.id === importedId && clip.source.kind === "imported" && clip.source.assetId === asset.id
+      )
+    )!;
+    const assetRoot = path.resolve(process.env.REPURPOSE_ASSET_DIR!);
+    const importedRelativePath = path.relative(assetRoot, path.resolve(importedAsset.sourcePath));
+    expect(importedRelativePath).not.toBe("");
+    expect(importedRelativePath.startsWith("..") || path.isAbsolute(importedRelativePath)).toBe(false);
     await page.getByRole("button", { name: "Generate automatic effects", exact: true }).click();
     await expect
       .poll(async () => {

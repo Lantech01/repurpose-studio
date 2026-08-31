@@ -16,7 +16,14 @@ export interface BrowserErrorCollector {
   assertEmpty(): void;
 }
 
-export function collectBrowserErrors(page: Page): BrowserErrorCollector {
+export interface BrowserErrorCollectorOptions {
+  expectedOptional404Paths?: readonly string[];
+}
+
+export function collectBrowserErrors(
+  page: Page,
+  options: BrowserErrorCollectorOptions = {}
+): BrowserErrorCollector {
   const consoleErrors: string[] = [];
   const pageErrors: string[] = [];
   const httpErrors: string[] = [];
@@ -27,6 +34,12 @@ export function collectBrowserErrors(page: Page): BrowserErrorCollector {
     errorText: string;
   }> = [];
   const expectedConsoleFailureUrls = new Set<string>();
+  const expectedOptional404Paths = new Set([
+    "/repurpose/claude-routines-words.json",
+    "/repurpose/final-transcript.txt",
+    "/repurpose/footage-manifest.json",
+    ...(options.expectedOptional404Paths ?? []),
+  ]);
   page.on("console", (message) => {
     if (message.type() === "error") {
       const location = message.location().url;
@@ -48,12 +61,7 @@ export function collectBrowserErrors(page: Page): BrowserErrorCollector {
     const expectedOptional404 =
       response.status() === 404 &&
       response.request().method() === "GET" &&
-      [
-        "/repurpose/claude-routines-words.json",
-        "/repurpose/final-transcript.txt",
-        "/repurpose/footage-manifest.json",
-        "/api/repurpose/thumb",
-      ].includes(url.pathname);
+      expectedOptional404Paths.has(url.pathname);
     const expectedSaveRace =
       response.status() === 409 &&
       response.request().method() === "POST" &&
@@ -86,12 +94,7 @@ export function collectBrowserErrors(page: Page): BrowserErrorCollector {
         if (!location) return true;
         const url = new URL(location);
         return !(
-          [
-            "/repurpose/claude-routines-words.json",
-            "/repurpose/final-transcript.txt",
-            "/repurpose/footage-manifest.json",
-            "/api/repurpose/thumb",
-          ].includes(url.pathname) ||
+          expectedOptional404Paths.has(url.pathname) ||
           expectedConsoleFailureUrls.has(location)
         );
       });

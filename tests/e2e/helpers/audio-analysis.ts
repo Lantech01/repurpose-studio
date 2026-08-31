@@ -42,6 +42,8 @@ export interface AudioDifferenceMeasurements extends TimedSfxWindowMeasurement {
   fullRms: number;
   hz220: number;
   hz440: number;
+  alignmentLagSamples: number;
+  alignmentCorrelation: number;
 }
 
 export interface AudioDifferenceWindow {
@@ -51,6 +53,27 @@ export interface AudioDifferenceWindow {
   hz880: number;
   hz1100: number;
 }
+
+export interface PcmAlignmentOptions {
+  sampleRate?: number;
+  maxLagSec?: number;
+  minOverlapSec?: number;
+  minOverlapRatio?: number;
+  minCorrelation?: number;
+}
+
+export interface PcmAlignment {
+  lagSamples: number;
+  correlation: number;
+  referenceStart: number;
+  candidateStart: number;
+  reference: Float32Array;
+  candidate: Float32Array;
+}
+
+// AAC priming is normally about 21 ms at 48 kHz. A 100 ms cap allows encoder
+// variance without permitting correlation to drift to unrelated edit content.
+export const MAX_PCM_ALIGNMENT_LAG_SEC = 0.1;
 
 function spawnToBuffer(command: string, args: string[]): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -140,6 +163,125 @@ function rms(samples: Float32Array): number {
   return Math.sqrt(sum / samples.length);
 }
 
+function normalizedCorrelationAtLag(
+  reference: Float32Array,
+  candidate: Float32Array,
+  lagSamples: number,
+  stride: number
+): number {
+  const referenceStart = lagSamples < 0 ? -lagSamples : 0;
+  const candidateStart = lagSamples > 0 ? lagSamples : 0;
+  const length = Math.min(
+    reference.length - referenceStart,
+    candidate.length - candidateStart
+  );
+  if (length <= 1) return Number.NEGATIVE_INFINITY;
+  let count = 0;
+  let sumReference = 0;
+  let sumCandidate = 0;
+  let sumReferenceSquared = 0;
+  let sumCandidateSquared = 0;
+  let sumProduct = 0;
+  for (let index = 0; index < length; index += stride) {
+    const left = reference[referenceStart + index];
+    const right = candidate[candidateStart + index];
+    count += 1;
+    sumReference += left;
+    sumCandidate += right;
+    sumReferenceSquared += left * left;
+    sumCandidateSquared += right * right;
+    sumProduct += left * right;
+  }
+  const covariance = sumProduct - sumReference * sumCandidate / count;
+  const referenceVariance = sumReferenceSquared - sumReference * sumReference / count;
+  const candidateVariance = sumCandidateSquared - sumCandidate * sumCandidate / count;
+  const denominator = Math.sqrt(referenceVariance * candidateVariance);
+  return denominator > 0 ? covariance / denominator : Number.NEGATIVE_INFINITY;
+}
+
+export function alignPcmForDifference(
+  reference: Float32Array,
+  candidate: Float32Array,
+  options: PcmAlignmentOptions = {}
+): PcmAlignment {
+  const sampleRate = options.sampleRate ?? 48_000;
+  const maxLagSec = options.maxLagSec ?? MAX_PCM_ALIGNMENT_LAG_SEC;
+  const minOverlapSec = options.minOverlapSec ?? 0.5;
+  const minOverlapRatio = options.minOverlapRatio ?? 0.8;
+  const minCorrelation = options.minCorrelation ?? 0.8;
+  if (
+    !Number.isFinite(sampleRate) || sampleRate <= 0 ||
+    !Number.isFinite(maxLagSec) || maxLagSec < 0 ||
+    !Number.isFinite(minOverlapSec) || minOverlapSec < 0 ||
+    !Number.isFinite(minOverlapRatio) || minOverlapRatio <= 0 || minOverlapRatio > 1 ||
+    !Number.isFinite(minCorrelation) || minCorrelation < -1 || minCorrelation > 1
+  ) {
+    throw new Error("Invalid PCM alignment options");
+  }
+  const maxLagSamples = Math.min(
+    Math.round(maxLagSec * sampleRate),
+    Math.max(0, Math.min(reference.length, candidate.length) - 1)
+  );
+  const stride = Math.max(1, Math.ceil(Math.max(reference.length, candidate.length) / 12_000));
+  let bestLag = 0;
+  let bestCorrelation = Number.NEGATIVE_INFINITY;
+  const consider = (lag: number, correlation: number) => {
+    if (
+      correlation > bestCorrelation + 1e-12 ||
+      (Math.abs(correlation - bestCorrelation) <= 1e-12 && Math.abs(lag) < Math.abs(bestLag))
+    ) {
+      bestLag = lag;
+      bestCorrelation = correlation;
+    }
+  };
+  for (let lag = -maxLagSamples; lag <= maxLagSamples; lag += stride) {
+    consider(lag, normalizedCorrelationAtLag(reference, candidate, lag, stride));
+  }
+  const coarseLag = bestLag;
+  bestCorrelation = Number.NEGATIVE_INFINITY;
+  for (
+    let lag = Math.max(-maxLagSamples, coarseLag - stride);
+    lag <= Math.min(maxLagSamples, coarseLag + stride);
+    lag += 1
+  ) {
+    consider(lag, normalizedCorrelationAtLag(reference, candidate, lag, 1));
+  }
+  // Candidate-only effects can make a whole-cycle lag score slightly better by
+  // excluding mismatched samples. Treat correlations within 0.02 as equivalent
+  // and prefer zero; real encoder delays still need a materially stronger score.
+  const zeroLagCorrelation = normalizedCorrelationAtLag(reference, candidate, 0, 1);
+  if (bestCorrelation - zeroLagCorrelation <= 0.02) {
+    bestLag = 0;
+    bestCorrelation = zeroLagCorrelation;
+  }
+  const referenceStart = bestLag < 0 ? -bestLag : 0;
+  const candidateStart = bestLag > 0 ? bestLag : 0;
+  const overlapLength = Math.min(
+    reference.length - referenceStart,
+    candidate.length - candidateStart
+  );
+  const minimumLength = Math.ceil(minOverlapSec * sampleRate);
+  const minimumRatioLength = Math.ceil(Math.min(reference.length, candidate.length) * minOverlapRatio);
+  if (overlapLength < minimumLength || overlapLength < minimumRatioLength) {
+    throw new Error(
+      `PCM alignment overlap is insufficient: ${overlapLength} samples at ${sampleRate} Hz`
+    );
+  }
+  if (!Number.isFinite(bestCorrelation) || bestCorrelation < minCorrelation) {
+    throw new Error(
+      `PCM alignment correlation ${bestCorrelation.toFixed(4)} is below ${minCorrelation}`
+    );
+  }
+  return {
+    lagSamples: bestLag,
+    correlation: bestCorrelation,
+    referenceStart,
+    candidateStart,
+    reference: reference.subarray(referenceStart, referenceStart + overlapLength),
+    candidate: candidate.subarray(candidateStart, candidateStart + overlapLength),
+  };
+}
+
 export function measureTimedSfxWindow(
   samples: Float32Array,
   centerSec: number,
@@ -193,14 +335,20 @@ export async function analyzeAudioDifference(
     decodeMonoFloat48k(referencePath),
     decodeMonoFloat48k(candidatePath),
   ]);
-  const length = Math.min(reference.length, candidate.length);
+  const aligned = alignPcmForDifference(reference, candidate);
+  const length = aligned.reference.length;
   const difference = new Float32Array(length);
-  for (let i = 0; i < length; i++) difference[i] = candidate[i] - reference[i];
+  for (let i = 0; i < length; i++) {
+    difference[i] = aligned.candidate[i] - aligned.reference[i];
+  }
+  const alignedCenterSec = sfxCenterSec - aligned.referenceStart / 48_000;
   return {
-    ...measureTimedSfxWindow(difference, sfxCenterSec),
+    ...measureTimedSfxWindow(difference, alignedCenterSec),
     fullRms: rms(difference),
     hz220: goertzelMagnitude(difference, 220),
     hz440: goertzelMagnitude(difference, 440),
+    alignmentLagSamples: aligned.lagSamples,
+    alignmentCorrelation: aligned.correlation,
   };
 }
 
@@ -213,14 +361,15 @@ export async function analyzeAudioDifferenceWindows(
     decodeMonoFloat48k(referencePath),
     decodeMonoFloat48k(candidatePath),
   ]);
-  const length = Math.min(reference.length, candidate.length);
+  const aligned = alignPcmForDifference(reference, candidate);
+  const length = aligned.reference.length;
   const difference = new Float32Array(length);
   for (let index = 0; index < length; index += 1) {
-    difference[index] = candidate[index] - reference[index];
+    difference[index] = aligned.candidate[index] - aligned.reference[index];
   }
   const halfWindow = Math.round(0.05 * 48_000);
   return centersSec.map((centerSec) => {
-    const center = Math.round(centerSec * 48_000);
+    const center = Math.round(centerSec * 48_000) - aligned.referenceStart;
     const window = difference.subarray(
       Math.max(0, center - halfWindow),
       Math.min(difference.length, center + halfWindow)

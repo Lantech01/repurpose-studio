@@ -1,7 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
-import { createHash } from "node:crypto";
-import { access, copyFile, mkdir, readFile, rm } from "node:fs/promises";
-import os from "node:os";
+import { randomBytes } from "node:crypto";
+import { copyFile, mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 
 import type { ProjectSnapshot, SfxClip } from "@/lib/repurpose/types";
@@ -13,6 +12,7 @@ import {
   currentDurableProjectId,
   seedProjectSnapshot,
 } from "./helpers/project";
+import { validateReusedE2eStorage } from "./helpers/storage-root";
 
 async function readSnapshot(page: Page, projectId: string): Promise<ProjectSnapshot> {
   const response = await page.request.get(`/api/repurpose/projects/${projectId}`, {
@@ -43,23 +43,14 @@ function timelineEnd(clip: SfxClip): number {
 
 async function installLegacyFixture(): Promise<{ filePath: string; cleanup(): Promise<void> }> {
   const source = path.join(GENERATED_FIXTURES, "editable-sfx.wav");
-  const hash = createHash("sha256").update(await readFile(source)).digest("hex");
-  const directory = process.env.REPURPOSE_SFX_CACHE_DIR
-    ? path.resolve(process.env.REPURPOSE_SFX_CACHE_DIR)
-    : path.join(os.homedir(), "Downloads", "repurpose-overlays");
-  const filePath = path.join(directory, `sfx-${hash}.wav`);
-  await mkdir(directory, { recursive: true });
-  let created = false;
-  try {
-    await access(filePath);
-  } catch {
-    await copyFile(source, filePath);
-    created = true;
-  }
+  const { sfxDir } = validateReusedE2eStorage(process.env);
+  const filePath = path.join(sfxDir, `sfx-${randomBytes(32).toString("hex")}.wav`);
+  await mkdir(sfxDir, { recursive: true });
+  await copyFile(source, filePath);
   return {
     filePath,
     async cleanup() {
-      if (created) await rm(filePath, { force: true });
+      await rm(filePath, { force: true });
     },
   };
 }
@@ -67,9 +58,10 @@ async function installLegacyFixture(): Promise<{ filePath: string; cleanup(): Pr
 async function seekToFrame(page: Page, frame: number): Promise<void> {
   await page.keyboard.press("Home");
   for (let index = 0; index < frame; index += 1) await page.keyboard.press("ArrowRight");
+  const expected = (frame / 30).toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
   await expect(page.getByRole("slider", { name: "Playhead" })).toHaveAttribute(
     "aria-valuenow",
-    new RegExp(`^${(frame / 30).toFixed(3).replace(/0+$/, "")}`)
+    expected
   );
 }
 
@@ -169,6 +161,13 @@ test("edits independent effects and preserves manual SFX through regeneration an
     const importedManual = withManualEffects.sfxClips!.find(
       (clip) => clip.origin === "manual" && clip.source.kind === "imported"
     )!;
+    const assetRoot = path.resolve(process.env.REPURPOSE_ASSET_DIR!);
+    const importedAsset = withManualEffects.sfxAssets!.find(
+      (asset) => importedManual.source.kind === "imported" && asset.id === importedManual.source.assetId
+    )!;
+    const importedRelativePath = path.relative(assetRoot, path.resolve(importedAsset.sourcePath));
+    expect(importedRelativePath).not.toBe("");
+    expect(importedRelativePath.startsWith("..") || path.isAbsolute(importedRelativePath)).toBe(false);
     expect(builtInManual.timelineStart).toBeCloseTo(importedManual.timelineStart, 3);
     expect(Math.min(timelineEnd(builtInManual), timelineEnd(importedManual))).toBeGreaterThan(
       Math.max(builtInManual.timelineStart, importedManual.timelineStart)
@@ -285,15 +284,24 @@ test("migrates a legacy SFX bed into previewable clips and saves only the new mo
 }) => {
   test.setTimeout(240_000);
   await page.addInitScript(() => {
-    type GainEvent = { value: number; time: number };
+    type GainEvent = { kind: "set" | "ramp"; value: number; time: number };
     type TrackedParam = AudioParam & { __sfxGainEvents?: GainEvent[] };
-    type TrackedSource = AudioBufferSourceNode & { __sfxGain?: GainNode };
+    type TrackedGain = GainNode & { __sfxDestinationConnected?: boolean };
+    type TrackedSource = AudioBufferSourceNode & { __sfxGain?: TrackedGain };
     const originalConnect = AudioBufferSourceNode.prototype.connect;
     Object.defineProperty(AudioBufferSourceNode.prototype, "connect", {
       configurable: true,
       value: function (this: TrackedSource, destination: AudioNode | AudioParam, ...rest: number[]) {
-        if (destination instanceof GainNode) this.__sfxGain = destination;
+        if (destination instanceof GainNode) this.__sfxGain = destination as TrackedGain;
         return Reflect.apply(originalConnect, this, [destination, ...rest]);
+      },
+    });
+    const originalGainConnect = GainNode.prototype.connect;
+    Object.defineProperty(GainNode.prototype, "connect", {
+      configurable: true,
+      value: function (this: TrackedGain, destination: AudioNode | AudioParam, ...rest: number[]) {
+        if (destination === this.context.destination) this.__sfxDestinationConnected = true;
+        return Reflect.apply(originalGainConnect, this, [destination, ...rest]);
       },
     });
     const originalSetValueAtTime = AudioParam.prototype.setValueAtTime;
@@ -301,8 +309,17 @@ test("migrates a legacy SFX bed into previewable clips and saves only the new mo
       configurable: true,
       value: function (this: TrackedParam, value: number, time: number) {
         this.__sfxGainEvents ??= [];
-        this.__sfxGainEvents.push({ value, time });
+        this.__sfxGainEvents.push({ kind: "set", value, time });
         return Reflect.apply(originalSetValueAtTime, this, [value, time]);
+      },
+    });
+    const originalLinearRamp = AudioParam.prototype.linearRampToValueAtTime;
+    Object.defineProperty(AudioParam.prototype, "linearRampToValueAtTime", {
+      configurable: true,
+      value: function (this: TrackedParam, value: number, time: number) {
+        this.__sfxGainEvents ??= [];
+        this.__sfxGainEvents.push({ kind: "ramp", value, time });
+        return Reflect.apply(originalLinearRamp, this, [value, time]);
       },
     });
     const original = AudioBufferSourceNode.prototype.start;
@@ -315,6 +332,9 @@ test("migrates a legacy SFX bed into previewable clips and saves only the new mo
           offset: number;
           duration?: number;
           gainEvents: GainEvent[];
+          contextState: AudioContextState;
+          sourceConnectedToGain: boolean;
+          gainConnectedToDestination: boolean;
         }>;
       };
       state.__sfxPreviewStarts ??= [];
@@ -325,6 +345,9 @@ test("migrates a legacy SFX bed into previewable clips and saves only the new mo
         offset: args[1] ?? 0,
         duration: args[2],
         gainEvents: [...((this.__sfxGain?.gain as TrackedParam | undefined)?.__sfxGainEvents ?? [])],
+        contextState: this.context.state,
+        sourceConnectedToGain: this.__sfxGain !== undefined,
+        gainConnectedToDestination: this.__sfxGain?.__sfxDestinationConnected === true,
       });
       return Reflect.apply(original, this, args);
     };
@@ -338,6 +361,7 @@ test("migrates a legacy SFX bed into previewable clips and saves only the new mo
       path.join(GENERATED_FIXTURES, "h264-aac.mp4")
     );
     const legacyPath = legacyFixture.filePath;
+    expect(path.dirname(legacyPath)).toBe(path.resolve(process.env.REPURPOSE_SFX_CACHE_DIR!));
     await seedProjectSnapshot<ProjectSnapshot>(page, projectId, (snapshot) => {
       delete snapshot.sfxClips;
       delete snapshot.sfxAssets;
@@ -382,6 +406,8 @@ test("migrates a legacy SFX bed into previewable clips and saves only the new mo
       Math.abs((snapshot.sfxClips?.[0].timelineStart ?? 0) - 10 / 30) < 0.001
     );
     await page.getByRole("slider", { name: "Source in for Legacy Sound Effects" }).fill("0.25");
+    await page.getByRole("slider", { name: "Fade in for Legacy Sound Effects" }).fill("0.1");
+    await page.getByRole("slider", { name: "Fade out for Legacy Sound Effects" }).fill("0.15");
     const editedLegacy = await waitForSnapshot(page, projectId, (snapshot) => {
       const clip = snapshot.sfxClips?.[0];
       return Boolean(
@@ -389,17 +415,75 @@ test("migrates a legacy SFX bed into previewable clips and saves only the new mo
           Math.abs(clip.timelineStart - 10 / 30) < 0.001 &&
           clip.sourceStart === 0.25 &&
           clip.sourceEnd === 1.73 &&
-          clip.gain === 1.37
+          clip.gain === 1.37 &&
+          clip.fadeInSec === 0.1 &&
+          clip.fadeOutSec === 0.15
       );
     });
     expect(editedLegacy.sfxClips![0]).toMatchObject({
       sourceStart: 0.25,
       sourceEnd: 1.73,
       gain: 1.37,
+      fadeInSec: 0.1,
+      fadeOutSec: 0.15,
       origin: "automatic",
       source: { kind: "legacy", sourcePath: legacyPath, srcDuration: 1.73 },
     });
     expect(editedLegacy.sfxClips![0].timelineStart).toBeCloseTo(10 / 30, 12);
+
+    const renderedEvidence = await page.evaluate(async ({ sourcePath, clip }) => {
+      const response = await fetch(`/api/repurpose/sfx?path=${encodeURIComponent(sourcePath)}`);
+      if (!response.ok) throw new Error(`Legacy source fetch failed: ${response.status}`);
+      const decoder = new AudioContext();
+      const sourceBuffer = await decoder.decodeAudioData(await response.arrayBuffer());
+      await decoder.close();
+      const sampleRate = 48_000;
+      const clipDuration = clip.sourceEnd - clip.sourceStart;
+      const renderedDuration = clip.timelineStart + clipDuration + 0.1;
+      const offline = new OfflineAudioContext(1, Math.ceil(renderedDuration * sampleRate), sampleRate);
+      const source = offline.createBufferSource();
+      const gain = offline.createGain();
+      source.buffer = sourceBuffer;
+      source.connect(gain);
+      gain.connect(offline.destination);
+      const start = clip.timelineStart;
+      const end = start + clipDuration;
+      gain.gain.setValueAtTime(0, start);
+      gain.gain.linearRampToValueAtTime(clip.gain, start + clip.fadeInSec);
+      gain.gain.setValueAtTime(clip.gain, end - clip.fadeOutSec);
+      gain.gain.linearRampToValueAtTime(0, end);
+      source.start(start, clip.sourceStart, clipDuration);
+      const rendered = (await offline.startRendering()).getChannelData(0);
+      const rms = (from: number, to: number) => {
+        const first = Math.max(0, Math.floor(from * sampleRate));
+        const last = Math.min(rendered.length, Math.ceil(to * sampleRate));
+        let sum = 0;
+        for (let index = first; index < last; index += 1) sum += rendered[index] ** 2;
+        return last > first ? Math.sqrt(sum / (last - first)) : 0;
+      };
+      let firstAudibleSample = -1;
+      for (let index = 0; index < rendered.length; index += 1) {
+        if (Math.abs(rendered[index]) > 1e-4) {
+          firstAudibleSample = index;
+          break;
+        }
+      }
+      return {
+        firstAudibleSec: firstAudibleSample / sampleRate,
+        beforeRms: rms(0.1, 0.2),
+        fadeRms: rms(start + 0.01, start + 0.03),
+        sustainedRms: rms(start + 0.15, start + 0.25),
+        tailRms: rms(end + 0.02, end + 0.08),
+      };
+    }, {
+      sourcePath: legacyPath,
+      clip: editedLegacy.sfxClips![0],
+    });
+    expect(renderedEvidence.firstAudibleSec).toBeCloseTo(10 / 30, 2);
+    expect(renderedEvidence.beforeRms).toBeLessThan(1e-6);
+    expect(renderedEvidence.fadeRms).toBeGreaterThan(0.001);
+    expect(renderedEvidence.sustainedRms).toBeGreaterThan(renderedEvidence.fadeRms * 2);
+    expect(renderedEvidence.tailRms).toBeLessThan(1e-6);
 
     await page.getByRole("button", { name: "Go to start", exact: true }).click();
     const sourceResponse = page.waitForResponse((response) => {
@@ -432,7 +516,10 @@ test("migrates a legacy SFX bed into previewable clips and saves only the new mo
           playhead: number;
           offset: number;
           duration?: number;
-          gainEvents: Array<{ value: number; time: number }>;
+          gainEvents: Array<{ kind: "set" | "ramp"; value: number; time: number }>;
+          contextState: AudioContextState;
+          sourceConnectedToGain: boolean;
+          gainConnectedToDestination: boolean;
         }>;
       }).__sfxPreviewStarts ?? []
     );
@@ -440,13 +527,24 @@ test("migrates a legacy SFX bed into previewable clips and saves only the new mo
       Math.abs(start.offset - 0.25) < 0.001 &&
       Math.abs((start.duration ?? 0) - 1.48) < 0.01 &&
       start.gainEvents.some(
-        (event) => Math.abs(event.value - 1.37) < 0.001 && Math.abs(event.time - start.when) < 0.001
-      )
+        (event) => event.kind === "set" && event.value === 0 && Math.abs(event.time - start.when) < 0.001
+      ) &&
+      start.gainEvents.some(
+        (event) => event.kind === "ramp" && Math.abs(event.value - 1.37) < 0.001 &&
+          Math.abs(event.time - (start.when + 0.1)) < 0.01
+      ) &&
+      start.contextState === "running" &&
+      start.sourceConnectedToGain &&
+      start.gainConnectedToDestination
     );
     expect(scheduledLegacy).toBeDefined();
     expect(
       scheduledLegacy!.playhead + scheduledLegacy!.when - scheduledLegacy!.contextTime
     ).toBeCloseTo(10 / 30, 1);
+    await expect.poll(async () => Number(
+      await page.getByRole("slider", { name: "Playhead" }).getAttribute("aria-valuenow")
+    )).toBeGreaterThan(0.1);
+    await expect(page.getByRole("status", { name: "Sound effect preview warning" })).toHaveCount(0);
     await page.getByRole("button", { name: "Pause", exact: true }).click();
 
     await page.getByRole("button", { name: "Generate automatic effects", exact: true }).click();

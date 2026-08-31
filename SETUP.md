@@ -114,14 +114,17 @@ You describe the feature, the agent writes the code, you approve it. That is the
 
 You can also import `.wav`, `.mp3`, and `.m4a` effects. Imports are copied into the current project's sound-effect library and remain scoped to that project.
 
+Imported media defaults to `~/Downloads/repurpose-overlays`. Set `REPURPOSE_ASSET_DIR` before starting the app to use a different local asset root.
+
 The pinned Python environment is retained only for legacy POST renderer and integration compatibility tests. To run those compatibility tests, install the pinned `uv` release and synchronize the committed lockfile:
 
 ```bash
 python -m pip install uv==0.11.2
 uv sync --frozen --project scripts/sfx-engine
+npm test -- tests/integration/sfx-engine.test.ts tests/integration/sfx-catalog.test.ts
 ```
 
-To run those tests against a compatible legacy renderer directory, set:
+To configure and run the legacy POST endpoint against a compatible renderer directory, set:
 
 ```bash
 REPURPOSE_SFX_ENGINE_DIR=/path/to/your/sfx-engine npm run dev

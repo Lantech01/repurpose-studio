@@ -3,10 +3,10 @@ import 'server-only';
 // ===========================================================================
 // lib/repurpose/projects.ts  —  disk-backed project store for Repurpose Studio
 // ===========================================================================
-// Each project is one JSON file under ~/Downloads/repurpose-projects named
-// <id>.json. The id IS the filename stem, so ID_RE below is the ONLY security
-// gate we need: it forbids `/`, `\`, `.`, `..`, and any traversal, and we only
-// ever touch our OWN fixed PROJECTS_DIR. Because the dir is fixed and the id is
+// Each project is one JSON file under PROJECTS_DIR (by default
+// ~/Downloads/repurpose-projects) named <id>.json. The id IS the filename stem,
+// so ID_RE below is the security gate: it forbids `/`, `\`, `.`, `..`, and any
+// traversal. Because the configured root is server-owned and the id is
 // regex-clamped to a single path segment, there is no way to escape it, so NO
 // realpath allow-list is needed here (unlike /api/repurpose/asset, which serves
 // arbitrary user-picked absolute paths). Node runtime required for fs.
@@ -14,17 +14,13 @@ import 'server-only';
 
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import os from 'node:os';
 import path from 'node:path';
 
 import type { ProjectSnapshot } from './types';
 import { isApprovedSfxKey } from './sfx-effects';
+import { resolveRepurposeProjectsDir } from './project-root';
 
-export const PROJECTS_DIR = path.join(
-  os.homedir(),
-  'Downloads',
-  'repurpose-projects',
-);
+export const PROJECTS_DIR = resolveRepurposeProjectsDir();
 
 // Single path segment: lowercase alnum start, then alnum/hyphen, 1..100 chars.
 // Forbids `/ \ . ..` and traversal because none of those characters match.
