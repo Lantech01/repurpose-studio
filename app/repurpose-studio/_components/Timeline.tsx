@@ -36,7 +36,8 @@ import {
 } from "@/lib/repurpose/overlay-ingest";
 import { ClipBlock } from "./ClipBlock";
 import { OverlayBlock, useOverlayThumbnails } from "./OverlayBlock";
-import { SfxClipBlock, type SfxPointerStart } from "./SfxClipBlock";
+import { SfxClipBlock } from "./SfxClipBlock";
+import type { TimelinePointerStart } from "./timeline-pointer";
 import { useSfxWaveform } from "./useSfxWaveform";
 import { TransportBar } from "./TransportBar";
 import {
@@ -88,7 +89,10 @@ export interface TimelineProps {
  */
 type ReorderSibling = { id: string; center: number };
 
-type DragKind =
+type DragKind = {
+  pointerId: number;
+  captureTarget: HTMLElement;
+} & (
   | { type: "playhead" }
   | {
       type: "clip-body";
@@ -118,14 +122,19 @@ type DragKind =
       clip: SfxClip;
       edge: "body" | "start" | "end";
       startClientX: number;
-      pointerId: number;
-      captureTarget: HTMLButtonElement;
       token: string | null;
-    };
+    }
+);
 
-type SfxDrag = Extract<DragKind, { type: "sfx" }>;
+function captureTimelinePointer(pointer: TimelinePointerStart): void {
+  try {
+    pointer.captureTarget.setPointerCapture(pointer.pointerId);
+  } catch {
+    // Pointer capture is optional in test DOMs and may fail for a detached target.
+  }
+}
 
-function releaseSfxPointerCapture(drag: SfxDrag): void {
+function releaseTimelinePointerCapture(drag: DragKind): void {
   try {
     if (drag.captureTarget.hasPointerCapture(drag.pointerId)) {
       drag.captureTarget.releasePointerCapture(drag.pointerId);
@@ -717,8 +726,13 @@ export function Timeline({
     }
   }, []);
 
+  const canStartTimelineDrag = useCallback((_pointerId: number): boolean => (
+    dragRef.current === null
+  ), []);
+
   const startPlayheadScrub = useCallback(
     (e: React.PointerEvent<HTMLDivElement>, seek: boolean) => {
+      if (!canStartTimelineDrag(e.pointerId)) return;
       // Grabbing the playhead again stops any in-flight release coast so it can't
       // fight the fresh scrub, and clears leftover velocity so a plain click
       // (no movement) after a prior fling can't coast off the clicked frame.
@@ -728,12 +742,17 @@ export function Timeline({
         const t = clientXToTime(e.clientX);
         setPlayhead(clamp(t, 0, duration));
       }
-      dragRef.current = { type: "playhead" };
+      const pointer = {
+        clientX: e.clientX,
+        pointerId: e.pointerId,
+        captureTarget: e.currentTarget,
+      };
+      captureTimelinePointer(pointer);
+      dragRef.current = { type: "playhead", ...pointer };
       lastScrubClientXRef.current = e.clientX;
       lastScrubTsRef.current = performance.now();
-      e.currentTarget.setPointerCapture(e.pointerId);
     },
-    [clientXToTime, setPlayhead, duration, stopCoast]
+    [canStartTimelineDrag, clientXToTime, setPlayhead, duration, stopCoast]
   );
 
   // Ruler + empty-track background: click/drag anywhere seeks the play mark to
@@ -762,7 +781,8 @@ export function Timeline({
 
   // ---- clip body drag (reorder) ---------------------------------------------
   const handleClipBodyDragStart = useCallback(
-    (clip: Clip, clientX: number) => {
+    (clip: Clip, pointer: TimelinePointerStart) => {
+      if (!canStartTimelineDrag(pointer.pointerId)) return;
       stopCoast();
       // Freeze the OTHER kept clips' centers now, at drag start. The reorder
       // target is computed against this stable snapshot on every move so a
@@ -771,71 +791,82 @@ export function Timeline({
         .filter((c) => c.kept && c.id !== clip.id)
         .map((c) => ({ id: c.id, center: (c.timelineStart + c.timelineEnd) / 2 }))
         .sort((a, b) => a.center - b.center);
+      captureTimelinePointer(pointer);
       dragRef.current = {
         type: "clip-body",
         clip,
-        startClientX: clientX,
+        startClientX: pointer.clientX,
         startTimelineStart: clip.timelineStart,
         siblings,
+        pointerId: pointer.pointerId,
+        captureTarget: pointer.captureTarget,
       };
     },
-    [clips, stopCoast]
+    [canStartTimelineDrag, clips, stopCoast]
   );
 
   // ---- clip edge drag (trim) -------------------------------------------------
   const handleClipEdgeDragStart = useCallback(
-    (clip: Clip, edge: "start" | "end", clientX: number) => {
+    (clip: Clip, edge: "start" | "end", pointer: TimelinePointerStart) => {
+      if (!canStartTimelineDrag(pointer.pointerId)) return;
       stopCoast();
+      captureTimelinePointer(pointer);
       dragRef.current = {
         type: "clip-edge",
         clip,
         edge,
-        startClientX: clientX,
+        startClientX: pointer.clientX,
         startSrcStart: clip.srcStart,
         startSrcEnd: clip.srcEnd,
+        pointerId: pointer.pointerId,
+        captureTarget: pointer.captureTarget,
       };
     },
-    [stopCoast]
+    [canStartTimelineDrag, stopCoast]
   );
 
   // ---- overlay body drag (slide in output time -- NO ripple) -----------------
   const handleOverlayBodyDragStart = useCallback(
-    (overlay: Overlay, clientX: number) => {
+    (overlay: Overlay, pointer: TimelinePointerStart) => {
+      if (!canStartTimelineDrag(pointer.pointerId)) return;
       stopCoast();
+      captureTimelinePointer(pointer);
       dragRef.current = {
         type: "overlay-body",
         overlay,
-        startClientX: clientX,
+        startClientX: pointer.clientX,
         startTimelineStart: overlay.timelineStart,
+        pointerId: pointer.pointerId,
+        captureTarget: pointer.captureTarget,
       };
     },
-    [stopCoast]
+    [canStartTimelineDrag, stopCoast]
   );
 
   // ---- overlay edge drag (trim one edge, frozen-anchor absolute target) -------
   const handleOverlayEdgeDragStart = useCallback(
-    (overlay: Overlay, edge: "start" | "end", clientX: number) => {
+    (overlay: Overlay, edge: "start" | "end", pointer: TimelinePointerStart) => {
+      if (!canStartTimelineDrag(pointer.pointerId)) return;
       stopCoast();
+      captureTimelinePointer(pointer);
       dragRef.current = {
         type: "overlay-edge",
         overlay,
         edge,
-        startClientX: clientX,
+        startClientX: pointer.clientX,
         startTimelineStart: overlay.timelineStart,
         startTimelineEnd: overlay.timelineEnd,
+        pointerId: pointer.pointerId,
+        captureTarget: pointer.captureTarget,
       };
     },
-    [stopCoast]
+    [canStartTimelineDrag, stopCoast]
   );
 
-  const handleSfxBodyDragStart = useCallback((clip: SfxClip, pointer: SfxPointerStart) => {
-    if (dragRef.current) return;
+  const handleSfxBodyDragStart = useCallback((clip: SfxClip, pointer: TimelinePointerStart) => {
+    if (!canStartTimelineDrag(pointer.pointerId)) return;
     stopCoast();
-    try {
-      pointer.captureTarget.setPointerCapture(pointer.pointerId);
-    } catch {
-      // Pointer capture is optional in test DOMs and may fail for a detached target.
-    }
+    captureTimelinePointer(pointer);
     dragRef.current = {
       type: "sfx",
       clip,
@@ -845,16 +876,12 @@ export function Timeline({
       captureTarget: pointer.captureTarget,
       token: null,
     };
-  }, [stopCoast]);
+  }, [canStartTimelineDrag, stopCoast]);
 
-  const handleSfxEdgeDragStart = useCallback((clip: SfxClip, edge: "start" | "end", pointer: SfxPointerStart) => {
-    if (dragRef.current) return;
+  const handleSfxEdgeDragStart = useCallback((clip: SfxClip, edge: "start" | "end", pointer: TimelinePointerStart) => {
+    if (!canStartTimelineDrag(pointer.pointerId)) return;
     stopCoast();
-    try {
-      pointer.captureTarget.setPointerCapture(pointer.pointerId);
-    } catch {
-      // Pointer capture is optional in test DOMs and may fail for a detached target.
-    }
+    captureTimelinePointer(pointer);
     dragRef.current = {
       type: "sfx",
       clip,
@@ -864,11 +891,11 @@ export function Timeline({
       captureTarget: pointer.captureTarget,
       token: null,
     };
-  }, [stopCoast]);
+  }, [canStartTimelineDrag, stopCoast]);
 
   useEffect(() => useRepurposeStore.getState().subscribeSfxGestureCancellation(() => {
     if (dragRef.current?.type === "sfx") {
-      releaseSfxPointerCapture(dragRef.current);
+      releaseTimelinePointerCapture(dragRef.current);
       dragRef.current = null;
     }
     setSnapGuideX(null);
@@ -919,7 +946,7 @@ export function Timeline({
     const handleMove = (e: PointerEvent) => {
       const drag = dragRef.current;
       if (!drag) return;
-      if (drag.type === "sfx" && e.pointerId !== drag.pointerId) return;
+      if (e.pointerId !== drag.pointerId) return;
       const {
         clientXToTime,
         clips,
@@ -1115,11 +1142,11 @@ export function Timeline({
 
     const handleUp = (e: PointerEvent) => {
       const drag = dragRef.current;
-      if (drag?.type === "sfx" && e.pointerId !== drag.pointerId) return;
+      if (drag && e.pointerId !== drag.pointerId) return;
       dragRef.current = null;
       setSnapGuideX(null);
+      if (drag) releaseTimelinePointerCapture(drag);
       if (drag?.type === "sfx") {
-        releaseSfxPointerCapture(drag);
         if (drag.token) endSfxGesture(drag.token);
       }
       if (drag?.type === "playhead") {
@@ -1134,11 +1161,11 @@ export function Timeline({
 
     const handleCancel = (e: PointerEvent) => {
       const drag = dragRef.current;
-      if (drag?.type === "sfx" && e.pointerId !== drag.pointerId) return;
+      if (drag && e.pointerId !== drag.pointerId) return;
       dragRef.current = null;
       setSnapGuideX(null);
+      if (drag) releaseTimelinePointerCapture(drag);
       if (drag?.type === "sfx") {
-        releaseSfxPointerCapture(drag);
         if (drag.token) cancelSfxGesture(drag.token);
       }
     };
@@ -1151,10 +1178,10 @@ export function Timeline({
       window.removeEventListener("pointerup", handleUp);
       window.removeEventListener("pointercancel", handleCancel);
       const drag = dragRef.current;
-      if (drag?.type === "sfx") {
+      if (drag) {
         dragRef.current = null;
-        releaseSfxPointerCapture(drag);
-        if (drag.token) cancelSfxGesture(drag.token);
+        releaseTimelinePointerCapture(drag);
+        if (drag.type === "sfx" && drag.token) cancelSfxGesture(drag.token);
       }
       // NOTE: do NOT cancel momentumRafRef here. The coast is owned by its own
       // unmount-only effect (see below); cancelling it on every re-render is
@@ -1939,8 +1966,8 @@ function TimelineSfxBlock({
   onSelect: (id: string) => void;
   onMoveBy: (id: string, delta: number) => void;
   onTrimBy: (id: string, edge: "start" | "end", delta: number) => void;
-  onBodyPointerDown: (clip: SfxClip, pointer: SfxPointerStart) => void;
-  onEdgePointerDown: (clip: SfxClip, edge: "start" | "end", pointer: SfxPointerStart) => void;
+  onBodyPointerDown: (clip: SfxClip, pointer: TimelinePointerStart) => void;
+  onEdgePointerDown: (clip: SfxClip, edge: "start" | "end", pointer: TimelinePointerStart) => void;
   onDelete: (id: string) => void;
 }) {
   const source = resolveSfxSource(clip.source, assets);

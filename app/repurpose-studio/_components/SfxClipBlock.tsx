@@ -11,12 +11,7 @@ import {
   waveformRenderMetrics,
   type FaceWaveform,
 } from "./useFaceWaveform";
-
-export interface SfxPointerStart {
-  clientX: number;
-  pointerId: number;
-  captureTarget: HTMLButtonElement;
-}
+import type { TimelinePointerStart } from "./timeline-pointer";
 
 export interface SfxClipBlockProps {
   clip: SfxClip;
@@ -33,8 +28,8 @@ export interface SfxClipBlockProps {
   onSelect: (id: string) => void;
   onMoveBy: (id: string, delta: number) => void;
   onTrimBy: (id: string, edge: "start" | "end", delta: number) => void;
-  onBodyPointerDown: (clip: SfxClip, pointer: SfxPointerStart) => void;
-  onEdgePointerDown: (clip: SfxClip, edge: "start" | "end", pointer: SfxPointerStart) => void;
+  onBodyPointerDown: (clip: SfxClip, pointer: TimelinePointerStart) => void;
+  onEdgePointerDown: (clip: SfxClip, edge: "start" | "end", pointer: TimelinePointerStart) => void;
   onDelete: (id: string) => void;
 }
 

@@ -6,11 +6,37 @@ import { SfxPanel } from "@/app/repurpose-studio/_components/SfxPanel";
 import { SFX_DRAG_MIME } from "@/lib/repurpose/sfx-drag";
 import { createSfxImportOwner, registerSfxImportOwner, releaseSfxImportOwner } from "@/lib/repurpose/sfx-ingest-client";
 import { useRepurposeStore } from "@/lib/repurpose/store";
-import type { Clip, SfxClip } from "@/lib/repurpose/types";
+import type { Clip, Overlay, SfxClip } from "@/lib/repurpose/types";
 
-vi.mock("@/app/repurpose-studio/_components/ClipBlock", () => ({ ClipBlock: () => null }));
+vi.mock("@/app/repurpose-studio/_components/ClipBlock", () => ({
+  ClipBlock: ({ clip, onDragBodyStart, onDragEdgeStart }: {
+    clip: Clip;
+    onDragBodyStart: (clip: Clip, pointer: { clientX: number; pointerId: number; captureTarget: HTMLDivElement }) => void;
+    onDragEdgeStart: (clip: Clip, edge: "start" | "end", pointer: { clientX: number; pointerId: number; captureTarget: HTMLButtonElement }) => void;
+  }) => <div data-testid={`scene-body-${clip.id}`} onPointerDown={(event) => {
+    event.stopPropagation();
+    onDragBodyStart(clip, { clientX: event.clientX, pointerId: event.pointerId, captureTarget: event.currentTarget });
+  }}>
+    <button data-testid={`scene-trim-${clip.id}`} onPointerDown={(event) => {
+      event.stopPropagation();
+      onDragEdgeStart(clip, "start", { clientX: event.clientX, pointerId: event.pointerId, captureTarget: event.currentTarget });
+    }} />
+  </div>,
+}));
 vi.mock("@/app/repurpose-studio/_components/OverlayBlock", () => ({
-  OverlayBlock: () => null,
+  OverlayBlock: ({ overlay, onDragBodyStart, onDragEdgeStart }: {
+    overlay: Overlay;
+    onDragBodyStart: (overlay: Overlay, pointer: { clientX: number; pointerId: number; captureTarget: HTMLDivElement }) => void;
+    onDragEdgeStart: (overlay: Overlay, edge: "start" | "end", pointer: { clientX: number; pointerId: number; captureTarget: HTMLButtonElement }) => void;
+  }) => <div data-testid={`overlay-body-${overlay.id}`} onPointerDown={(event) => {
+    event.stopPropagation();
+    onDragBodyStart(overlay, { clientX: event.clientX, pointerId: event.pointerId, captureTarget: event.currentTarget });
+  }}>
+    <button data-testid={`overlay-trim-${overlay.id}`} onPointerDown={(event) => {
+      event.stopPropagation();
+      onDragEdgeStart(overlay, "start", { clientX: event.clientX, pointerId: event.pointerId, captureTarget: event.currentTarget });
+    }} />
+  </div>,
   useOverlayThumbnails: () => new Map(),
 }));
 vi.mock("@/app/repurpose-studio/_components/TransportBar", () => ({ TransportBar: () => null }));
@@ -44,6 +70,35 @@ function effect(overrides: Partial<SfxClip> = {}): SfxClip {
     origin: "manual", timelineStart: 1, sourceStart: 0, sourceEnd: 2,
     gain: 1, fadeInSec: 0, fadeOutSec: 0, muted: false, ...overrides,
   };
+}
+
+function overlay(): Overlay {
+  return {
+    id: "overlay",
+    kind: "image",
+    src: "/overlay.png",
+    naturalWidth: 100,
+    naturalHeight: 100,
+    timelineStart: 1,
+    timelineEnd: 3,
+    srcStart: 0,
+    srcDuration: 0,
+    transform: { x: 0.5, y: 0.5, scale: 1, rotation: 0 },
+    zIndex: 0,
+    opacity: 1,
+    band: "screen",
+  };
+}
+
+function rulerWithPointerCapture(): HTMLElement {
+  const rulerLabel = screen.getByText("0:00");
+  const timelineContent = rulerLabel.parentElement?.parentElement?.parentElement as HTMLElement;
+  Object.defineProperties(timelineContent, {
+    setPointerCapture: { configurable: true, value: vi.fn() },
+    hasPointerCapture: { configurable: true, value: vi.fn().mockReturnValue(true) },
+    releasePointerCapture: { configurable: true, value: vi.fn() },
+  });
+  return rulerLabel;
 }
 
 beforeEach(() => {
@@ -134,6 +189,79 @@ describe("Timeline real SFX interactions", () => {
     expect(releasePointerCapture).toHaveBeenCalledWith(31);
     useRepurposeStore.getState().undo();
     expect(useRepurposeStore.getState().sfxClips[0]).toMatchObject(effect());
+  });
+
+  it.each([
+    ["ruler", () => screen.getByText("0:00")],
+    ["scene body", () => screen.getByTestId("scene-body-first")],
+    ["scene trim", () => screen.getByTestId("scene-trim-first")],
+    ["overlay body", () => screen.getByTestId("overlay-body-overlay")],
+    ["overlay trim", () => screen.getByTestId("overlay-trim-overlay")],
+    ["another SFX trim", () => screen.getByRole("slider", { name: "Trim Other start" })],
+  ])("does not let a secondary %s pointerdown steal an active SFX drag", (_label, secondaryTarget) => {
+    useRepurposeStore.setState({
+      overlays: [overlay()],
+      sfxClips: [effect(), effect({ id: "other", name: "Other", timelineStart: 4 })],
+      past: [],
+      future: [],
+    });
+    render(<Timeline />);
+    rulerWithPointerCapture();
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: /Select Impact/ }), {
+      button: 0,
+      clientX: 90,
+      pointerId: 101,
+    });
+    fireEvent.pointerDown(secondaryTarget(), { button: 0, clientX: 360, pointerId: 202 });
+    fireEvent.pointerMove(window, { clientX: 450, pointerId: 202 });
+    fireEvent.pointerUp(window, { pointerId: 202 });
+    fireEvent.pointerCancel(window, { pointerId: 202 });
+
+    expect(useRepurposeStore.getState().sfxClips[0]).toMatchObject(effect());
+    expect(useRepurposeStore.getState().past).toEqual([]);
+
+    fireEvent.pointerMove(window, { clientX: 180, pointerId: 101 });
+    fireEvent.pointerUp(window, { pointerId: 101 });
+
+    expect(useRepurposeStore.getState().sfxClips[0].timelineStart).toBe(2);
+    expect(useRepurposeStore.getState().past).toHaveLength(1);
+    useRepurposeStore.getState().undo();
+    expect(useRepurposeStore.getState().sfxClips[0]).toMatchObject(effect());
+  });
+
+  it("keeps a playhead owner from an SFX secondary and allows a new gesture after completion", () => {
+    render(<Timeline />);
+    const ruler = rulerWithPointerCapture();
+
+    fireEvent.pointerDown(ruler, { button: 0, clientX: 90, pointerId: 301 });
+    expect(useRepurposeStore.getState().playhead).toBe(1);
+    fireEvent.pointerDown(screen.getByRole("button", { name: /Select Impact/ }), {
+      button: 0,
+      clientX: 90,
+      pointerId: 302,
+    });
+    fireEvent.pointerMove(window, { clientX: 360, pointerId: 302 });
+    fireEvent.pointerUp(window, { pointerId: 302 });
+    fireEvent.pointerCancel(window, { pointerId: 302 });
+
+    expect(useRepurposeStore.getState().playhead).toBe(1);
+    expect(useRepurposeStore.getState().sfxClips[0]).toMatchObject(effect());
+
+    fireEvent.pointerMove(window, { clientX: 180, pointerId: 301 });
+    fireEvent.pointerUp(window, { pointerId: 301 });
+    expect(useRepurposeStore.getState().playhead).toBe(2);
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: /Select Impact/ }), {
+      button: 0,
+      clientX: 90,
+      pointerId: 303,
+    });
+    fireEvent.pointerMove(window, { clientX: 180, pointerId: 303 });
+    fireEvent.pointerUp(window, { pointerId: 303 });
+
+    expect(useRepurposeStore.getState().sfxClips[0].timelineStart).toBe(2);
+    expect(useRepurposeStore.getState().past).toHaveLength(1);
   });
 
   it.each([

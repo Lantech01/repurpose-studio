@@ -5,6 +5,7 @@ import { TrashSimple, ArrowCounterClockwise, Star } from "@phosphor-icons/react"
 import type { Clip, Word } from "@/lib/repurpose/types";
 import { formatTimecode } from "./timeline-utils";
 import { sliceClipPeaks, type FaceWaveform } from "./useFaceWaveform";
+import type { TimelinePointerStart } from "./timeline-pointer";
 
 interface ClipBlockProps {
   clip: Clip;
@@ -14,8 +15,8 @@ interface ClipBlockProps {
   trackHeight: number;
   isSelected: boolean;
   onSelect: (id: string) => void;
-  onDragBodyStart: (clip: Clip, pointerX: number) => void;
-  onDragEdgeStart: (clip: Clip, edge: "start" | "end", pointerX: number) => void;
+  onDragBodyStart: (clip: Clip, pointer: TimelinePointerStart) => void;
+  onDragEdgeStart: (clip: Clip, edge: "start" | "end", pointer: TimelinePointerStart) => void;
   onDelete: (id: string) => void;
   onRestore: (id: string) => void;
   /**
@@ -486,7 +487,11 @@ export function ClipBlock({
 
       // CLIP-MOVE mode: select the scene + start the body (reorder) drag.
       onSelect(clip.id);
-      onDragBodyStart(clip, e.clientX);
+      onDragBodyStart(clip, {
+        clientX: e.clientX,
+        pointerId: e.pointerId,
+        captureTarget: e.currentTarget,
+      });
     },
     [
       clip,
@@ -640,7 +645,11 @@ export function ClipBlock({
       e.stopPropagation();
       e.preventDefault();
       onSelect(clip.id);
-      onDragEdgeStart(clip, edge, e.clientX);
+      onDragEdgeStart(clip, edge, {
+        clientX: e.clientX,
+        pointerId: e.pointerId,
+        captureTarget: e.currentTarget,
+      });
     },
     [clip, onSelect, onDragEdgeStart]
   );
