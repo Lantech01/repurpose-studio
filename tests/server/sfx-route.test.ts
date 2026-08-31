@@ -963,14 +963,15 @@ describe("SFX route", () => {
       utimes(referencedPath, oldTime, oldTime),
       utimes(eligiblePath, oldTime, oldTime),
     ]);
-    vi.doMock("@/lib/repurpose/projects", () => ({
-      listReferencedSfxPaths: () => new Set([path.resolve(referencedPath).toLowerCase()]),
+    const referenceIdentity = process.platform === "win32"
+      ? path.normalize(path.resolve(referencedPath)).toLowerCase()
+      : path.normalize(path.resolve(referencedPath));
+    vi.doMock("@/lib/repurpose/projects", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("@/lib/repurpose/projects")>()),
+      listReferencedSfxPaths: () => new Set([referenceIdentity]),
       withProjectReferenceSnapshot: async <T>(
         operation: (references: ReadonlySet<string>) => Promise<T> | T
-      ) => operation(new Set([path.resolve(referencedPath).toLowerCase()])),
-      normalizeProjectMediaPath: (value: unknown) => typeof value === "string"
-        ? path.resolve(value).toLowerCase()
-        : null,
+      ) => operation(new Set([referenceIdentity])),
     }));
     const mockedExecFile = vi.fn((
       _file: string,

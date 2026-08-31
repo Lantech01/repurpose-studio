@@ -216,28 +216,55 @@ function nextMediaAssetId(): string {
   return `asset-${mediaAssetIdCounter}`;
 }
 
-let sfxClipIdCounter = 0;
-function nextSfxClipId(): string {
-  sfxClipIdCounter += 1;
-  return `sfx-clip-${sfxClipIdCounter}`;
+const SFX_ID_SUFFIX_CEILING = 1_000_000_000;
+
+function safeIdSuffix(id: string, prefix: string): number | null {
+  if (!id.startsWith(prefix)) return null;
+  const raw = id.slice(prefix.length);
+  if (!/^(0|[1-9]\d*)$/.test(raw)) return null;
+  const suffix = Number(raw);
+  return Number.isSafeInteger(suffix) && suffix >= 0 && suffix < SFX_ID_SUFFIX_CEILING
+    ? suffix
+    : null;
 }
 
+function nextAvailableSfxId(
+  prefix: "sfx-clip-" | "sfx-asset-",
+  counter: number,
+  usedIds: ReadonlySet<string>
+): { id: string; suffix: number } {
+  const occupied = new Set<number>();
+  for (const id of usedIds) {
+    const suffix = safeIdSuffix(id, prefix);
+    if (suffix !== null && suffix > 0) occupied.add(suffix);
+  }
+  const safeCounter = Number.isSafeInteger(counter)
+    && counter >= 0
+    && counter < SFX_ID_SUFFIX_CEILING
+    ? counter
+    : 0;
+  let suffix = safeCounter >= SFX_ID_SUFFIX_CEILING - 1 ? 1 : safeCounter + 1;
+  for (let attempts = 0; attempts <= occupied.size; attempts += 1) {
+    if (!occupied.has(suffix)) return { id: `${prefix}${suffix}`, suffix };
+    suffix = suffix >= SFX_ID_SUFFIX_CEILING - 1 ? 1 : suffix + 1;
+  }
+  throw new Error("No safe SFX IDs are available");
+}
+
+let sfxClipIdCounter = 0;
+
 function nextAvailableSfxClipId(usedIds: ReadonlySet<string>): string {
-  let id = nextSfxClipId();
-  while (usedIds.has(id)) id = nextSfxClipId();
-  return id;
+  const allocation = nextAvailableSfxId("sfx-clip-", sfxClipIdCounter, usedIds);
+  sfxClipIdCounter = allocation.suffix;
+  return allocation.id;
 }
 
 let sfxAssetIdCounter = 0;
-function nextSfxAssetId(): string {
-  sfxAssetIdCounter += 1;
-  return `sfx-asset-${sfxAssetIdCounter}`;
-}
 
 function nextAvailableSfxAssetId(usedIds: ReadonlySet<string>): string {
-  let id = nextSfxAssetId();
-  while (usedIds.has(id)) id = nextSfxAssetId();
-  return id;
+  const allocation = nextAvailableSfxId("sfx-asset-", sfxAssetIdCounter, usedIds);
+  sfxAssetIdCounter = allocation.suffix;
+  return allocation.id;
 }
 
 // Sane default visible window (output seconds) for a freshly-added overlay: a
@@ -298,9 +325,9 @@ function densePackOverlayZ(overlays: Overlay[]): Overlay[] {
 function maxIdSuffix(ids: (string | undefined)[], prefix: string): number {
   let max = 0;
   for (const id of ids) {
-    if (typeof id !== "string" || !id.startsWith(prefix)) continue;
-    const n = Number.parseInt(id.slice(prefix.length), 10);
-    if (Number.isFinite(n) && n > max) max = n;
+    if (typeof id !== "string") continue;
+    const suffix = safeIdSuffix(id, prefix);
+    if (suffix !== null && suffix > max) max = suffix;
   }
   return max;
 }

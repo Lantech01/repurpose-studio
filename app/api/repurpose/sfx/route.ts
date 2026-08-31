@@ -123,15 +123,20 @@ function isUnder(root: string, target: string): boolean {
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
+function cachePathIdentity(filePath: string): string {
+  return normalizeProjectMediaPath(filePath) ?? filePath;
+}
+
 function isFileProtected(
   filePath: string,
   projectReferences: ReadonlySet<string>,
   extraProtected: ReadonlySet<string>
 ): boolean {
-  return extraProtected.has(filePath) ||
-    runtimeState.activeFiles.has(filePath) ||
-    (runtimeState.servingFiles.get(filePath) ?? 0) > 0 ||
-    projectReferences.has(normalizeProjectMediaPath(filePath) ?? "");
+  const identity = cachePathIdentity(filePath);
+  return extraProtected.has(identity) ||
+    runtimeState.activeFiles.has(identity) ||
+    (runtimeState.servingFiles.get(identity) ?? 0) > 0 ||
+    projectReferences.has(identity);
 }
 
 async function performCacheSweep(extraProtected: ReadonlySet<string>): Promise<void> {
@@ -165,7 +170,7 @@ async function performCacheSweep(extraProtected: ReadonlySet<string>): Promise<v
 }
 
 function sweepCache(extraProtected?: string): Promise<void> {
-  if (extraProtected) runtimeState.sweepExtraProtected.add(extraProtected);
+  if (extraProtected) runtimeState.sweepExtraProtected.add(cachePathIdentity(extraProtected));
   if (runtimeState.sweepRunning) {
     runtimeState.sweepPending = true;
     return runtimeState.sweepRunning;
@@ -385,9 +390,9 @@ async function renderTrack(
   const unique = randomUUID();
   const eventsPath = path.join(SFX_DIR, `sfx-${hash}-${unique}.events.json`);
   const partialPath = path.join(SFX_DIR, `sfx-${hash}-${unique}.partial.wav`);
-  runtimeState.activeFiles.add(finalPath);
-  runtimeState.activeFiles.add(eventsPath);
-  runtimeState.activeFiles.add(partialPath);
+  runtimeState.activeFiles.add(cachePathIdentity(finalPath));
+  runtimeState.activeFiles.add(cachePathIdentity(eventsPath));
+  runtimeState.activeFiles.add(cachePathIdentity(partialPath));
 
   try {
     await mkdir(SFX_DIR, { recursive: true });
@@ -456,9 +461,9 @@ async function renderTrack(
       rm(eventsPath, { force: true }).catch(() => {}),
       rm(partialPath, { force: true }).catch(() => {}),
     ]);
-    runtimeState.activeFiles.delete(eventsPath);
-    runtimeState.activeFiles.delete(partialPath);
-    runtimeState.activeFiles.delete(finalPath);
+    runtimeState.activeFiles.delete(cachePathIdentity(eventsPath));
+    runtimeState.activeFiles.delete(cachePathIdentity(partialPath));
+    runtimeState.activeFiles.delete(cachePathIdentity(finalPath));
   }
 }
 
@@ -656,14 +661,15 @@ function parseRange(header: string, size: number): { start: number; end: number 
 }
 
 function acquireServingLease(filePath: string): (requestSweep: boolean) => void {
-  runtimeState.servingFiles.set(filePath, (runtimeState.servingFiles.get(filePath) ?? 0) + 1);
+  const identity = cachePathIdentity(filePath);
+  runtimeState.servingFiles.set(identity, (runtimeState.servingFiles.get(identity) ?? 0) + 1);
   let released = false;
   return (requestSweep: boolean) => {
     if (released) return;
     released = true;
-    const remaining = (runtimeState.servingFiles.get(filePath) ?? 1) - 1;
-    if (remaining > 0) runtimeState.servingFiles.set(filePath, remaining);
-    else runtimeState.servingFiles.delete(filePath);
+    const remaining = (runtimeState.servingFiles.get(identity) ?? 1) - 1;
+    if (remaining > 0) runtimeState.servingFiles.set(identity, remaining);
+    else runtimeState.servingFiles.delete(identity);
     if (requestSweep) void sweepCache().catch(() => {});
   };
 }

@@ -413,7 +413,7 @@ export function readProject(id: string): ProjectFile | null {
   return readFileSafe(filePath(id));
 }
 
-/** Normalize an absolute persisted media path for stable cross-platform comparison. */
+/** Normalize a persisted media path to the same identity used by this host's routes. */
 export function normalizeProjectMediaPath(value: unknown): string | null {
   if (
     typeof value !== 'string' ||
@@ -434,12 +434,12 @@ export function normalizeProjectMediaPath(value: unknown): string | null {
     ) return null;
     return normalized.toLowerCase();
   }
-  if (!path.posix.isAbsolute(value)) return null;
-  const normalized = path.posix.normalize(path.posix.resolve(value));
-  if (normalized === path.posix.parse(normalized).root || normalized.endsWith('/')) {
+  if (!path.isAbsolute(value)) return null;
+  const normalized = path.normalize(path.resolve(value));
+  if (normalized === path.parse(normalized).root || normalized.endsWith(path.sep)) {
     return null;
   }
-  return normalized;
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
 
 function readReferencedSfxPaths(): Set<string> {

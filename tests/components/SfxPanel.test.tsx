@@ -62,6 +62,50 @@ afterEach(() => {
 });
 
 describe("SfxPanel generation ownership", () => {
+  it("aborts and ignores a delayed render after the SFX document is removed", async () => {
+    const clipId = useRepurposeStore.getState().addSfxClip({
+      name: "Manual hit",
+      source: { kind: "built-in", key: "ding" },
+      atTime: 0,
+    }) as string;
+    const request = delayedFetch();
+    render(<SfxPanel projectId="project-a" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate SFX track" }));
+    await waitFor(() => expect(request.fetchMock).toHaveBeenCalledTimes(1));
+    act(() => useRepurposeStore.getState().removeSfxClip(clipId));
+    await waitFor(() => expect(request.signal().aborted).toBe(true));
+    await act(async () => request.resolve());
+
+    expect(useRepurposeStore.getState().sfxTrack).toBeNull();
+    expect(useRepurposeStore.getState().sfxGenerating).toBe(false);
+  });
+
+  it("invalidates a delayed render after an SFX edit is undone", async () => {
+    const clipId = useRepurposeStore.getState().addSfxClip({
+      name: "Manual hit",
+      source: { kind: "built-in", key: "ding" },
+      atTime: 0,
+    }) as string;
+    useRepurposeStore.setState({ past: [], future: [] });
+    const revision = useRepurposeStore.getState().sfxDocumentRevision;
+    const request = delayedFetch();
+    render(<SfxPanel projectId="project-a" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Generate SFX track" }));
+    await waitFor(() => expect(request.fetchMock).toHaveBeenCalledTimes(1));
+    act(() => {
+      useRepurposeStore.getState().moveSfxClip(clipId, 1);
+      useRepurposeStore.getState().undo();
+    });
+    expect(useRepurposeStore.getState().sfxDocumentRevision).toBeGreaterThan(revision);
+    await waitFor(() => expect(request.signal().aborted).toBe(true));
+    await act(async () => request.resolve());
+
+    expect(useRepurposeStore.getState().sfxTrack).toBeNull();
+    expect(useRepurposeStore.getState().sfxGenerating).toBe(false);
+  });
+
   it("aborts and ignores a delayed render after plan inputs are edited", async () => {
     const request = delayedFetch();
     render(<SfxPanel projectId="project-a" />);

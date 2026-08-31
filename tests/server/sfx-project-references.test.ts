@@ -76,8 +76,9 @@ describe("persisted SFX project references", () => {
       },
     }));
 
+    const servingCandidate = path.normalize(path.resolve(referencedPath));
     await expect(projects.listReferencedSfxPaths()).resolves.toEqual(new Set([
-      projects.normalizeProjectMediaPath(referencedPath),
+      process.platform === "win32" ? servingCandidate.toLowerCase() : servingCandidate,
     ]));
   });
 
@@ -184,16 +185,19 @@ describe("persisted SFX project references", () => {
       },
     }));
 
+    const servingCandidate = path.normalize(path.resolve(referencedPath));
     await expect(projects.listReferencedSfxPaths()).resolves.toEqual(new Set([
-      projects.normalizeProjectMediaPath(referencedPath),
+      process.platform === "win32" ? servingCandidate.toLowerCase() : servingCandidate,
     ]));
   });
 
   it.each([
-    ["Windows drive", "C:\\cache\\generated.wav"],
-    ["Windows UNC", "\\\\server\\share\\generated.wav"],
-    ["POSIX", "/var/tmp/generated.wav"],
-  ])("normalizes a valid %s local path", async (_label, sourcePath) => {
+    ["Windows drive", "C:\\cache\\generated.wav", path.win32.normalize(path.win32.resolve("C:\\cache\\generated.wav")).toLowerCase()],
+    ["Windows UNC", "\\\\server\\share\\generated.wav", path.win32.normalize(path.win32.resolve("\\\\server\\share\\generated.wav")).toLowerCase()],
+    ["host-rooted", "/var/tmp/generated.wav", process.platform === "win32"
+      ? path.normalize(path.resolve("/var/tmp/generated.wav")).toLowerCase()
+      : path.normalize(path.resolve("/var/tmp/generated.wav"))],
+  ])("uses the serving candidate identity for a valid %s local path", async (_label, sourcePath, servingCandidate) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "repurpose-sfx-project-local-path-"));
     tempRoots.push(root);
     const home = path.join(root, "home");
@@ -204,7 +208,7 @@ describe("persisted SFX project references", () => {
     }));
     const projects = await import("@/lib/repurpose/projects");
 
-    expect(projects.normalizeProjectMediaPath(sourcePath)).not.toBeNull();
+    expect(projects.normalizeProjectMediaPath(sourcePath)).toBe(servingCandidate);
   });
 
   it("rejects the snapshot when project enumeration fails", async () => {
@@ -287,10 +291,7 @@ describe("persisted SFX project references", () => {
 
     const save = projects.writeProject(project);
     try {
-      expect(await Promise.race([
-        saveStarted.then(() => true),
-        new Promise<false>((resolve) => setTimeout(() => resolve(false), 30)),
-      ])).toBe(true);
+      await saveStarted;
       let sweepEntered = false;
       const sweep = projects.withProjectReferenceSnapshot(async (references) => {
         sweepEntered = true;
@@ -298,7 +299,11 @@ describe("persisted SFX project references", () => {
           await rm(referencedPath, { force: true });
         }
       });
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      const referenceRuntime = (globalThis as Record<symbol, unknown>)[
+        Symbol.for("repurpose-studio.project-reference-runtime")
+      ] as { locked: boolean; waiters: Array<() => void> };
+      expect(referenceRuntime.locked).toBe(true);
+      expect(referenceRuntime.waiters).toHaveLength(1);
       expect(sweepEntered).toBe(false);
       resumeSave();
       await save;

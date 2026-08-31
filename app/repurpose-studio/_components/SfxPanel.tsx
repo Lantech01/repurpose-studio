@@ -27,6 +27,7 @@ export function SfxPanel({ projectId }: { projectId: string }) {
   const words = useRepurposeStore((s) => s.words);
   const duration = useRepurposeStore((s) => s.duration);
   const projectEpoch = useRepurposeStore((s) => s.projectEpoch);
+  const sfxDocumentRevision = useRepurposeStore((s) => s.sfxDocumentRevision);
   const setSfxTrack = useRepurposeStore((s) => s.setSfxTrack);
   const setSfxGenerating = useRepurposeStore((s) => s.setSfxGenerating);
   const clearSfxTrack = useRepurposeStore((s) => s.clearSfxTrack);
@@ -57,7 +58,16 @@ export function SfxPanel({ projectId }: { projectId: string }) {
 
   useEffect(() => () => {
     cancelGeneration();
-  }, [cancelGeneration, clips, duration, projectEpoch, projectId, sfxTrack, words]);
+  }, [
+    cancelGeneration,
+    clips,
+    duration,
+    projectEpoch,
+    projectId,
+    sfxDocumentRevision,
+    sfxTrack,
+    words,
+  ]);
 
   const generate = useCallback(async () => {
     const state = useRepurposeStore.getState();
@@ -74,6 +84,7 @@ export function SfxPanel({ projectId }: { projectId: string }) {
       clips: state.clips,
       words: state.words,
       duration: state.duration,
+      sfxDocumentRevision: state.sfxDocumentRevision,
       sfxTrack: state.sfxTrack,
     };
     const ownsGeneration = () => {
@@ -86,6 +97,7 @@ export function SfxPanel({ projectId }: { projectId: string }) {
         current.clips === operation.clips &&
         current.words === operation.words &&
         current.duration === operation.duration &&
+        current.sfxDocumentRevision === operation.sfxDocumentRevision &&
         current.sfxTrack === operation.sfxTrack;
     };
 

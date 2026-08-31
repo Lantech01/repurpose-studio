@@ -48,6 +48,8 @@ beforeEach(() => {
 });
 
 describe("SFX inventory and IDs", () => {
+  const safeSuffixCeiling = 1_000_000_000;
+
   it("mints independent clip and asset IDs and reseeds beyond hydrated IDs", () => {
     reseedIdCounters({
       sfxClips: [sfx({ id: "sfx-clip-900000" })],
@@ -116,6 +118,74 @@ describe("SFX inventory and IDs", () => {
     });
     expect(clipId).not.toBe(occupiedClipId);
     expect(new Set(useRepurposeStore.getState().sfxClips.map((clip) => clip.id)).size).toBe(2);
+  });
+
+  it("wraps safely past the valid SFX suffix boundary and skips occupied IDs", () => {
+    const clipBoundary = `sfx-clip-${safeSuffixCeiling - 1}`;
+    const assetBoundary = `sfx-asset-${safeSuffixCeiling - 1}`;
+    const occupiedAsset = {
+      id: "sfx-asset-1",
+      name: "Occupied.wav",
+      sourcePath: "C:\\audio\\occupied.wav",
+      srcDuration: 1,
+    };
+    useRepurposeStore.setState({
+      sfxClips: [sfx({ id: "sfx-clip-1" }), sfx({ id: clipBoundary })],
+      sfxAssets: [occupiedAsset, { ...occupiedAsset, id: assetBoundary }],
+    });
+    reseedIdCounters(useRepurposeStore.getState());
+
+    const assetId = useRepurposeStore.getState().addSfxAsset({
+      name: "New.wav",
+      sourcePath: "C:\\audio\\new.wav",
+      srcDuration: 1,
+    });
+    const clipId = useRepurposeStore.getState().addSfxClip({
+      name: "New",
+      source: { kind: "built-in", key: "ding" },
+      atTime: 0,
+    });
+
+    expect(assetId).toBe("sfx-asset-2");
+    expect(clipId).toBe("sfx-clip-2");
+  });
+
+  it("ignores unsafe hydrated SFX suffixes while retaining their document IDs", () => {
+    const unsafeSuffixes = [
+      String(Number.MAX_SAFE_INTEGER),
+      String(Number.MAX_SAFE_INTEGER + 1),
+      "9".repeat(200),
+    ];
+    const clips = unsafeSuffixes.map((suffix, index) => sfx({
+      id: `sfx-clip-${suffix}`,
+      name: `Unsafe clip ${index}`,
+    }));
+    const assets = unsafeSuffixes.map((suffix, index) => ({
+      id: `sfx-asset-${suffix}`,
+      name: `Unsafe ${index}.wav`,
+      sourcePath: `C:\\audio\\unsafe-${index}.wav`,
+      srcDuration: 1,
+    }));
+    useRepurposeStore.setState({ sfxClips: clips, sfxAssets: assets });
+    reseedIdCounters(useRepurposeStore.getState());
+
+    const assetId = useRepurposeStore.getState().addSfxAsset({
+      name: "Safe.wav",
+      sourcePath: "C:\\audio\\safe.wav",
+      srcDuration: 1,
+    });
+    const clipId = useRepurposeStore.getState().addSfxClip({
+      name: "Safe",
+      source: { kind: "built-in", key: "ding" },
+      atTime: 0,
+    }) as string;
+
+    expect(useRepurposeStore.getState().sfxAssets.slice(0, assets.length)).toEqual(assets);
+    expect(useRepurposeStore.getState().sfxClips.slice(0, clips.length)).toEqual(clips);
+    expect(Number(assetId.slice("sfx-asset-".length))).toBeLessThan(safeSuffixCeiling);
+    expect(Number(clipId.slice("sfx-clip-".length))).toBeLessThan(safeSuffixCeiling);
+    expect(assets.some((asset) => asset.id === assetId)).toBe(false);
+    expect(clips.some((clip) => clip.id === clipId)).toBe(false);
   });
 
   it("deduplicates assets outside history and keeps inventory after placement Undo", () => {
