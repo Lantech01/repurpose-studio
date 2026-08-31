@@ -523,6 +523,42 @@ describe("SFX project persistence", () => {
     rendered.unmount();
   });
 
+  test("does not serialize URL-like or query-bearing SFX source paths", async () => {
+    const persistence = installSfxRoundTrip(snapshot({ footageMeta: null }));
+    const rendered = await loadProject();
+    const invalidPaths = [
+      "/api/repurpose/sfx?path=C%3A%5Caudio%5Chit.wav",
+      "blob:temporary",
+      "https://example.com/hit.wav",
+      "relative/hit.wav",
+      "C:\\audio\\hit.wav?token=derived",
+    ];
+
+    act(() => {
+      useRepurposeStore.setState({
+        sfxAssets: invalidPaths.map((sourcePath, index) => ({
+          id: `sfx-asset-invalid-${index}`,
+          name: `Invalid ${index}`,
+          sourcePath,
+          srcDuration: 2,
+        })),
+        sfxClips: invalidPaths.map((sourcePath, index) => sfxClip({
+          id: `sfx-clip-invalid-${index}`,
+          name: `Invalid ${index}`,
+          source: { kind: "legacy", sourcePath, srcDuration: 2 },
+        })),
+        sfxTrack: {
+          ...persistedLegacyTrack,
+          sourcePath: invalidPaths[0],
+        },
+      });
+    });
+
+    await waitFor(() => expect(persistence.saved()).not.toBeNull());
+    expect(persistence.saved()).toMatchObject({ sfxAssets: [], sfxClips: [] });
+    rendered.unmount();
+  });
+
   test("treats an explicit empty clip array as authoritative over a stale track", async () => {
     installSfxRoundTrip(snapshot({
       footageMeta: null,
@@ -555,6 +591,10 @@ describe("SFX project persistence", () => {
       { ...sfxClip({ id: "zero" }), sourceStart: 1, sourceEnd: 1 },
       { ...sfxClip({ id: "nan" }), timelineStart: Number.NaN },
       { ...sfxClip({ id: "relative" }), source: { kind: "legacy", sourcePath: "relative.wav", srcDuration: 2 } },
+      { ...sfxClip({ id: "api-url" }), source: { kind: "legacy", sourcePath: "/api/repurpose/sfx?path=derived", srcDuration: 2 } },
+      { ...sfxClip({ id: "blob-url" }), source: { kind: "legacy", sourcePath: "blob:temporary", srcDuration: 2 } },
+      { ...sfxClip({ id: "http-url" }), source: { kind: "legacy", sourcePath: "https://example.com/hit.wav", srcDuration: 2 } },
+      { ...sfxClip({ id: "query-path" }), source: { kind: "legacy", sourcePath: "C:\\audio\\hit.wav?token=derived", srcDuration: 2 } },
       missingImported,
     ] as unknown as SfxClip[];
     installSfxRoundTrip(snapshot({
@@ -582,6 +622,10 @@ describe("SFX project persistence", () => {
       { id: "sfx-asset-71", name: "Second.wav", sourcePath: "C:\\audio\\second.wav", srcDuration: 3 },
       { id: "blank", name: "   ", sourcePath: "C:\\audio\\blank.wav", srcDuration: 1 },
       { id: "relative", name: "Relative.wav", sourcePath: "relative.wav", srcDuration: 1 },
+      { id: "api", name: "API.wav", sourcePath: "/api/repurpose/sfx?path=derived", srcDuration: 1 },
+      { id: "blob", name: "Blob.wav", sourcePath: "blob:temporary", srcDuration: 1 },
+      { id: "http", name: "HTTP.wav", sourcePath: "https://example.com/hit.wav", srcDuration: 1 },
+      { id: "query", name: "Query.wav", sourcePath: "C:\\audio\\hit.wav?token=derived", srcDuration: 1 },
       { id: "zero", name: "Zero.wav", sourcePath: "C:\\audio\\zero.wav", srcDuration: 0 },
     ] as SfxAsset[];
     installSfxRoundTrip(snapshot({ footageMeta: null, sfxClips: [], sfxAssets: assets }));
@@ -592,6 +636,41 @@ describe("SFX project persistence", () => {
       assets[0],
       { ...assets[1], id: "sfx-asset-71-2" },
     ]);
+    rendered.unmount();
+  });
+
+  test.each([
+    "C:\\audio\\drive.wav",
+    "\\\\server\\share\\unc.wav",
+    "/var/tmp/posix.wav",
+  ])("hydrates valid absolute local SFX path %s", async (sourcePath) => {
+    const asset: SfxAsset = {
+      id: "sfx-asset-local",
+      name: "Local.wav",
+      sourcePath,
+      srcDuration: 2,
+    };
+    const clip = sfxClip({
+      id: "sfx-clip-local",
+      name: "Local legacy",
+      origin: "automatic",
+      timelineStart: 0,
+      source: { kind: "legacy", sourcePath, srcDuration: 2 },
+      sourceEnd: 2,
+    });
+    installSfxRoundTrip(snapshot({
+      footageMeta: null,
+      sfxAssets: [asset],
+      sfxClips: [clip],
+    }));
+
+    const rendered = await loadProject();
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      sfxAssets: [asset],
+      sfxClips: [clip],
+      sfxTrack: { sourcePath },
+    });
     rendered.unmount();
   });
 
@@ -647,6 +726,10 @@ describe("SFX project persistence", () => {
     { ...persistedLegacyTrack, durationSec: 0 },
     { ...persistedLegacyTrack, gain: Number.NaN },
     { ...persistedLegacyTrack, sourcePath: "relative.wav" },
+    { ...persistedLegacyTrack, sourcePath: "/api/repurpose/sfx?path=derived" },
+    { ...persistedLegacyTrack, sourcePath: "blob:temporary" },
+    { ...persistedLegacyTrack, sourcePath: "https://example.com/hit.wav" },
+    { ...persistedLegacyTrack, sourcePath: "C:\\audio\\hit.wav?token=derived" },
   ])("does not create an incoherent bridge from an invalid old track", async (invalidTrack) => {
     installSfxRoundTrip(snapshot({ footageMeta: null, sfxTrack: invalidTrack }));
 

@@ -119,6 +119,15 @@ describe("persisted SFX project references", () => {
     ["malformed source", { sfxClips: [persistedClip([])] }],
     ["unknown source kind", { sfxClips: [persistedClip({ kind: "other" })] }],
     ["relative legacy path", { sfxClips: [persistedClip({ kind: "legacy", sourcePath: "relative.wav", srcDuration: 1 })] }],
+    ["API legacy path", { sfxClips: [persistedClip({ kind: "legacy", sourcePath: "/api/repurpose/sfx?path=derived", srcDuration: 1 })] }],
+    ["blob legacy path", { sfxClips: [persistedClip({ kind: "legacy", sourcePath: "blob:temporary", srcDuration: 1 })] }],
+    ["HTTP legacy path", { sfxClips: [persistedClip({ kind: "legacy", sourcePath: "https://example.com/hit.wav", srcDuration: 1 })] }],
+    ["query-bearing legacy path", { sfxClips: [persistedClip({ kind: "legacy", sourcePath: "C:\\cache\\sound.wav?token=derived", srcDuration: 1 })] }],
+    ["API old track path", { sfxTrack: { sourcePath: "/api/repurpose/sfx?path=derived" } }],
+    ["blob old track path", { sfxTrack: { sourcePath: "blob:temporary" } }],
+    ["HTTP old track path", { sfxTrack: { sourcePath: "https://example.com/hit.wav" } }],
+    ["relative old track path", { sfxTrack: { sourcePath: "relative.wav" } }],
+    ["query-bearing old track path", { sfxTrack: { sourcePath: "C:\\cache\\sound.wav?token=derived" } }],
     ["non-string legacy path", { sfxClips: [persistedClip({ kind: "legacy", sourcePath: 42, srcDuration: 1 })] }],
     ["control-character legacy path", { sfxClips: [persistedClip({ kind: "legacy", sourcePath: "C:\\cache\\bad\u0000.wav", srcDuration: 1 })] }],
     ["invalid legacy duration", { sfxClips: [persistedClip({ kind: "legacy", sourcePath: "C:\\cache\\sound.wav", srcDuration: 0 })] }],
@@ -178,6 +187,24 @@ describe("persisted SFX project references", () => {
     await expect(projects.listReferencedSfxPaths()).resolves.toEqual(new Set([
       projects.normalizeProjectMediaPath(referencedPath),
     ]));
+  });
+
+  it.each([
+    ["Windows drive", "C:\\cache\\generated.wav"],
+    ["Windows UNC", "\\\\server\\share\\generated.wav"],
+    ["POSIX", "/var/tmp/generated.wav"],
+  ])("normalizes a valid %s local path", async (_label, sourcePath) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "repurpose-sfx-project-local-path-"));
+    tempRoots.push(root);
+    const home = path.join(root, "home");
+    await mkdir(path.join(home, "Downloads"), { recursive: true });
+    vi.doMock("node:os", () => ({
+      default: { homedir: () => home },
+      homedir: () => home,
+    }));
+    const projects = await import("@/lib/repurpose/projects");
+
+    expect(projects.normalizeProjectMediaPath(sourcePath)).not.toBeNull();
   });
 
   it("rejects the snapshot when project enumeration fails", async () => {

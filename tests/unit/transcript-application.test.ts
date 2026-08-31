@@ -240,12 +240,7 @@ function seedRichState(): void {
       },
     ],
     markers: [{ id: "marker-after-new-end", t: 5.5, label: "keep" }],
-    sfxTrack: {
-      src: "/sfx.wav",
-      sourcePath: "C:\\media\\sfx.wav",
-      durationSec: 6,
-      gain: 0.8,
-    },
+    sfxTrack: null,
     sfxClips: [
       {
         id: "sfx-crossing-new-end",
@@ -498,7 +493,8 @@ describe("atomic transcript store action", () => {
     );
     expect(state.overlays).toEqual(before.overlays);
     expect(state.markers).toEqual(before.markers);
-    expect(state.sfxTrack).toEqual(before.sfxTrack);
+    // Mixed imported/built-in documents never own the temporary runtime bridge.
+    expect(state.sfxTrack).toBeNull();
     expect(state.sfxClips).toEqual(before.sfxClips);
     expect(state.musicTrack).toEqual(before.musicTrack);
     expect(state.mediaAssets).toEqual(before.mediaAssets);
@@ -566,7 +562,7 @@ describe("atomic transcript store action", () => {
     expect(state.clips[0]).not.toHaveProperty("manualScene");
     expect(state.duration).toBe(2);
     expect(state.selectedClipId).toBeNull();
-    expect(state.sfxTrack).toEqual(before.sfxTrack);
+    expect(state.sfxTrack).toBeNull();
     expect(state.sfxClips).toEqual([
       expect.objectContaining({
         id: "sfx-crossing-new-end",

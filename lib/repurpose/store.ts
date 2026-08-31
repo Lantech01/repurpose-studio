@@ -45,6 +45,7 @@ import {
   trimSfxClipLeft as trimSfxClipLeftValue,
   trimSfxClipRight as trimSfxClipRightValue,
 } from "./sfx-clips";
+import { isAbsoluteLocalMediaPath } from "./local-media-path";
 import { resolveSfxSource } from "./sfx-source";
 import type { EditStats } from "./ingest";
 import { DEFAULT_SMART_TRANSITION, footageUrlForPath } from "./ingest";
@@ -393,10 +394,32 @@ function sfxClipContentEqual(a: SfxClip, b: SfxClip): boolean {
   );
 }
 
-function runtimeSfxTrackFromDocument(clips: readonly SfxClip[]): SfxTrack | null {
+function runtimeSfxTrackFromDocument(
+  clips: readonly SfxClip[],
+  projectDuration: number
+): SfxTrack | null {
   if (clips.length !== 1) return null;
   const legacy = clips[0];
-  if (legacy.origin !== "automatic" || legacy.source.kind !== "legacy") return null;
+  if (
+    legacy.origin !== "automatic" ||
+    legacy.source.kind !== "legacy" ||
+    legacy.timelineStart !== 0 ||
+    legacy.sourceStart !== 0 ||
+    !Number.isFinite(legacy.sourceEnd) ||
+    !Number.isFinite(legacy.source.srcDuration) ||
+    !Number.isFinite(projectDuration) ||
+    legacy.sourceEnd <= 0 ||
+    legacy.source.srcDuration <= 0 ||
+    !Number.isFinite(legacy.gain) ||
+    legacy.fadeInSec !== 0 ||
+    legacy.fadeOutSec !== 0 ||
+    legacy.muted ||
+    !isAbsoluteLocalMediaPath(legacy.source.sourcePath)
+  ) return null;
+  const expectedSourceEnd = Math.round(
+    Math.min(legacy.source.srcDuration, projectDuration) * 1e12
+  ) / 1e12;
+  if (legacy.sourceEnd !== expectedSourceEnd) return null;
   const resolved = resolveSfxSource(legacy.source, []);
   if (!resolved.url) return null;
   return {
@@ -405,6 +428,17 @@ function runtimeSfxTrackFromDocument(clips: readonly SfxClip[]): SfxTrack | null
     durationSec: legacy.source.srcDuration,
     gain: legacy.gain,
   };
+}
+
+function sfxTrackEqual(a: SfxTrack | null, b: SfxTrack | null): boolean {
+  return a === b || (
+    a !== null &&
+    b !== null &&
+    a.src === b.src &&
+    a.sourcePath === b.sourcePath &&
+    a.durationSec === b.durationSec &&
+    a.gain === b.gain
+  );
 }
 
 function recomputeTimeline(clips: Clip[]): Clip[] {
@@ -1090,7 +1124,7 @@ function snapshotToPatch(snap: EditableSnapshot): Partial<RepurposeState> {
     splitRatio: parsePersistedSplitRatio(snap.splitRatio, 0.5),
     duration,
     sfxClips,
-    sfxTrack: runtimeSfxTrackFromDocument(sfxClips),
+    sfxTrack: runtimeSfxTrackFromDocument(sfxClips, duration),
   };
 }
 
@@ -2198,6 +2232,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     const documentChanged = !sfxDocumentEqual(state.sfxClips, gesture.sfxClips);
     set({
       sfxClips: gesture.sfxClips,
+      sfxTrack: runtimeSfxTrackFromDocument(gesture.sfxClips, state.duration),
       past: gesture.past,
       future: gesture.future,
       sfxDocumentRevision: state.sfxDocumentRevision + (documentChanged ? 1 : 0),
@@ -2240,14 +2275,22 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
   ): Partial<RepurposeState> => {
     const state = get();
     const sfxClips = constrainSfxClipsToDuration(sourceClips, duration);
-    if (sfxDocumentEqual(sfxClips, state.sfxClips)) return {};
+    const sfxTrack = runtimeSfxTrackFromDocument(sfxClips, duration);
+    const documentChanged = !sfxDocumentEqual(sfxClips, state.sfxClips);
+    const bridgeChanged = !sfxTrackEqual(sfxTrack, state.sfxTrack);
+    if (!documentChanged && !bridgeChanged) return {};
     return {
-      sfxClips,
-      sfxDocumentRevision: state.sfxDocumentRevision + 1,
-      selectedSfxClipId: state.selectedSfxClipId !== null
-        && sfxClips.some((clip) => clip.id === state.selectedSfxClipId)
-        ? state.selectedSfxClipId
-        : null,
+      ...(documentChanged
+        ? {
+            sfxClips,
+            sfxDocumentRevision: state.sfxDocumentRevision + 1,
+            selectedSfxClipId: state.selectedSfxClipId !== null
+              && sfxClips.some((clip) => clip.id === state.selectedSfxClipId)
+              ? state.selectedSfxClipId
+              : null,
+          }
+        : {}),
+      sfxTrack,
     };
   };
 
@@ -2314,18 +2357,18 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
   };
 
   const commitSfxDocument = (
-    sfxClips: SfxClip[],
-    patch: Partial<RepurposeState> = {}
+    sfxClips: SfxClip[]
   ): boolean => {
     const state = get();
+    const sfxTrack = runtimeSfxTrackFromDocument(sfxClips, state.duration);
     if (sfxDocumentEqual(sfxClips, state.sfxClips)) {
-      if (Object.keys(patch).length > 0) set(patch);
+      if (!sfxTrackEqual(sfxTrack, state.sfxTrack)) set({ sfxTrack });
       return false;
     }
     captureHistoryEntry();
     set({
-      ...patch,
       sfxClips,
+      sfxTrack,
       sfxDocumentRevision: state.sfxDocumentRevision + 1,
       selectedSfxClipId: state.selectedSfxClipId !== null
         && sfxClips.some((clip) => clip.id === state.selectedSfxClipId)
@@ -2438,7 +2481,6 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
         }
       : null;
     const sfxClips = migrated ? [migrated] : state.sfxClips;
-    const synchronizeRuntime = explicitSfxDocument || shouldMigrateLegacyTrack;
     const documentChanged = hydrationSfxClipsBaseline !== null
       && !sfxDocumentEqual(sfxClips, hydrationSfxClipsBaseline);
     reseedIdCounters({ sfxClips });
@@ -2446,9 +2488,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     set({
       hydrating: false,
       sfxClips,
-      ...(synchronizeRuntime
-        ? { sfxTrack: runtimeSfxTrackFromDocument(sfxClips) }
-        : {}),
+      sfxTrack: runtimeSfxTrackFromDocument(sfxClips, state.duration),
       sfxDocumentRevision: state.sfxDocumentRevision + (documentChanged ? 1 : 0),
     });
   },
@@ -2622,6 +2662,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       duration,
       past,
       future,
+      sfxTrack: runtimeSfxTrackFromDocument(sfxClips, duration),
       ...(sfxChanged
         ? {
             sfxClips,
@@ -4383,8 +4424,12 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
       captureHistoryEntry();
       gesture.historyCommitted = true;
     }
+    const sfxClips = state.sfxClips.map((clip) =>
+      clip.id === gesture.id ? updated : clip
+    );
     set({
-      sfxClips: state.sfxClips.map((clip) => clip.id === gesture.id ? updated : clip),
+      sfxClips,
+      sfxTrack: runtimeSfxTrackFromDocument(sfxClips, state.duration),
       sfxDocumentRevision: state.sfxDocumentRevision + 1,
     });
   },
@@ -4426,10 +4471,7 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
             ?? nextAvailableSfxClipId(new Set(state.sfxClips.map((clip) => clip.id)))
         )
       : null;
-    commitSfxDocument(
-      legacy ? [...retained, legacy] : retained,
-      { sfxTrack: track }
-    );
+    commitSfxDocument(legacy ? [...retained, legacy] : retained);
   },
   clearSfxTrack: () => get().setSfxTrack(null),
   setSfxGenerating: (generating) => {
@@ -4442,15 +4484,12 @@ export const useRepurposeStore = create<RepurposeState>((set, get) => {
     const state = get();
     if (!state.sfxTrack) return;
     const clamped = Math.max(0, Math.min(2, gain));
-    const nextTrack = state.sfxTrack.gain === clamped
-      ? state.sfxTrack
-      : { ...state.sfxTrack, gain: clamped };
     const sfxClips = state.sfxClips.map((clip) =>
       clip.origin === "automatic" && clip.source.kind === "legacy"
         ? { ...clip, gain: clamped }
         : clip
     );
-    commitSfxDocument(sfxClips, { sfxTrack: nextTrack });
+    commitSfxDocument(sfxClips);
   },
 
   // --- background music (manual) --------------------------------------------

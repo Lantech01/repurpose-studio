@@ -253,13 +253,26 @@ describe("temporary legacy bridge", () => {
     gain: 0.8,
   };
 
-  it("mirrors set, gain, and clear while preserving manual clips with one commit each", () => {
+  it("keeps the bridge for frame-derived durations normalized by the SFX document", () => {
+    const duration = 67 / 30;
+    seed(duration);
+
+    useRepurposeStore.getState().setSfxTrack({ ...track, durationSec: duration });
+
+    expect(useRepurposeStore.getState().sfxTrack).toMatchObject({
+      sourcePath: track.sourcePath,
+      durationSec: duration,
+    });
+    expect(useRepurposeStore.getState().sfxClips[0].sourceEnd).toBe(2.233333333333);
+  });
+
+  it("preserves manual clips but clears the runtime bridge when setting a track makes a mixed document", () => {
     const manual = sfx({ id: "manual", origin: "manual" });
     useRepurposeStore.setState({ sfxClips: [manual], past: [], future: [] });
 
     useRepurposeStore.getState().setSfxTrack(track);
     let state = useRepurposeStore.getState();
-    expect(state.sfxTrack).toEqual(track);
+    expect(state.sfxTrack).toBeNull();
     expect(state.sfxClips).toEqual([
       manual,
       expect.objectContaining({
@@ -276,15 +289,15 @@ describe("temporary legacy bridge", () => {
 
     state.setSfxGain(1.25);
     state = useRepurposeStore.getState();
-    expect(state.sfxTrack?.gain).toBe(1.25);
-    expect(state.sfxClips[1].gain).toBe(1.25);
-    expect(state.past).toHaveLength(2);
+    expect(state.sfxTrack).toBeNull();
+    expect(state.sfxClips[1].gain).toBe(0.8);
+    expect(state.past).toHaveLength(1);
 
     state.clearSfxTrack();
     state = useRepurposeStore.getState();
     expect(state.sfxTrack).toBeNull();
     expect(state.sfxClips).toEqual([manual]);
-    expect(state.past).toHaveLength(3);
+    expect(state.past).toHaveLength(2);
   });
 
   it("replaces only automatic legacy clips and treats equivalent writes as no-ops", () => {
@@ -300,7 +313,41 @@ describe("temporary legacy bridge", () => {
 
     expect(useRepurposeStore.getState().sfxClips[0]).toBe(automaticBuiltIn);
     expect(useRepurposeStore.getState().sfxClips).toHaveLength(2);
+    expect(useRepurposeStore.getState().sfxTrack).toBeNull();
     expect(useRepurposeStore.getState().past).toHaveLength(1);
+  });
+
+  it("clears and restores the bridge across a discrete move and Undo/Redo", () => {
+    useRepurposeStore.getState().setSfxTrack(track);
+    const id = useRepurposeStore.getState().sfxClips[0].id;
+    expect(useRepurposeStore.getState().sfxTrack).not.toBeNull();
+
+    useRepurposeStore.getState().moveSfxClip(id, 1);
+    expect(useRepurposeStore.getState().sfxTrack).toBeNull();
+
+    useRepurposeStore.getState().undo();
+    expect(useRepurposeStore.getState().sfxTrack).toMatchObject({
+      sourcePath: track.sourcePath,
+      gain: track.gain,
+    });
+
+    useRepurposeStore.getState().redo();
+    expect(useRepurposeStore.getState().sfxTrack).toBeNull();
+  });
+
+  it("clears a live bridge during an incompatible gesture and restores it on cancel", () => {
+    useRepurposeStore.getState().setSfxTrack(track);
+    const id = useRepurposeStore.getState().sfxClips[0].id;
+    const token = useRepurposeStore.getState().beginSfxGesture(id, "left-trim") as string;
+
+    useRepurposeStore.getState().updateSfxGesture(token, 0.5);
+    expect(useRepurposeStore.getState().sfxTrack).toBeNull();
+
+    useRepurposeStore.getState().cancelSfxGesture(token);
+    expect(useRepurposeStore.getState().sfxTrack).toMatchObject({
+      sourcePath: track.sourcePath,
+      gain: track.gain,
+    });
   });
 
   it("keeps the runtime bridge equivalent when setting a track is undone and redone", () => {
@@ -459,6 +506,46 @@ describe("temporary legacy bridge", () => {
       past: [],
       future: [],
     });
+  });
+
+  it.each([
+    ["manual legacy", [sfx({
+      origin: "manual",
+      timelineStart: 0,
+      source: { kind: "legacy", sourcePath: track.sourcePath, srcDuration: 6 },
+      sourceEnd: 6,
+    })]],
+    ["offset automatic legacy", [sfx({
+      origin: "automatic",
+      timelineStart: 1,
+      source: { kind: "legacy", sourcePath: track.sourcePath, srcDuration: 6 },
+      sourceEnd: 6,
+    })]],
+    ["invalid-path automatic legacy", [sfx({
+      origin: "automatic",
+      timelineStart: 0,
+      source: { kind: "legacy", sourcePath: "/api/repurpose/sfx?path=bad", srcDuration: 6 },
+      sourceEnd: 6,
+    })]],
+    ["mixed document", [
+      sfx({
+        id: "legacy",
+        origin: "automatic",
+        timelineStart: 0,
+        source: { kind: "legacy", sourcePath: track.sourcePath, srcDuration: 6 },
+        sourceEnd: 6,
+      }),
+      sfx({ id: "manual" }),
+    ]],
+  ] as const)("clears a stale bridge after hydrating a %s", (_label, clips) => {
+    useRepurposeStore.getState().setHydrating(true);
+    useRepurposeStore.getState().resetProject();
+    useRepurposeStore.getState().setClips([scene(10)]);
+    useRepurposeStore.setState({ sfxTrack: track, sfxClips: [...clips] });
+
+    useRepurposeStore.getState().setHydrating(false);
+
+    expect(useRepurposeStore.getState().sfxTrack).toBeNull();
   });
 
   it("clears a track-only hydration when zero project duration prevents migration", () => {

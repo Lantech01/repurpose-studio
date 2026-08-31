@@ -82,6 +82,7 @@ import {
   parsePersistedSplitRatio,
 } from "@/lib/repurpose/split-ratio";
 import { normalizeOverlayAppearance } from "@/lib/repurpose/overlay-effects";
+import { isAbsoluteLocalMediaPath } from "@/lib/repurpose/local-media-path";
 import {
   migrateLegacySfxTrack,
   normalizeSfxClip,
@@ -123,17 +124,6 @@ function normalizeSafeSfxText(value: unknown): string | null {
     : null;
 }
 
-function isAbsoluteLocalPath(value: unknown): value is string {
-  if (typeof value !== "string" || /[\u0000-\u001f\u007f]/.test(value)) {
-    return false;
-  }
-  return (
-    /^[A-Za-z]:[\\/]/.test(value) ||
-    /^\\\\[^\\/]+[\\/][^\\/]+/.test(value) ||
-    value.startsWith("/")
-  );
-}
-
 function normalizeSfxAssets(value: unknown): SfxAsset[] {
   if (!Array.isArray(value)) return [];
   const assets: SfxAsset[] = [];
@@ -145,7 +135,7 @@ function normalizeSfxAssets(value: unknown): SfxAsset[] {
     if (
       !preferredId ||
       !name ||
-      !isAbsoluteLocalPath(entry.sourcePath) ||
+      !isAbsoluteLocalMediaPath(entry.sourcePath) ||
       !isFiniteNumber(entry.srcDuration) ||
       entry.srcDuration <= 0
     ) {
@@ -181,7 +171,7 @@ function normalizePersistedSfxClips(
       source = { ...source, assetId };
     } else if (
       source.kind === "legacy" &&
-      !isAbsoluteLocalPath(source.sourcePath)
+      !isAbsoluteLocalMediaPath(source.sourcePath)
     ) {
       continue;
     }
@@ -199,7 +189,7 @@ function normalizePersistedSfxClips(
 function normalizeLegacySfxTrack(value: unknown): SfxTrack | null {
   if (
     !isRecord(value) ||
-    !isAbsoluteLocalPath(value.sourcePath) ||
+    !isAbsoluteLocalMediaPath(value.sourcePath) ||
     !isFiniteNumber(value.durationSec) ||
     value.durationSec <= 0 ||
     !isFiniteNumber(value.gain)

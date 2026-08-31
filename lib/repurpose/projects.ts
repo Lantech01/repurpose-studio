@@ -417,11 +417,29 @@ export function readProject(id: string): ProjectFile | null {
 export function normalizeProjectMediaPath(value: unknown): string | null {
   if (
     typeof value !== 'string' ||
+    value.length === 0 ||
+    value !== value.trim() ||
     /[\u0000-\u001f\u007f]/.test(value) ||
-    !path.isAbsolute(value)
+    value.includes('?') ||
+    value.startsWith('//') ||
+    value === '/api' ||
+    value.startsWith('/api/')
   ) return null;
-  const normalized = path.normalize(path.resolve(value));
-  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+  if (/^[A-Za-z]:[\\/]/.test(value) || value.startsWith('\\\\')) {
+    if (!path.win32.isAbsolute(value)) return null;
+    const normalized = path.win32.normalize(path.win32.resolve(value));
+    if (
+      normalized === path.win32.parse(normalized).root ||
+      normalized.endsWith(path.win32.sep)
+    ) return null;
+    return normalized.toLowerCase();
+  }
+  if (!path.posix.isAbsolute(value)) return null;
+  const normalized = path.posix.normalize(path.posix.resolve(value));
+  if (normalized === path.posix.parse(normalized).root || normalized.endsWith('/')) {
+    return null;
+  }
+  return normalized;
 }
 
 function readReferencedSfxPaths(): Set<string> {
