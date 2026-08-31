@@ -40,6 +40,8 @@ export interface TimedSfxWindowMeasurement {
 
 export interface AudioDifferenceMeasurements extends TimedSfxWindowMeasurement {
   fullRms: number;
+  hz220: number;
+  hz440: number;
 }
 
 export interface AudioDifferenceWindow {
@@ -197,6 +199,8 @@ export async function analyzeAudioDifference(
   return {
     ...measureTimedSfxWindow(difference, sfxCenterSec),
     fullRms: rms(difference),
+    hz220: goertzelMagnitude(difference, 220),
+    hz440: goertzelMagnitude(difference, 440),
   };
 }
 

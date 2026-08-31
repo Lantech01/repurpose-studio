@@ -110,7 +110,7 @@ You describe the feature, the agent writes the code, you approve it. That is the
 
 ## Sound effects
 
-**Generate** and **Regenerate** map the included catalog directly to independent, editable timeline clips. Normal sound-effect generation does not require Python or `uv`.
+**Generate** and **Regenerate** map the included catalog directly to independent, editable timeline clips. Normal sound-effect generation is fully local and offline: it does not require Python or `uv`, and it makes no external sound-search or service calls.
 
 You can also import `.wav`, `.mp3`, and `.m4a` effects. Imports are copied into the current project's sound-effect library and remain scoped to that project.
 

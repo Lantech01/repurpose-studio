@@ -34,7 +34,6 @@ interface PreviewParityFrame {
   frame: number;
   time: number;
   dataUrl: string;
-  captureMode: "canvas" | "screenshot";
 }
 
 interface PixelParity {
@@ -159,7 +158,7 @@ async function capturePreviewParityFrame(
     const dataUrl = await canvas.evaluate((element: HTMLCanvasElement) =>
       element.toDataURL("image/png")
     );
-    return { frame, time, dataUrl, captureMode: "canvas" };
+    return { frame, time, dataUrl };
   } catch (error) {
     if (!(error instanceof Error) || !/SecurityError|tainted by cross-origin data/i.test(error.message)) {
       throw error;
@@ -180,7 +179,6 @@ async function capturePreviewParityFrame(
     frame,
     time,
     dataUrl: `data:image/png;base64,${current!.toString("base64")}`,
-    captureMode: "screenshot",
   };
 }
 
@@ -794,12 +792,11 @@ test("exports representative editable SFX with narration and music in a layered 
     }
     console.log("EXPORT_PIXEL_PARITY", JSON.stringify(pixelParity));
     for (const [index, metrics] of pixelParity.entries()) {
-      const screenshotFallback = parityFrames[index].captureMode === "screenshot";
       expect(metrics.exportTime).toBeCloseTo((parityFrames[index].frame + 0.5) / EXPORT_FPS, 2);
-      expect(metrics.fullMae).toBeLessThan(screenshotFallback ? 15 : 12);
-      expect(metrics.captionBandMae).toBeLessThan(screenshotFallback ? 15 : 12);
-      expect(metrics.fullLargeDiffRatio).toBeLessThan(screenshotFallback ? 0.15 : 0.02);
-      expect(metrics.captionBandLargeDiffRatio).toBeLessThan(screenshotFallback ? 0.15 : 0.02);
+      expect(metrics.fullMae).toBeLessThan(12);
+      expect(metrics.captionBandMae).toBeLessThan(12);
+      expect(metrics.fullLargeDiffRatio).toBeLessThan(0.02);
+      expect(metrics.captionBandLargeDiffRatio).toBeLessThan(0.02);
     }
     await exportedVideo.evaluate(async (video: HTMLVideoElement) => {
       video.currentTime = 1.5 + 1 / 60;
@@ -836,7 +833,15 @@ test("exports representative editable SFX with narration and music in a layered 
         sfxWindows,
       })
     );
-    expect(layeredAudio.hz220).toBeGreaterThanOrEqual(controlAudio.hz220 * 4);
+    expect(musicControlAudio.hz220).toBeGreaterThanOrEqual(controlAudio.hz220 * 4);
+    const narrationParity = layeredAudio.hz440 / musicControlAudio.hz440;
+    const musicParity = layeredAudio.hz220 / musicControlAudio.hz220;
+    expect(narrationParity).toBeGreaterThan(0.95);
+    expect(narrationParity).toBeLessThan(1.05);
+    expect(musicParity).toBeGreaterThan(0.95);
+    expect(musicParity).toBeLessThan(1.05);
+    expect(sfxDifference.hz440).toBeLessThan(musicControlAudio.hz440 * 0.05);
+    expect(sfxDifference.hz220).toBeLessThan(musicControlAudio.hz220 * 0.05);
     // Subtract an export with the same narration + continuous music. A nonzero
     // residual in the timed event window can only come from the added SFX layer.
     expect(sfxDifference.eventRms).toBeGreaterThan(0.01);
@@ -848,8 +853,8 @@ test("exports representative editable SFX with narration and music in a layered 
     expect(muted.rms).toBeLessThan(manualOnly.rms * 0.15);
     expect(manualOnly.hz880).toBeGreaterThan(manualOnly.hz660 * 5);
     expect(manualOnly.hz880).toBeGreaterThan(manualOnly.hz1100 * 5);
-    expect(layeredAudio.hz440).toBeGreaterThanOrEqual(controlAudio.hz440 * 0.5);
-    expect(layeredAudio.hz440).toBeGreaterThan(0.01);
+    expect(musicControlAudio.hz440 / controlAudio.hz440).toBeGreaterThan(0.95);
+    expect(musicControlAudio.hz440 / controlAudio.hz440).toBeLessThan(1.05);
     await expect(page.getByRole("status", { name: "Export warning" })).toHaveCount(0);
     browserErrors.assertEmpty();
   } finally {
