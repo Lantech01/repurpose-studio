@@ -10,6 +10,22 @@ vi.mock("server-only", () => ({}));
 
 const tempRoots: string[] = [];
 
+function persistedClip(source: unknown, id = "sfx-clip-1") {
+  return {
+    id,
+    name: "Persisted SFX",
+    source,
+    origin: "manual",
+    timelineStart: 0,
+    sourceStart: 0,
+    sourceEnd: 1,
+    gain: 1,
+    fadeInSec: 0,
+    fadeOutSec: 0,
+    muted: false,
+  };
+}
+
 afterEach(async () => {
   vi.restoreAllMocks();
   vi.doUnmock("node:os");
@@ -19,7 +35,7 @@ afterEach(async () => {
 });
 
 describe("persisted SFX project references", () => {
-  it("returns normalized source paths", async () => {
+  it("dedupes the same generated WAV referenced by an old track and new legacy clips", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "repurpose-sfx-project-refs-"));
     tempRoots.push(root);
     const home = path.join(root, "home");
@@ -37,7 +53,126 @@ describe("persisted SFX project references", () => {
       createdAt: "2026-08-20T00:00:00.000Z",
       updatedAt: "2026-08-20T00:00:00.000Z",
       durationSec: 1,
-      snapshot: { sfxTrack: { sourcePath: referencedPath } },
+      snapshot: {
+        sfxTrack: { sourcePath: referencedPath },
+        sfxClips: [
+          persistedClip(
+            {
+              kind: "legacy",
+              sourcePath: referencedPath,
+              srcDuration: 1,
+            },
+            "sfx-clip-1",
+          ),
+          persistedClip(
+            {
+              kind: "legacy",
+              sourcePath: referencedPath,
+              srcDuration: 1,
+            },
+            "sfx-clip-2",
+          ),
+        ],
+      },
+    }));
+
+    await expect(projects.listReferencedSfxPaths()).resolves.toEqual(new Set([
+      projects.normalizeProjectMediaPath(referencedPath),
+    ]));
+  });
+
+  it("ignores valid built-in and imported clip sources", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "repurpose-sfx-project-ignore-"));
+    tempRoots.push(root);
+    const home = path.join(root, "home");
+    await mkdir(path.join(home, "Downloads"), { recursive: true });
+    vi.doMock("node:os", () => ({
+      default: { homedir: () => home },
+      homedir: () => home,
+    }));
+    const projects = await import("@/lib/repurpose/projects");
+    await mkdir(projects.PROJECTS_DIR, { recursive: true });
+    await writeFile(path.join(projects.PROJECTS_DIR, "ignored.json"), JSON.stringify({
+      id: "ignored",
+      name: "Ignored",
+      createdAt: "2026-08-20T00:00:00.000Z",
+      updatedAt: "2026-08-20T00:00:00.000Z",
+      durationSec: 1,
+      snapshot: {
+        sfxClips: [
+          persistedClip({ kind: "built-in", key: "ding" }, "sfx-clip-1"),
+          persistedClip(
+            { kind: "imported", assetId: "sfx-asset-1", srcDuration: 1 },
+            "sfx-clip-2",
+          ),
+        ],
+      },
+    }));
+
+    await expect(projects.listReferencedSfxPaths()).resolves.toEqual(new Set());
+  });
+
+  it.each([
+    ["non-array", { sfxClips: {} }],
+    ["non-object entry", { sfxClips: [null] }],
+    ["missing source", { sfxClips: [persistedClip(undefined)] }],
+    ["malformed source", { sfxClips: [persistedClip([])] }],
+    ["unknown source kind", { sfxClips: [persistedClip({ kind: "other" })] }],
+    ["relative legacy path", { sfxClips: [persistedClip({ kind: "legacy", sourcePath: "relative.wav", srcDuration: 1 })] }],
+    ["non-string legacy path", { sfxClips: [persistedClip({ kind: "legacy", sourcePath: 42, srcDuration: 1 })] }],
+    ["control-character legacy path", { sfxClips: [persistedClip({ kind: "legacy", sourcePath: "C:\\cache\\bad\u0000.wav", srcDuration: 1 })] }],
+    ["invalid legacy duration", { sfxClips: [persistedClip({ kind: "legacy", sourcePath: "C:\\cache\\sound.wav", srcDuration: 0 })] }],
+    ["legacy path disguised as built-in", { sfxClips: [persistedClip({ kind: "built-in", key: "ding", sourcePath: "C:\\cache\\hidden.wav" })] }],
+  ])("fails closed for a %s", async (_label, malformedSnapshot) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "repurpose-sfx-project-malformed-"));
+    tempRoots.push(root);
+    const home = path.join(root, "home");
+    await mkdir(path.join(home, "Downloads"), { recursive: true });
+    vi.doMock("node:os", () => ({
+      default: { homedir: () => home },
+      homedir: () => home,
+    }));
+    const projects = await import("@/lib/repurpose/projects");
+    await mkdir(projects.PROJECTS_DIR, { recursive: true });
+    await writeFile(path.join(projects.PROJECTS_DIR, "malformed.json"), JSON.stringify({
+      id: "malformed",
+      name: "Malformed",
+      createdAt: "2026-08-20T00:00:00.000Z",
+      updatedAt: "2026-08-20T00:00:00.000Z",
+      durationSec: 1,
+      snapshot: malformedSnapshot,
+    }));
+
+    await expect(projects.listReferencedSfxPaths()).rejects.toMatchObject({
+      code: "PROJECT_REFERENCE_SNAPSHOT_UNAVAILABLE",
+    });
+  });
+
+  it("protects a migrated saved snapshot after the old track field disappears", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "repurpose-sfx-project-migrated-"));
+    tempRoots.push(root);
+    const home = path.join(root, "home");
+    await mkdir(path.join(home, "Downloads"), { recursive: true });
+    vi.doMock("node:os", () => ({
+      default: { homedir: () => home },
+      homedir: () => home,
+    }));
+    const projects = await import("@/lib/repurpose/projects");
+    await mkdir(projects.PROJECTS_DIR, { recursive: true });
+    const referencedPath = path.join(home, "Downloads", "repurpose-overlays", `sfx-${"b".repeat(64)}.wav`);
+    await writeFile(path.join(projects.PROJECTS_DIR, "migrated.json"), JSON.stringify({
+      id: "migrated",
+      name: "Migrated",
+      createdAt: "2026-08-20T00:00:00.000Z",
+      updatedAt: "2026-08-20T00:00:00.000Z",
+      durationSec: 1,
+      snapshot: {
+        sfxClips: [persistedClip({
+          kind: "legacy",
+          sourcePath: referencedPath,
+          srcDuration: 1,
+        })],
+      },
     }));
 
     await expect(projects.listReferencedSfxPaths()).resolves.toEqual(new Set([

@@ -18,6 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import type { ProjectSnapshot } from './types';
+import { isApprovedSfxKey } from './sfx-effects';
 
 export const PROJECTS_DIR = path.join(
   os.homedir(),
@@ -36,6 +37,19 @@ const LOCK_OWNER_GRACE_MS = 1_000;
 const PROJECT_REFERENCE_RUNTIME_KEY = Symbol.for(
   'repurpose-studio.project-reference-runtime',
 );
+const PERSISTED_SFX_CLIP_FIELDS = new Set([
+  'id',
+  'name',
+  'source',
+  'origin',
+  'timelineStart',
+  'sourceStart',
+  'sourceEnd',
+  'gain',
+  'fadeInSec',
+  'fadeOutSec',
+  'muted',
+]);
 
 interface ProjectReferenceRuntime {
   locked: boolean;
@@ -401,7 +415,11 @@ export function readProject(id: string): ProjectFile | null {
 
 /** Normalize an absolute persisted media path for stable cross-platform comparison. */
 export function normalizeProjectMediaPath(value: unknown): string | null {
-  if (typeof value !== 'string' || !path.isAbsolute(value)) return null;
+  if (
+    typeof value !== 'string' ||
+    /[\u0000-\u001f\u007f]/.test(value) ||
+    !path.isAbsolute(value)
+  ) return null;
   const normalized = path.normalize(path.resolve(value));
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
@@ -421,15 +439,101 @@ function readReferencedSfxPaths(): Set<string> {
       }
       const snapshot = project.snapshot as unknown as Record<string, unknown>;
       const track = snapshot.sfxTrack;
-      if (track === undefined || track === null) continue;
-      if (typeof track !== 'object' || Array.isArray(track)) {
+      if (track !== undefined && track !== null) {
+        if (typeof track !== 'object' || Array.isArray(track)) {
+          throw new ProjectReferenceSnapshotUnavailableError();
+        }
+        const normalized = normalizeProjectMediaPath(
+          (track as Record<string, unknown>).sourcePath,
+        );
+        if (!normalized) throw new ProjectReferenceSnapshotUnavailableError();
+        referenced.add(normalized);
+      }
+
+      const clips = snapshot.sfxClips;
+      if (clips === undefined) continue;
+      if (!Array.isArray(clips)) {
         throw new ProjectReferenceSnapshotUnavailableError();
       }
-      const normalized = normalizeProjectMediaPath(
-        (track as Record<string, unknown>).sourcePath,
-      );
-      if (!normalized) throw new ProjectReferenceSnapshotUnavailableError();
-      referenced.add(normalized);
+      for (const clip of clips) {
+        if (!clip || typeof clip !== 'object' || Array.isArray(clip)) {
+          throw new ProjectReferenceSnapshotUnavailableError();
+        }
+        const candidate = clip as Record<string, unknown>;
+        if (
+          Object.keys(candidate).some((key) => !PERSISTED_SFX_CLIP_FIELDS.has(key)) ||
+          typeof candidate.id !== 'string' ||
+          candidate.id.trim().length === 0 ||
+          typeof candidate.name !== 'string' ||
+          candidate.name.trim().length === 0 ||
+          (candidate.origin !== 'automatic' && candidate.origin !== 'manual') ||
+          typeof candidate.timelineStart !== 'number' ||
+          !Number.isFinite(candidate.timelineStart) ||
+          candidate.timelineStart < 0 ||
+          typeof candidate.sourceStart !== 'number' ||
+          !Number.isFinite(candidate.sourceStart) ||
+          candidate.sourceStart < 0 ||
+          typeof candidate.sourceEnd !== 'number' ||
+          !Number.isFinite(candidate.sourceEnd) ||
+          candidate.sourceEnd <= candidate.sourceStart ||
+          typeof candidate.gain !== 'number' ||
+          !Number.isFinite(candidate.gain) ||
+          typeof candidate.fadeInSec !== 'number' ||
+          !Number.isFinite(candidate.fadeInSec) ||
+          candidate.fadeInSec < 0 ||
+          typeof candidate.fadeOutSec !== 'number' ||
+          !Number.isFinite(candidate.fadeOutSec) ||
+          candidate.fadeOutSec < 0 ||
+          typeof candidate.muted !== 'boolean'
+        ) {
+          throw new ProjectReferenceSnapshotUnavailableError();
+        }
+        const source = candidate.source;
+        if (!source || typeof source !== 'object' || Array.isArray(source)) {
+          throw new ProjectReferenceSnapshotUnavailableError();
+        }
+        const record = source as Record<string, unknown>;
+        if (record.kind === 'built-in') {
+          if (
+            Object.keys(record).some((key) => key !== 'kind' && key !== 'key') ||
+            !isApprovedSfxKey(record.key)
+          ) {
+            throw new ProjectReferenceSnapshotUnavailableError();
+          }
+          continue;
+        }
+        if (record.kind === 'imported') {
+          if (
+            Object.keys(record).some(
+              (key) => key !== 'kind' && key !== 'assetId' && key !== 'srcDuration',
+            ) ||
+            typeof record.assetId !== 'string' ||
+            record.assetId.trim().length === 0 ||
+            typeof record.srcDuration !== 'number' ||
+            !Number.isFinite(record.srcDuration) ||
+            record.srcDuration <= 0
+          ) {
+            throw new ProjectReferenceSnapshotUnavailableError();
+          }
+          continue;
+        }
+        if (record.kind !== 'legacy') {
+          throw new ProjectReferenceSnapshotUnavailableError();
+        }
+        if (
+          Object.keys(record).some(
+            (key) => key !== 'kind' && key !== 'sourcePath' && key !== 'srcDuration',
+          ) ||
+          typeof record.srcDuration !== 'number' ||
+          !Number.isFinite(record.srcDuration) ||
+          record.srcDuration <= 0
+        ) {
+          throw new ProjectReferenceSnapshotUnavailableError();
+        }
+        const normalized = normalizeProjectMediaPath(record.sourcePath);
+        if (!normalized) throw new ProjectReferenceSnapshotUnavailableError();
+        referenced.add(normalized);
+      }
     }
   } catch (error) {
     if (error instanceof ProjectReferenceSnapshotUnavailableError) throw error;

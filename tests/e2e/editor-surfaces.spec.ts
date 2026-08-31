@@ -42,6 +42,13 @@ type SurfaceSnapshot = {
   inPoint?: number | null;
   outPoint?: number | null;
   musicTrack?: { name?: string } | null;
+  sfxClips?: Array<{
+    origin: "automatic" | "manual";
+    source:
+      | { kind: "built-in"; key: string }
+      | { kind: "imported"; assetId: string; srcDuration: number }
+      | { kind: "legacy"; sourcePath: string; srcDuration: number };
+  }>;
   sfxTrack?: { sourcePath?: string } | null;
 };
 
@@ -363,14 +370,25 @@ test("dogfoods the remaining editor surfaces through the browser", async ({ page
       timeout: 60_000,
     });
     await expect
-      .poll(async () => (await readSnapshot(page, projectId!)).sfxTrack?.sourcePath ?? "", {
-        timeout: 30_000,
-      })
+      .poll(async () => {
+        const legacy = (await readSnapshot(page, projectId!)).sfxClips?.find(
+          (clip) => clip.source.kind === "legacy",
+        );
+        return legacy?.source.kind === "legacy" ? legacy.source.sourcePath : "";
+      }, { timeout: 30_000 })
       .not.toBe("");
     const finalSnapshot = await readSnapshot(page, projectId);
     expect(finalSnapshot.loopPlayback).toBe(true);
     expect(finalSnapshot.musicTrack?.name).toBe("music.wav");
-    expect(finalSnapshot.sfxTrack?.sourcePath).toBeTruthy();
+    expect(finalSnapshot.sfxTrack).toBeUndefined();
+    expect(
+      finalSnapshot.sfxClips?.some(
+        (clip) =>
+          clip.origin === "automatic" &&
+          clip.source.kind === "legacy" &&
+          Boolean(clip.source.sourcePath),
+      ),
+    ).toBe(true);
 
     await page.getByRole("button", { name: "Clear in/out region" }).click();
     await page.getByRole("button", { name: "Toggle loop" }).click();

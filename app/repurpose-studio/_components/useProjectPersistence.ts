@@ -53,6 +53,8 @@ import type {
   MusicTrack,
   Overlay,
   ProjectSnapshot,
+  SfxAsset,
+  SfxClip,
   SfxTrack,
   VideoSourceRecord,
   VideoSourceTarget,
@@ -80,6 +82,10 @@ import {
   parsePersistedSplitRatio,
 } from "@/lib/repurpose/split-ratio";
 import { normalizeOverlayAppearance } from "@/lib/repurpose/overlay-effects";
+import {
+  migrateLegacySfxTrack,
+  normalizeSfxClip,
+} from "@/lib/repurpose/sfx-clips";
 import type { CaptionBlock, CaptionStyle } from "@/lib/repurpose/captions";
 import { datedSlug, deriveProjectTitle } from "./naming";
 
@@ -107,6 +113,105 @@ function needsMediaReconnect(path: string | undefined | null): boolean {
 
 function assetUrlForPath(path: string): string {
   return `/api/repurpose/asset?path=${encodeURIComponent(path)}`;
+}
+
+function normalizeSafeSfxText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized && !/[\u0000-\u001f\u007f]/.test(normalized)
+    ? normalized
+    : null;
+}
+
+function isAbsoluteLocalPath(value: unknown): value is string {
+  if (typeof value !== "string" || /[\u0000-\u001f\u007f]/.test(value)) {
+    return false;
+  }
+  return (
+    /^[A-Za-z]:[\\/]/.test(value) ||
+    /^\\\\[^\\/]+[\\/][^\\/]+/.test(value) ||
+    value.startsWith("/")
+  );
+}
+
+function normalizeSfxAssets(value: unknown): SfxAsset[] {
+  if (!Array.isArray(value)) return [];
+  const assets: SfxAsset[] = [];
+  const usedIds = new Set<string>();
+  for (const entry of value) {
+    if (!isRecord(entry)) continue;
+    const preferredId = normalizeSafeSfxText(entry.id);
+    const name = normalizeSafeSfxText(entry.name);
+    if (
+      !preferredId ||
+      !name ||
+      !isAbsoluteLocalPath(entry.sourcePath) ||
+      !isFiniteNumber(entry.srcDuration) ||
+      entry.srcDuration <= 0
+    ) {
+      continue;
+    }
+    let id = preferredId;
+    for (let suffix = 2; usedIds.has(id); suffix += 1) {
+      id = `${preferredId}-${suffix}`;
+    }
+    usedIds.add(id);
+    assets.push({ id, name, sourcePath: entry.sourcePath, srcDuration: entry.srcDuration });
+  }
+  return assets;
+}
+
+function normalizePersistedSfxClips(
+  value: unknown,
+  projectDuration: number
+): SfxClip[] {
+  if (!Array.isArray(value)) return [];
+  const clips: SfxClip[] = [];
+  const usedIds = new Set<string>();
+  for (const entry of value) {
+    if (!isRecord(entry) || !isRecord(entry.source)) continue;
+    const id = normalizeSafeSfxText(entry.id);
+    const name = normalizeSafeSfxText(entry.name);
+    if (!id || !name || usedIds.has(id)) continue;
+
+    let source = { ...entry.source };
+    if (source.kind === "imported") {
+      const assetId = normalizeSafeSfxText(source.assetId);
+      if (!assetId) continue;
+      source = { ...source, assetId };
+    } else if (
+      source.kind === "legacy" &&
+      !isAbsoluteLocalPath(source.sourcePath)
+    ) {
+      continue;
+    }
+    const normalized = normalizeSfxClip(
+      { ...entry, id, name, source },
+      projectDuration
+    );
+    if (!normalized) continue;
+    usedIds.add(id);
+    clips.push(normalized);
+  }
+  return clips;
+}
+
+function normalizeLegacySfxTrack(value: unknown): SfxTrack | null {
+  if (
+    !isRecord(value) ||
+    !isAbsoluteLocalPath(value.sourcePath) ||
+    !isFiniteNumber(value.durationSec) ||
+    value.durationSec <= 0 ||
+    !isFiniteNumber(value.gain)
+  ) {
+    return null;
+  }
+  return {
+    src: `/api/repurpose/sfx?path=${encodeURIComponent(value.sourcePath)}`,
+    sourcePath: value.sourcePath,
+    durationSec: value.durationSec,
+    gain: value.gain,
+  };
 }
 
 export function restoreFootageMeta(
@@ -200,6 +305,15 @@ function snapshotFromStore(): ProjectSnapshot {
         ? { ...overlay, src: RECONNECT_REQUIRED_PATH }
         : overlay
     );
+  const normalizedSfxClips = normalizePersistedSfxClips(
+    s.sfxClips,
+    s.duration
+  );
+  const runtimeTrack = normalizeLegacySfxTrack(s.sfxTrack);
+  const fallbackLegacyClip =
+    s.sfxClips.length === 0 && runtimeTrack
+      ? migrateLegacySfxTrack(runtimeTrack, s.duration)
+      : null;
   return {
     // Per-scene framing (screenFraming / faceFraming) rides inside each clip, so
     // persisting `clips` persists it too -- no separate keyframe/global fields.
@@ -231,13 +345,8 @@ function snapshotFromStore(): ProjectSnapshot {
     markers: s.markers,
     deletedWordIndices: s.deletedWordIndices,
     overlays,
-    sfxTrack:
-      s.sfxTrack?.sourcePath
-        ? {
-            ...s.sfxTrack,
-            src: `/api/repurpose/sfx?path=${encodeURIComponent(s.sfxTrack.sourcePath)}`,
-          }
-        : null,
+    sfxClips: fallbackLegacyClip ? [fallbackLegacyClip] : normalizedSfxClips,
+    sfxAssets: normalizeSfxAssets(s.sfxAssets),
     musicTrack:
       s.musicTrack?.sourcePath
         ? {
@@ -919,18 +1028,17 @@ function hydrateSnapshot(snapshot: ProjectSnapshot): boolean {
   // re-derives duration.
   store.setClips(migratedClips);
 
-  // SFX track -- re-derive `src` from `sourcePath` (never trust the persisted src).
-  const restoredSfxTrack: SfxTrack | null | undefined =
-    snapshot.sfxTrack === undefined
-      ? undefined
-      : snapshot.sfxTrack && snapshot.sfxTrack.sourcePath
-        ? {
-            ...snapshot.sfxTrack,
-            src: `/api/repurpose/sfx?path=${encodeURIComponent(
-              snapshot.sfxTrack.sourcePath
-            )}`,
-          }
-        : null;
+  const authoritativeSfxDocument = snapshot.sfxClips !== undefined;
+  const restoredSfxAssets = normalizeSfxAssets(snapshot.sfxAssets);
+  const restoredSfxClips = authoritativeSfxDocument
+    ? normalizePersistedSfxClips(
+        snapshot.sfxClips,
+        useRepurposeStore.getState().duration
+      )
+    : undefined;
+  const restoredSfxTrack = authoritativeSfxDocument
+    ? null
+    : normalizeLegacySfxTrack(snapshot.sfxTrack);
 
   // MUSIC track -- same safe pattern; music is served by the asset route.
   const restoredMusicTrack: MusicTrack | null | undefined =
@@ -992,7 +1100,9 @@ function hydrateSnapshot(snapshot: ProjectSnapshot): boolean {
         }
       : {}),
     ...(restoredOverlays !== undefined ? { overlays: restoredOverlays } : {}),
-    ...(restoredSfxTrack !== undefined ? { sfxTrack: restoredSfxTrack } : {}),
+    sfxAssets: restoredSfxAssets,
+    ...(restoredSfxClips !== undefined ? { sfxClips: restoredSfxClips } : {}),
+    sfxTrack: restoredSfxTrack,
     ...(restoredMusicTrack !== undefined ? { musicTrack: restoredMusicTrack } : {}),
     ...(restoredMediaAssets !== undefined ? { mediaAssets: restoredMediaAssets } : {}),
   });
@@ -1005,6 +1115,8 @@ function hydrateSnapshot(snapshot: ProjectSnapshot): boolean {
     markers: seed.markers,
     overlays: seed.overlays,
     mediaAssets: seed.mediaAssets,
+    sfxClips: seed.sfxClips,
+    sfxAssets: seed.sfxAssets,
   });
 
   // SELF-HEAL captions: words present but no blocks -> chunk them now.
@@ -1324,6 +1436,8 @@ function isStructurallyValidSnapshot(value: unknown): value is ProjectSnapshot {
     snapshot.markers,
     snapshot.deletedWordIndices,
     snapshot.mediaAssets,
+    snapshot.sfxClips,
+    snapshot.sfxAssets,
   ];
   return optionalArrays.every(
     (entry) => entry === undefined || Array.isArray(entry)

@@ -394,10 +394,9 @@ function sfxClipContentEqual(a: SfxClip, b: SfxClip): boolean {
 }
 
 function runtimeSfxTrackFromDocument(clips: readonly SfxClip[]): SfxTrack | null {
-  const legacy = clips.find(
-    (clip) => clip.origin === "automatic" && clip.source.kind === "legacy"
-  );
-  if (!legacy || legacy.source.kind !== "legacy") return null;
+  if (clips.length !== 1) return null;
+  const legacy = clips[0];
+  if (legacy.origin !== "automatic" || legacy.source.kind !== "legacy") return null;
   const resolved = resolveSfxSource(legacy.source, []);
   if (!resolved.url) return null;
   return {

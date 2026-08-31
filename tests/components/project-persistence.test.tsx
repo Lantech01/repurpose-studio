@@ -30,6 +30,7 @@ import {
   useProjectPersistence,
 } from "@/app/repurpose-studio/_components/useProjectPersistence";
 import { useRepurposeStore } from "@/lib/repurpose/store";
+import { isSfxClipSourceAvailable } from "@/lib/repurpose/sfx-clips";
 import type { MediaInspection } from "@/lib/repurpose/media-types";
 import {
   VIDEO_TIMELINE_CLIP_ID,
@@ -38,6 +39,9 @@ import {
   type MediaAsset,
   type Overlay,
   type ProjectSnapshot,
+  type SfxAsset,
+  type SfxClip,
+  type SfxTrack,
   type VideoSourceRecord,
 } from "@/lib/repurpose/types";
 
@@ -144,6 +148,69 @@ function snapshot(overrides: Partial<ProjectSnapshot> = {}): ProjectSnapshot {
     footageMeta: footage(),
     ...overrides,
   };
+}
+
+function sfxClip(overrides: Partial<SfxClip> = {}): SfxClip {
+  return {
+    id: "sfx-clip-1",
+    name: "Ding",
+    source: { kind: "built-in", key: "ding" },
+    origin: "manual",
+    timelineStart: 1,
+    sourceStart: 0,
+    sourceEnd: 2,
+    gain: 1,
+    fadeInSec: 0,
+    fadeOutSec: 0,
+    muted: false,
+    ...overrides,
+  };
+}
+
+const persistedLegacyTrack: SfxTrack = {
+  src: "blob:must-not-be-restored",
+  sourcePath: "C:\\cache\\generated.wav",
+  durationSec: 8,
+  gain: 1.25,
+};
+
+function installSfxRoundTrip(initial: ProjectSnapshot): {
+  saved: () => ProjectSnapshot | null;
+} {
+  let persisted = initial;
+  let saved: ProjectSnapshot | null = null;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith("/api/repurpose/projects/") && !init?.method) {
+        return jsonResponse({
+          project: {
+            id: "task-6-project",
+            name: "Task 6 project",
+            createdAt: "2026-08-24T00:00:00.000Z",
+            snapshot: persisted,
+          },
+        });
+      }
+      if (url === "/api/repurpose/projects" && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as ControlledSaveBody;
+        persisted = body.snapshot;
+        saved = body.snapshot;
+        return jsonResponse({
+          project: {
+            id: "task-6-project",
+            name: "Task 6 project",
+            createdAt: "2026-08-24T00:00:00.000Z",
+            saveRevision: body.saveRevision,
+            saveWriterId: body.writerId,
+          },
+        });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    })
+  );
+  return { saved: () => saved };
 }
 
 function videoAsset(
@@ -343,6 +410,289 @@ afterEach(() => {
   cleanup();
   clearProjectOutboxes();
   vi.unstubAllGlobals();
+});
+
+describe("SFX project persistence", () => {
+  test("writes normalized clips and assets without legacy or transient fields, then reopens every source kind", async () => {
+    const persistence = installSfxRoundTrip(snapshot({ footageMeta: null }));
+    const firstMount = await loadProject();
+    const asset: SfxAsset = {
+      id: "sfx-asset-41",
+      name: "Imported hit.wav",
+      sourcePath: "C:\\audio\\imported-hit.wav",
+      srcDuration: 4,
+    };
+    const authoredClips = [
+      sfxClip({ id: "sfx-clip-41" }),
+      sfxClip({
+        id: "sfx-clip-42",
+        name: "Imported hit",
+        source: { kind: "imported", assetId: asset.id, srcDuration: 4 },
+        sourceEnd: 3,
+      }),
+      sfxClip({
+        id: "sfx-clip-43",
+        name: "Legacy render",
+        source: {
+          kind: "legacy",
+          sourcePath: persistedLegacyTrack.sourcePath,
+          srcDuration: 5,
+        },
+        origin: "automatic",
+        sourceEnd: 4,
+      }),
+    ];
+
+    act(() => {
+      useRepurposeStore.setState({
+        sfxAssets: [{ ...asset, src: "blob:derived", waveform: [0.1] } as unknown as SfxAsset],
+        sfxClips: authoredClips.map((entry) => ({
+          ...entry,
+          src: "blob:derived",
+          decodedBuffer: { stale: true },
+          waveform: [0.1],
+          lane: 3,
+          selected: true,
+          error: "stale",
+        })) as unknown as SfxClip[],
+        sfxTrack: persistedLegacyTrack,
+        selectedSfxClipId: "sfx-clip-43",
+        sfxGenerating: true,
+      });
+    });
+
+    await waitFor(() => expect(persistence.saved()).not.toBeNull());
+    const saved = persistence.saved()!;
+    expect(saved.sfxAssets).toEqual([asset]);
+    expect(saved.sfxClips).toEqual(authoredClips);
+    expect(saved).not.toHaveProperty("sfxTrack");
+    for (const field of [
+      "selectedSfxClipId",
+      "sfxGenerating",
+      "sfxDocumentRevision",
+      "audition",
+      "lanes",
+      "gesture",
+      "error",
+    ]) {
+      expect(saved).not.toHaveProperty(field);
+    }
+    firstMount.unmount();
+    useRepurposeStore.setState(useRepurposeStore.getInitialState(), true);
+
+    const reopened = await loadProject();
+    expect(useRepurposeStore.getState()).toMatchObject({
+      sfxAssets: [asset],
+      sfxClips: authoredClips,
+      sfxTrack: null,
+      past: [],
+      future: [],
+    });
+    reopened.unmount();
+  });
+
+  test("serializes a runtime-only track as an automatic legacy clip", async () => {
+    const persistence = installSfxRoundTrip(snapshot({ footageMeta: null }));
+    const rendered = await loadProject();
+
+    act(() => {
+      useRepurposeStore.setState({ sfxClips: [], sfxTrack: persistedLegacyTrack });
+    });
+
+    await waitFor(() => expect(persistence.saved()).not.toBeNull());
+    expect(persistence.saved()).not.toHaveProperty("sfxTrack");
+    expect(persistence.saved()?.sfxClips).toEqual([
+      {
+        id: "sfx-legacy",
+        name: "Legacy Sound Effects",
+        source: {
+          kind: "legacy",
+          sourcePath: persistedLegacyTrack.sourcePath,
+          srcDuration: persistedLegacyTrack.durationSec,
+        },
+        origin: "automatic",
+        timelineStart: 0,
+        sourceStart: 0,
+        sourceEnd: 5,
+        gain: persistedLegacyTrack.gain,
+        fadeInSec: 0,
+        fadeOutSec: 0,
+        muted: false,
+      },
+    ]);
+    rendered.unmount();
+  });
+
+  test("treats an explicit empty clip array as authoritative over a stale track", async () => {
+    installSfxRoundTrip(snapshot({
+      footageMeta: null,
+      sfxClips: [],
+      sfxAssets: [],
+      sfxTrack: persistedLegacyTrack,
+    }));
+
+    const rendered = await loadProject();
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      sfxClips: [],
+      sfxAssets: [],
+      sfxTrack: null,
+      past: [],
+    });
+    rendered.unmount();
+  });
+
+  test("isolates malformed clips while retaining an unavailable imported sibling", async () => {
+    const missingImported = sfxClip({
+      id: "sfx-clip-52",
+      name: "Missing import",
+      source: { kind: "imported", assetId: "sfx-asset-missing", srcDuration: 4 },
+      sourceEnd: 4,
+    });
+    const malformed = [
+      sfxClip({ id: "sfx-clip-51", sourceEnd: 99 }),
+      { ...sfxClip({ id: "bad-key" }), source: { kind: "built-in", key: "unknown" } },
+      { ...sfxClip({ id: "zero" }), sourceStart: 1, sourceEnd: 1 },
+      { ...sfxClip({ id: "nan" }), timelineStart: Number.NaN },
+      { ...sfxClip({ id: "relative" }), source: { kind: "legacy", sourcePath: "relative.wav", srcDuration: 2 } },
+      missingImported,
+    ] as unknown as SfxClip[];
+    installSfxRoundTrip(snapshot({
+      footageMeta: null,
+      sfxClips: malformed,
+      sfxAssets: [],
+    }));
+
+    const rendered = await loadProject();
+    const state = useRepurposeStore.getState();
+
+    expect(state.sfxClips.map((entry) => entry.id)).toEqual([
+      "sfx-clip-51",
+      "sfx-clip-52",
+    ]);
+    expect(state.sfxClips[0].sourceEnd).toBe(2.951854167);
+    expect(isSfxClipSourceAvailable(state.sfxClips[1].source, state.sfxAssets)).toBe(false);
+    expect(state.sfxTrack).toBeNull();
+    rendered.unmount();
+  });
+
+  test("normalizes inventory paths and repeated IDs without aliasing", async () => {
+    const assets = [
+      { id: "sfx-asset-71", name: "First.wav", sourcePath: "C:\\audio\\first.wav", srcDuration: 2 },
+      { id: "sfx-asset-71", name: "Second.wav", sourcePath: "C:\\audio\\second.wav", srcDuration: 3 },
+      { id: "blank", name: "   ", sourcePath: "C:\\audio\\blank.wav", srcDuration: 1 },
+      { id: "relative", name: "Relative.wav", sourcePath: "relative.wav", srcDuration: 1 },
+      { id: "zero", name: "Zero.wav", sourcePath: "C:\\audio\\zero.wav", srcDuration: 0 },
+    ] as SfxAsset[];
+    installSfxRoundTrip(snapshot({ footageMeta: null, sfxClips: [], sfxAssets: assets }));
+
+    const rendered = await loadProject();
+
+    expect(useRepurposeStore.getState().sfxAssets).toEqual([
+      assets[0],
+      { ...assets[1], id: "sfx-asset-71-2" },
+    ]);
+    rendered.unmount();
+  });
+
+  test("migrates an old track exactly, saves only new arrays, and reopens it", async () => {
+    const persistence = installSfxRoundTrip(snapshot({
+      footageMeta: null,
+      sfxTrack: persistedLegacyTrack,
+    }));
+    const firstMount = await loadProject();
+
+    expect(useRepurposeStore.getState()).toMatchObject({
+      sfxClips: [{
+        name: "Legacy Sound Effects",
+        source: {
+          kind: "legacy",
+          sourcePath: persistedLegacyTrack.sourcePath,
+          srcDuration: 8,
+        },
+        origin: "automatic",
+        timelineStart: 0,
+        sourceStart: 0,
+        sourceEnd: 5,
+        gain: 1.25,
+        fadeInSec: 0,
+        fadeOutSec: 0,
+        muted: false,
+      }],
+      sfxTrack: {
+        src: `/api/repurpose/sfx?path=${encodeURIComponent(persistedLegacyTrack.sourcePath)}`,
+        sourcePath: persistedLegacyTrack.sourcePath,
+        durationSec: 8,
+        gain: 1.25,
+      },
+      past: [],
+    });
+    act(() => useRepurposeStore.getState().addMarker(1));
+    await waitFor(() => expect(persistence.saved()).not.toBeNull());
+    expect(persistence.saved()).not.toHaveProperty("sfxTrack");
+    expect(persistence.saved()?.sfxClips).toHaveLength(1);
+    firstMount.unmount();
+    useRepurposeStore.setState(useRepurposeStore.getInitialState(), true);
+
+    const reopened = await loadProject();
+    expect(useRepurposeStore.getState().sfxClips).toEqual(persistence.saved()?.sfxClips);
+    expect(useRepurposeStore.getState().sfxTrack).toMatchObject({
+      sourcePath: persistedLegacyTrack.sourcePath,
+      gain: 1.25,
+    });
+    reopened.unmount();
+  });
+
+  test.each([
+    { ...persistedLegacyTrack, durationSec: 0 },
+    { ...persistedLegacyTrack, gain: Number.NaN },
+    { ...persistedLegacyTrack, sourcePath: "relative.wav" },
+  ])("does not create an incoherent bridge from an invalid old track", async (invalidTrack) => {
+    installSfxRoundTrip(snapshot({ footageMeta: null, sfxTrack: invalidTrack }));
+
+    const rendered = await loadProject();
+
+    expect(useRepurposeStore.getState()).toMatchObject({ sfxClips: [], sfxTrack: null });
+    rendered.unmount();
+  });
+
+  test("keeps hydrated inventory through placement Undo and reseeds both ID domains", async () => {
+    const asset: SfxAsset = {
+      id: "sfx-asset-9100000",
+      name: "Hydrated.wav",
+      sourcePath: "C:\\audio\\hydrated.wav",
+      srcDuration: 4,
+    };
+    installSfxRoundTrip(snapshot({
+      footageMeta: null,
+      sfxAssets: [asset],
+      sfxClips: [sfxClip({ id: "sfx-clip-9200000" })],
+    }));
+    const rendered = await loadProject();
+
+    const placedId = useRepurposeStore.getState().addSfxClip({
+      name: asset.name,
+      source: { kind: "imported", assetId: asset.id, srcDuration: asset.srcDuration },
+      atTime: 2,
+    }) as string;
+    useRepurposeStore.getState().undo();
+    const addedAssetId = useRepurposeStore.getState().addSfxAsset({
+      name: "Next.wav",
+      sourcePath: "C:\\audio\\next.wav",
+      srcDuration: 2,
+    });
+
+    expect(Number(placedId.slice("sfx-clip-".length))).toBeGreaterThan(9_200_000);
+    expect(Number(addedAssetId.slice("sfx-asset-".length))).toBeGreaterThan(9_100_000);
+    expect(useRepurposeStore.getState().sfxAssets).toEqual([
+      asset,
+      expect.objectContaining({ id: addedAssetId, name: "Next.wav" }),
+    ]);
+    expect(useRepurposeStore.getState().sfxClips).toEqual([
+      expect.objectContaining({ id: "sfx-clip-9200000" }),
+    ]);
+    rendered.unmount();
+  });
 });
 
 describe("pure project media restoration", () => {
