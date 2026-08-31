@@ -83,6 +83,16 @@ async function tempRoot(): Promise<string> {
   return root;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((accept, decline) => {
+    resolve = accept;
+    reject = decline;
+  });
+  return { promise, resolve, reject };
+}
+
 async function eventually(assertion: () => void | Promise<void>): Promise<void> {
   let lastError: unknown;
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -269,7 +279,7 @@ describe("proxy encoder and cache lifecycle", () => {
 
   it("deduplicates one fingerprinted job and atomically publishes only after validation", async () => {
     const cacheDir = await tempRoot();
-    const release = Promise.withResolvers<void>();
+    const release = deferred<void>();
     const encode = vi.fn(async ({ outputPath }: { outputPath: string }) => {
       // Encoder invocation and creation of its output are separate async events.
       await new Promise((resolve) => setTimeout(resolve, 25));
@@ -373,8 +383,8 @@ describe("proxy encoder and cache lifecycle", () => {
 
   it("does not publish terminal failure until invalid partial cleanup settles", async () => {
     const cacheDir = await tempRoot();
-    const cleanupStarted = Promise.withResolvers<void>();
-    const releaseCleanup = Promise.withResolvers<void>();
+    const cleanupStarted = deferred<void>();
+    const releaseCleanup = deferred<void>();
     const removeFile = vi.fn(async (filePath: string) => {
       cleanupStarted.resolve();
       await releaseCleanup.promise;
@@ -415,8 +425,8 @@ describe("proxy encoder and cache lifecycle", () => {
     const cacheDir = await tempRoot();
     let timestamp = Date.now();
     let cleanupFailures = 1;
-    const activeStarted = Promise.withResolvers<string>();
-    const releaseActive = Promise.withResolvers<void>();
+    const activeStarted = deferred<string>();
+    const releaseActive = deferred<void>();
     const removeFile = vi.fn(async (filePath: string) => {
       if (filePath.endsWith(".partial.mp4") && cleanupFailures > 0) {
         cleanupFailures -= 1;

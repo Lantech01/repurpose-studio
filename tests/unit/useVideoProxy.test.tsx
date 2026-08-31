@@ -44,6 +44,16 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((accept, decline) => {
+    resolve = accept;
+    reject = decline;
+  });
+  return { promise, resolve, reject };
+}
+
 beforeEach(() => {
   useRepurposeStore.setState(useRepurposeStore.getInitialState(), true);
 });
@@ -455,7 +465,7 @@ describe("useVideoProxy and nested source ownership", () => {
   });
 
   it("restarts for an external same-fingerprint source replacement without looping on its own preview update", async () => {
-    const first = Promise.withResolvers<Response>();
+    const first = deferred<Response>();
     const fetcher = vi.fn<typeof fetch>((_input, init) => {
       const postCount = fetcher.mock.calls.filter(
         ([, callInit]) => callInit?.method === "POST"

@@ -2,12 +2,13 @@
 
 import { execFile } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import type { Clip, ProjectSnapshot } from "@/lib/repurpose/types";
 
-const FACE_PATH = "C:\\media\\face.mp4";
-const SCREEN_PATH = "C:\\media\\screen.mp4";
+const FACE_PATH = path.resolve("test-media", "face.mp4");
+const SCREEN_PATH = path.resolve("test-media", "screen.mp4");
 
 interface SourceAvailability {
   face: boolean;
