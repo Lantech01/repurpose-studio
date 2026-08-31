@@ -195,4 +195,3 @@ The stabilization is complete only when all of the following are freshly verifie
 6. Vendor and connect the offline SFX engine.
 7. Verify project reopen and full export.
 8. Run exhaustive browser QA, resolve remaining in-scope defects, and publish the report.
-
