@@ -37,7 +37,11 @@ import {
 import { ClipBlock } from "./ClipBlock";
 import { OverlayBlock, useOverlayThumbnails } from "./OverlayBlock";
 import { SfxClipBlock } from "./SfxClipBlock";
-import type { TimelinePointerStart } from "./timeline-pointer";
+import type {
+  TimelinePointerLifecycle,
+  TimelinePointerOwnership,
+  TimelinePointerStart,
+} from "./timeline-pointer";
 import { useSfxWaveform } from "./useSfxWaveform";
 import { TransportBar } from "./TransportBar";
 import {
@@ -94,6 +98,7 @@ type DragKind = {
   captureTarget: HTMLElement;
 } & (
   | { type: "playhead" }
+  | { type: "word-range"; lifecycle: TimelinePointerLifecycle; initialPlayhead: number }
   | {
       type: "clip-body";
       clip: Clip;
@@ -301,14 +306,19 @@ export function Timeline({
   // Seek the playhead to the FIRST word in the range so the preview parks at the
   // start of the selection, mirroring onWordCellClick's single-word seek.
   const onWordRangeSelect = useCallback(
-    (fromRawIndex: number, toRawIndex: number) => {
-      const lo = Math.min(fromRawIndex, toRawIndex);
+    (fromRawIndex: number | null, toRawIndex?: number) => {
+      if (fromRawIndex === null) {
+        selectWords(null);
+        return;
+      }
+      const resolvedTo = toRawIndex ?? fromRawIndex;
+      const lo = Math.min(fromRawIndex, resolvedTo);
       const first = words[lo];
       if (first) {
         const outT = sourceToTimelineTime(clips, first.start);
         if (outT != null) setPlayhead(outT);
       }
-      selectWords(fromRawIndex, toRawIndex);
+      selectWords(fromRawIndex, resolvedTo);
     },
     [words, clips, setPlayhead, selectWords]
   );
@@ -730,6 +740,53 @@ export function Timeline({
     dragRef.current === null
   ), []);
 
+  const beginWordRangeDrag = useCallback((
+    pointer: TimelinePointerStart,
+    lifecycle: TimelinePointerLifecycle
+  ): boolean => {
+    if (!canStartTimelineDrag(pointer.pointerId)) return false;
+    captureTimelinePointer(pointer);
+    dragRef.current = {
+      type: "word-range",
+      ...pointer,
+      lifecycle,
+      initialPlayhead: useRepurposeStore.getState().playhead,
+    };
+    return true;
+  }, [canStartTimelineDrag]);
+
+  const ownsWordRangeDrag = useCallback((pointerId: number): boolean => (
+    dragRef.current?.type === "word-range"
+    && dragRef.current.pointerId === pointerId
+  ), []);
+
+  const completeWordRangeDrag = useCallback((pointerId: number): boolean => {
+    const drag = dragRef.current;
+    if (drag?.type !== "word-range" || drag.pointerId !== pointerId) return false;
+    dragRef.current = null;
+    releaseTimelinePointerCapture(drag);
+    drag.lifecycle.complete();
+    return true;
+  }, []);
+
+  const cancelWordRangeDrag = useCallback((pointerId: number): boolean => {
+    const drag = dragRef.current;
+    if (drag?.type !== "word-range" || drag.pointerId !== pointerId) return false;
+    dragRef.current = null;
+    releaseTimelinePointerCapture(drag);
+    drag.lifecycle.cancel();
+    setPlayhead(drag.initialPlayhead);
+    return true;
+  }, [setPlayhead]);
+
+  const timelinePointerOwnership: TimelinePointerOwnership = {
+    canStartTimelineDrag,
+    beginWordRangeDrag,
+    ownsWordRangeDrag,
+    completeWordRangeDrag,
+    cancelWordRangeDrag,
+  };
+
   const startPlayheadScrub = useCallback(
     (e: React.PointerEvent<HTMLDivElement>, seek: boolean) => {
       if (!canStartTimelineDrag(e.pointerId)) return;
@@ -947,6 +1004,7 @@ export function Timeline({
       const drag = dragRef.current;
       if (!drag) return;
       if (e.pointerId !== drag.pointerId) return;
+      if (drag.type === "word-range") return;
       const {
         clientXToTime,
         clips,
@@ -1143,6 +1201,11 @@ export function Timeline({
     const handleUp = (e: PointerEvent) => {
       const drag = dragRef.current;
       if (drag && e.pointerId !== drag.pointerId) return;
+      if (drag?.type === "word-range") {
+        completeWordRangeDrag(e.pointerId);
+        setSnapGuideX(null);
+        return;
+      }
       dragRef.current = null;
       setSnapGuideX(null);
       if (drag) releaseTimelinePointerCapture(drag);
@@ -1162,6 +1225,11 @@ export function Timeline({
     const handleCancel = (e: PointerEvent) => {
       const drag = dragRef.current;
       if (drag && e.pointerId !== drag.pointerId) return;
+      if (drag?.type === "word-range") {
+        cancelWordRangeDrag(e.pointerId);
+        setSnapGuideX(null);
+        return;
+      }
       dragRef.current = null;
       setSnapGuideX(null);
       if (drag) releaseTimelinePointerCapture(drag);
@@ -1178,7 +1246,9 @@ export function Timeline({
       window.removeEventListener("pointerup", handleUp);
       window.removeEventListener("pointercancel", handleCancel);
       const drag = dragRef.current;
-      if (drag) {
+      if (drag?.type === "word-range") {
+        cancelWordRangeDrag(drag.pointerId);
+      } else if (drag) {
         dragRef.current = null;
         releaseTimelinePointerCapture(drag);
         if (drag.type === "sfx" && drag.token) cancelSfxGesture(drag.token);
@@ -1198,6 +1268,8 @@ export function Timeline({
     updateSfxGesture,
     endSfxGesture,
     cancelSfxGesture,
+    completeWordRangeDrag,
+    cancelWordRangeDrag,
   ]);
 
   // ---- keyboard: delete selected clip -----------------------------------------
@@ -1663,6 +1735,7 @@ export function Timeline({
                     onSelect={selectClip}
                     onDragBodyStart={handleClipBodyDragStart}
                     onDragEdgeStart={handleClipEdgeDragStart}
+                    timelinePointerOwnership={timelinePointerOwnership}
                     onDelete={deleteClip}
                     onRestore={restoreClip}
                     waveform={faceWaveform}
