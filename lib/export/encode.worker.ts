@@ -83,26 +83,29 @@ async function getSupportedVideoCodec(
   width: number,
   height: number,
   bitrate: number,
-  fps: number
+  fps: number,
+  forceH264: boolean
 ): Promise<string | null> {
-  // Probe HEVC first (better compression)
-  for (const codec of HEVC_CODEC_STRINGS) {
-    try {
-      const config = {
-        codec,
-        width,
-        height,
-        framerate: fps,
-        latencyMode: "quality" as const,
-        hardwareAcceleration: "no-preference" as const,
-        hevc: { format: "hevc" as const },
-        bitrate,
-        bitrateMode: "variable" as const,
-      } as VideoEncoderConfig;
-      const support = await VideoEncoder.isConfigSupported(config);
-      if (support.supported) return codec;
-    } catch {
-      continue;
+  if (!forceH264) {
+    // Probe HEVC first (better compression) unless the caller requires H.264.
+    for (const codec of HEVC_CODEC_STRINGS) {
+      try {
+        const config = {
+          codec,
+          width,
+          height,
+          framerate: fps,
+          latencyMode: "quality" as const,
+          hardwareAcceleration: "no-preference" as const,
+          hevc: { format: "hevc" as const },
+          bitrate,
+          bitrateMode: "variable" as const,
+        } as VideoEncoderConfig;
+        const support = await VideoEncoder.isConfigSupported(config);
+        if (support.supported) return codec;
+      } catch {
+        continue;
+      }
     }
   }
 
@@ -223,19 +226,22 @@ async function handleInitVideo(
 
   // Resolve codec
   let resolvedCodec: string;
-  if (config.resolvedCodec) {
+  if (config.resolvedCodec && !(config.forceH264 && isHevcCodec(config.resolvedCodec))) {
     resolvedCodec = config.resolvedCodec;
   } else {
     const codec = await getSupportedVideoCodec(
       config.width,
       config.height,
       bitrate,
-      config.fps
+      config.fps,
+      config.forceH264
     );
     if (!codec) {
       send({
         type: "error",
-        error: "No supported video codec found for this resolution.",
+        error: config.forceH264
+          ? "No supported H.264 video codec found for this resolution."
+          : "No supported video codec found for this resolution.",
         fatal: true,
       });
       return;

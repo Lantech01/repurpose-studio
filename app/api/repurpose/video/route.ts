@@ -18,14 +18,18 @@
 // ===========================================================================
 
 import { createReadStream, type Stats } from "node:fs";
-import { stat, realpath, open, rename, rm, mkdir, readdir } from "node:fs/promises";
+import { stat, open, rename, rm, mkdir, readdir } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 
-import { getProxyState } from "@/lib/repurpose/proxy-cache";
+import {
+  acquireProxyLease,
+  getProxyState,
+} from "@/lib/repurpose/proxy-cache";
+import { resolveAllowedVideoPath } from "@/lib/repurpose/media-paths.server";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -232,16 +236,6 @@ async function ensureFaststart(
   }
 }
 
-// Roots a request is allowed to read from. Real footage lives in ~/Downloads;
-// generated/temp inputs (e.g. transcribed words) live in the OS temp dir.
-const ALLOWED_ROOTS: string[] = [
-  path.join(os.homedir(), "Downloads"),
-  path.join(os.homedir(), "Desktop"),
-  path.join(os.homedir(), "Documents"),
-  path.join(os.homedir(), "Movies"),
-  os.tmpdir(),
-];
-
 // Common video containers we serve. Anything else is rejected so this route
 // can't be repurposed into a generic file exfiltration endpoint.
 const CONTENT_TYPES: Record<string, string> = {
@@ -251,41 +245,6 @@ const CONTENT_TYPES: Record<string, string> = {
   ".webm": "video/webm",
   ".mkv": "video/x-matroska",
 };
-
-function isUnder(root: string, target: string): boolean {
-  const rel = path.relative(root, target);
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
-}
-
-/**
- * Resolve + validate the requested path against the allow-list. Exported so
- * /api/repurpose/proxy applies the exact same sandbox to its ?path input --
- * one validator, one policy (Next.js only treats HTTP-method exports as
- * handlers; extra named exports from a route module are just module exports).
- */
-export async function resolveAllowed(rawPath: string): Promise<string | null> {
-  if (!rawPath || !path.isAbsolute(rawPath)) return null;
-  // Realpath collapses symlinks and `..`; re-check the resolved path is still
-  // inside an allowed root so neither trick escapes the sandbox.
-  let resolved: string;
-  try {
-    resolved = await realpath(rawPath);
-  } catch {
-    return null;
-  }
-  const ext = path.extname(resolved).toLowerCase();
-  if (!(ext in CONTENT_TYPES)) return null;
-  for (const root of ALLOWED_ROOTS) {
-    let realRoot: string;
-    try {
-      realRoot = await realpath(root);
-    } catch {
-      continue;
-    }
-    if (isUnder(realRoot, resolved)) return resolved;
-  }
-  return null;
-}
 
 /** Parse a single `bytes=start-end` range against the file size. */
 function parseRange(
@@ -320,12 +279,17 @@ export async function GET(request: Request): Promise<Response> {
     return new Response("Missing ?path", { status: 400 });
   }
 
-  const resolvedPath = await resolveAllowed(rawPath);
+  const resolvedPath = await resolveAllowedVideoPath(rawPath);
   if (!resolvedPath) {
     return new Response("Not found or not allowed", { status: 404 });
   }
 
-  const srcInfo = await stat(resolvedPath);
+  let srcInfo: Stats;
+  try {
+    srcInfo = await stat(resolvedPath);
+  } catch {
+    return new Response("Not found", { status: 404 });
+  }
   if (!srcInfo.isFile()) {
     return new Response("Not a file", { status: 404 });
   }
@@ -333,6 +297,7 @@ export async function GET(request: Request): Promise<Response> {
   let filePath: string;
   let info: Stats;
   let contentType: string;
+  let releaseProxyLease: (() => void) | null = null;
   if (url.searchParams.get("quality") === "proxy") {
     // PREVIEW PROXY: serve the low-res dense-keyframe proxy built by
     // /api/repurpose/proxy instead of the original. If it isn't ready we 404
@@ -348,7 +313,20 @@ export async function GET(request: Request): Promise<Response> {
       return new Response("Proxy not ready", { status: 404 });
     }
     filePath = proxy.proxyPath;
-    info = await stat(filePath);
+    releaseProxyLease = acquireProxyLease(filePath);
+    if (!releaseProxyLease) {
+      return new Response("Proxy not ready", { status: 404 });
+    }
+    try {
+      info = await stat(filePath);
+    } catch {
+      releaseProxyLease();
+      return new Response("Proxy not ready", { status: 404 });
+    }
+    if (!info.isFile() || info.size <= 0) {
+      releaseProxyLease();
+      return new Response("Proxy not ready", { status: 404 });
+    }
     contentType = "video/mp4"; // proxies are always mp4, whatever the source was
     // No ensureFaststart here: the proxy is encoded with -movflags +faststart.
   } else {
@@ -373,12 +351,42 @@ export async function GET(request: Request): Promise<Response> {
     "Cache-Control": "no-store",
   };
 
+  if (request.method === "HEAD") {
+    releaseProxyLease?.();
+    return new Response(null, {
+      status: range ? 206 : 200,
+      headers: range
+        ? {
+            ...commonHeaders,
+            "Content-Range": `bytes ${range.start}-${range.end}/${size}`,
+            "Content-Length": String(range.end - range.start + 1),
+          }
+        : { ...commonHeaders, "Content-Length": String(size) },
+    });
+  }
+
+  const createResponseStream = (options?: { start: number; end: number }) => {
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      releaseProxyLease?.();
+    };
+    try {
+      const nodeStream = createReadStream(filePath, options);
+      nodeStream.once("close", release);
+      nodeStream.once("error", release);
+      return Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>;
+    } catch (error) {
+      release();
+      throw error;
+    }
+  };
+
   if (!range) {
     // Full-content response (still advertises range support so the <video>
     // element issues subsequent range requests when seeking).
-    const stream = Readable.toWeb(
-      createReadStream(filePath)
-    ) as unknown as ReadableStream<Uint8Array>;
+    const stream = createResponseStream();
     return new Response(stream, {
       status: 200,
       headers: { ...commonHeaders, "Content-Length": String(size) },
@@ -387,9 +395,7 @@ export async function GET(request: Request): Promise<Response> {
 
   const { start, end } = range;
   const chunkSize = end - start + 1;
-  const stream = Readable.toWeb(
-    createReadStream(filePath, { start, end })
-  ) as unknown as ReadableStream<Uint8Array>;
+  const stream = createResponseStream({ start, end });
   return new Response(stream, {
     status: 206,
     headers: {
@@ -398,4 +404,8 @@ export async function GET(request: Request): Promise<Response> {
       "Content-Length": String(chunkSize),
     },
   });
+}
+
+export async function HEAD(request: Request): Promise<Response> {
+  return GET(request);
 }

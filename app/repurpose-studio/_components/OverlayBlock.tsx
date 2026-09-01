@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { TrashSimple, Image as ImageIcon, FilmSlate, Stack } from "@phosphor-icons/react";
 import type { Overlay } from "@/lib/repurpose/types";
 import { formatTimecode } from "./timeline-utils";
+import type { TimelinePointerStart } from "./timeline-pointer";
 
 interface OverlayBlockProps {
   overlay: Overlay;
@@ -13,8 +14,8 @@ interface OverlayBlockProps {
   trackHeight: number;
   isSelected: boolean;
   onSelect: (id: string) => void;
-  onDragBodyStart: (overlay: Overlay, pointerX: number) => void;
-  onDragEdgeStart: (overlay: Overlay, edge: "start" | "end", pointerX: number) => void;
+  onDragBodyStart: (overlay: Overlay, pointer: TimelinePointerStart) => void;
+  onDragEdgeStart: (overlay: Overlay, edge: "start" | "end", pointer: TimelinePointerStart) => void;
   onDelete: (id: string) => void;
   /**
    * A decoded poster frame for THIS overlay (an <img> cover for images, a
@@ -52,7 +53,11 @@ export function OverlayBlock({
     (e: React.PointerEvent<HTMLDivElement>) => {
       e.stopPropagation();
       onSelect(overlay.id);
-      onDragBodyStart(overlay, e.clientX);
+      onDragBodyStart(overlay, {
+        clientX: e.clientX,
+        pointerId: e.pointerId,
+        captureTarget: e.currentTarget,
+      });
     },
     [overlay, onSelect, onDragBodyStart]
   );
@@ -62,7 +67,11 @@ export function OverlayBlock({
       e.stopPropagation();
       e.preventDefault();
       onSelect(overlay.id);
-      onDragEdgeStart(overlay, edge, e.clientX);
+      onDragEdgeStart(overlay, edge, {
+        clientX: e.clientX,
+        pointerId: e.pointerId,
+        captureTarget: e.currentTarget,
+      });
     },
     [overlay, onSelect, onDragEdgeStart]
   );
@@ -110,11 +119,13 @@ export function OverlayBlock({
 
       {/* left trim edge */}
       <div
+        data-trim-edge="start"
         className="absolute left-0 top-0 h-full w-2 rounded-l-md hover:bg-[#a78bfa]/60"
         onPointerDown={handleEdgePointerDown("start")}
       />
       {/* right trim edge */}
       <div
+        data-trim-edge="end"
         className="absolute right-0 top-0 h-full w-2 rounded-r-md hover:bg-[#a78bfa]/60"
         onPointerDown={handleEdgePointerDown("end")}
       />

@@ -11,6 +11,35 @@
 // type-only imports (erased at build), so the captions.ts <-> types.ts cycle they
 // create is harmless.
 import type { CaptionStyle, CaptionBlock } from "./captions";
+import type { MediaInspection } from "./media-types";
+import type { ApprovedSfxKey } from "./sfx-effects";
+
+export const VIDEO_TIMELINE_CLIP_ID = "video-full-span";
+
+export type VideoImportPhase =
+  | "copying"
+  | "inspecting"
+  | "checking-browser"
+  | "converting"
+  | "building-proxy"
+  | "ready"
+  | "cancelled"
+  | "error";
+
+export interface VideoSourceRecord {
+  originalPath: string;
+  workingPath: string;
+  previewPath?: string;
+  originalName: string;
+  inspection: MediaInspection;
+  nativeCompatible: boolean;
+  compatibilityStatus: "native" | "converted";
+}
+
+export type VideoSourceTarget =
+  | { kind: "footage"; role: "face" | "screen" }
+  | { kind: "asset"; id: string }
+  | { kind: "overlay"; id: string };
 
 /** A single transcribed word with its position in the raw source file, in seconds. */
 export interface Word {
@@ -36,6 +65,8 @@ export interface Take {
 export interface FootageMeta {
   faceCamPath: string;
   screenPath: string;
+  faceCamSource?: VideoSourceRecord;
+  screenSource?: VideoSourceRecord;
   fps: number;
   width: number;
   height: number;
@@ -170,9 +201,10 @@ export interface Clip {
    * absent = "use the global `splitRatio`", so a scene only carries a value once
    * Manthan drags the coral handle while it is the active clip. Lets each scene
    * frame its face-cam/screen split independently (one scene tucks the face up,
-   * the next gives it more room) instead of one split for the whole reel. At a
+   * the next gives it more room) instead of one split for the whole reel. `0`
+   * makes Face full-frame; `1` makes Screen full-frame. At a
    * cut the Smart transition eases from the outgoing clip's resolved split to
-   * this one's (see `splitRatioAt` in ./time-map.ts). Clamped 0.4-0.6 like the
+   * this one's (see `splitRatioAt` in ./time-map.ts). Clamped to [0, 1] like the
    * global. Render-time only -- never ripples the timeline or remaps keyframes.
    * Survives ripple/persistence/undo for free (plain optional data on the clip,
    * exactly like `transitionIn`).
@@ -261,6 +293,16 @@ export interface OverlayTransform {
   rotation: number;
 }
 
+export type OverlayEffectType = "none" | "zoom" | "slide" | "pop" | "fade";
+
+export type OverlaySlideDirection = "left" | "right" | "up" | "down";
+
+export interface OverlayEffect {
+  type: OverlayEffectType;
+  durationSec: number;
+  direction?: OverlaySlideDirection;
+}
+
 /**
  * Payload for the attribute clipboard ("copy position" Cmd/Ctrl+C -> "paste
  * attributes" Cmd/Ctrl+Shift+V, Descript's chord). Same-kind paste only, like
@@ -277,7 +319,14 @@ export type AttributeClipboard =
       screenFraming?: FaceFraming;
       splitRatio: number;
     }
-  | { kind: "overlay"; transform: OverlayTransform; opacity: number };
+  | {
+      kind: "overlay";
+      transform: OverlayTransform;
+      opacity: number;
+      entranceEffect: OverlayEffect;
+      exitEffect: OverlayEffect;
+      cornerRadius: number;
+    };
 
 /**
  * A free-floating external media layer composited ON TOP of the two base
@@ -307,6 +356,8 @@ export interface Overlay {
    * Absent when the overlay is still on a transient blob: fallback.
    */
   sourcePath?: string;
+  /** Persisted original/working/preview identities for video overlays. */
+  videoSource?: VideoSourceRecord;
   /** Intrinsic media pixel width (for aspect + hit-test). */
   naturalWidth: number;
   /** Intrinsic media pixel height (for aspect + hit-test). */
@@ -344,6 +395,12 @@ export interface Overlay {
    * it never tweens at a cut).
    */
   opacity: number;
+  /** Optional entrance animation; absent legacy values normalize to no effect. */
+  entranceEffect?: OverlayEffect;
+  /** Optional exit animation; absent legacy values normalize to no effect. */
+  exitEffect?: OverlayEffect;
+  /** Uniform corner radius, normalized to 0..0.5 of the shorter rendered side. */
+  cornerRadius?: number;
   /**
    * Video overlays are ALWAYS muted -- true for kind:"video", absent for images.
    * A permanent rule, never a deferral: an overlay contributes no audio, ever.
@@ -392,24 +449,7 @@ export interface Marker {
   color?: string;
 }
 
-/**
- * The reel's generated SOUND-EFFECTS track -- a single full-length WAV rendered
- * by the /soundeffects engine and baked into the preview + exported MP4. Created
- * on demand when Manthan clicks the "Sound Effects" button; there is at most ONE
- * (the store keeps `sfxTrack: SfxTrack | null`), spanning the whole output
- * timeline (0..duration) rather than a set of draggable per-effect blocks.
- *
- * It sits on the Audio row BELOW the clip track (Overlays on top -> Clips ->
- * Audio at the bottom) and is rendered as a green block so it reads distinctly
- * from coral clips / violet overlays. Purely an audio layer -- it never draws to
- * the canvas and never ripples with clip/word edits (like {@link Overlay}, it is
- * placed in OUTPUT time and clamped to the reel bounds).
- *
- * PERSISTENCE (mirrors {@link Overlay}): `src` is a STABLE proxied URL
- * (`/api/repurpose/sfx?path=...`) so the track survives reload -- never a bare
- * blob: URL. `sourcePath` is the absolute on-disk WAV, so persistence can
- * re-derive a fresh proxy URL after a reload.
- */
+/** READ-ONLY legacy snapshot input. New documents use independent {@link SfxClip}s. */
 export interface SfxTrack {
   /** Stable proxied streaming URL the preview/export loads (never a blob: URL). */
   src: string;
@@ -423,6 +463,34 @@ export interface SfxTrack {
    * Lets Manthan pull the whole SFX bed up/down under the VO without re-rendering.
    */
   gain: number;
+}
+
+export type SfxClipOrigin = "automatic" | "manual";
+
+export type SfxClipSource =
+  | { kind: "built-in"; key: ApprovedSfxKey }
+  | { kind: "imported"; assetId: string; srcDuration: number }
+  | { kind: "legacy"; sourcePath: string; srcDuration: number };
+
+export interface SfxAsset {
+  id: string;
+  name: string;
+  sourcePath: string;
+  srcDuration: number;
+}
+
+export interface SfxClip {
+  id: string;
+  name: string;
+  source: SfxClipSource;
+  origin: SfxClipOrigin;
+  timelineStart: number;
+  sourceStart: number;
+  sourceEnd: number;
+  gain: number;
+  fadeInSec: number;
+  fadeOutSec: number;
+  muted: boolean;
 }
 
 /**
@@ -496,6 +564,8 @@ export interface MediaAsset {
    * disk copy failed and the entry is on a transient blob: fallback.
    */
   sourcePath?: string;
+  /** Persisted original/working/preview identities for video assets. */
+  videoSource?: VideoSourceRecord;
   /** Intrinsic pixel width (image/video only) -- carried so a placed overlay keeps aspect. */
   naturalWidth?: number;
   /** Intrinsic pixel height (image/video only). */
@@ -573,8 +643,10 @@ export interface ProjectSnapshot {
   // is a stable proxied /api/... path after copy-to-disk import; a leftover blob: src
   // is dead after reload and flags a reconnect. Optional for a pre-overlay snapshot.
   overlays?: Overlay[];
-  // The generated sound-effects track. `src` is a proxied /api/repurpose/sfx path;
-  // on restore it is RE-DERIVED fresh from `sourcePath`. Optional for pre-SFX.
+  // Editable sound-effect document and project-owned imported inventory.
+  sfxClips?: SfxClip[];
+  sfxAssets?: SfxAsset[];
+  // READ-ONLY legacy migration input. New snapshots do not write this field.
   sfxTrack?: SfxTrack | null;
   // The manually-added background-music track. `src` is a proxied
   // /api/repurpose/asset path; RE-DERIVED from `sourcePath` on restore. Optional.

@@ -39,3 +39,13 @@ next-env.d.ts
 # ~/Downloads/repurpose-projects, ~/Downloads/repurpose-overlays,
 # and $TMPDIR/repurpose-proxy — kept here in case a user relocates them)
 /.repurpose-data/
+
+# generated test media and browser artifacts
+/tests/fixtures/generated/
+/test-results/
+/.gstack/qa-reports/playwright-html/
+# Local protected-media evidence. Keep reports/screenshots reviewable without
+# committing source-derived videos or machine-specific paths.
+/.gstack/qa-reports/**/actual-hevc*.json
+/.gstack/qa-reports/**/actual-hevc*.mp4
+/.gstack/qa-reports/repurpose-studio-stabilization-2026-08-21/screenshots/

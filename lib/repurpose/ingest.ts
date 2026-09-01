@@ -13,7 +13,13 @@
 // by a Node script; the TranscriptPanel wires its output into the store.
 // ===========================================================================
 
-import type { Clip, ClipTransition, FootageMeta, Word } from "./types";
+import type {
+  Clip,
+  ClipTransition,
+  FootageMeta,
+  VideoSourceRecord,
+  Word,
+} from "./types";
 import {
   matchTakes,
   detectSilences,
@@ -55,12 +61,6 @@ export const DEFAULT_SMART_TRANSITION: ClipTransition = {
  * speech. Mirrors CUT_GAP in scripts/repurpose-fcpxml.mjs + fcpxml-import.ts.
  */
 export const CONTINUOUS_TAKE_GAP = 0.4;
-
-/** Shape of the `<base>.words.json` written by scripts/repurpose/transcribe-raw.mjs. */
-export interface RawWordsFile {
-  text: string;
-  words: Word[];
-}
 
 /** Everything needed to assemble a Short's clip timeline from raw footage. */
 export interface IngestInput {
@@ -279,7 +279,10 @@ export function computeEditStats(
  * final transcript or no viable window -- i.e. the full-cut fallback, where a
  * "short savings" number would be meaningless).
  */
-export function buildShortWithStats(input: IngestInput): {
+export function buildShortWithStats(
+  input: IngestInput,
+  options: { maxSourceDuration?: number } = {}
+): {
   clips: Clip[];
   stats: EditStats | null;
 } {
@@ -304,9 +307,18 @@ export function buildShortWithStats(input: IngestInput): {
     return { clips: buildShortClips(input), stats: null };
   }
 
+  const selectedClips =
+    options.maxSourceDuration === undefined
+      ? short.clips
+      : short.clips.flatMap((clip) => {
+          const srcStart = Math.max(0, clip.srcStart);
+          const srcEnd = Math.min(clip.srcEnd, options.maxSourceDuration!);
+          return srcEnd > srcStart ? [{ ...clip, srcStart, srcEnd }] : [];
+        });
+
   return {
-    clips: shortClipsToClips(short.clips),
-    stats: computeEditStats(segments, silences, short.clips),
+    clips: shortClipsToClips(selectedClips),
+    stats: computeEditStats(segments, silences, selectedClips),
   };
 }
 
@@ -326,6 +338,11 @@ export function buildShortWithStats(input: IngestInput): {
  */
 export function footageUrlForPath(ref: string): string {
   if (ref === "") return ref;
+  // A Windows drive prefix (`C:`) superficially looks like a URI scheme. Handle
+  // drive-letter paths before the generic scheme check so they are streamed.
+  if (/^[A-Za-z]:[\\/]/.test(ref)) {
+    return `/api/repurpose/video?path=${encodeURIComponent(ref)}`;
+  }
   // blob:, data:, http:, https:, file: ... anything with a scheme, plus
   // protocol-relative (//host) and already-app-relative (/...) URLs.
   if (/^[a-z][a-z0-9+.-]*:/i.test(ref) || ref.startsWith("//") || ref.startsWith("/api/")) {
@@ -350,6 +367,28 @@ export function footageUrlForPath(ref: string): string {
   }
   return ref;
 }
+/** Recover a raw local path from a persisted video endpoint URL or OS path. */
+export function footagePathFromUrl(ref: string | undefined): string | null {
+  if (!ref || ref.startsWith("blob:")) return null;
+  if (ref.startsWith("/api/repurpose/video?")) {
+    try {
+      return new URL(ref, "http://localhost").searchParams.get("path");
+    } catch {
+      return null;
+    }
+  }
+  if (
+    /^[A-Za-z]:[\\/]/.test(ref) ||
+    ref.startsWith("/Users/") ||
+    ref.startsWith("/home/") ||
+    ref.startsWith("/var/") ||
+    ref.startsWith("/tmp/") ||
+    ref.startsWith("/private/")
+  ) {
+    return ref;
+  }
+  return null;
+}
 
 /**
  * Derive a FootageMeta from user-picked media plus the raw words. `durationSec`
@@ -365,6 +404,8 @@ export function footageUrlForPath(ref: string): string {
 export function makeFootageMeta(params: {
   faceCamPath: string;
   screenPath: string;
+  faceCamSource?: VideoSourceRecord;
+  screenSource?: VideoSourceRecord;
   rawWords: Word[];
   fps?: number;
   width?: number;
@@ -374,34 +415,21 @@ export function makeFootageMeta(params: {
   const { faceCamPath, screenPath, rawWords } = params;
   const lastEnd = rawWords.length > 0 ? rawWords[rawWords.length - 1].end : 0;
   return {
-    faceCamPath: footageUrlForPath(faceCamPath),
-    screenPath: footageUrlForPath(screenPath),
+    faceCamPath: footageUrlForPath(
+      params.faceCamSource?.workingPath ?? faceCamPath
+    ),
+    screenPath: footageUrlForPath(
+      params.screenSource?.workingPath ?? screenPath
+    ),
+    ...(params.faceCamSource
+      ? { faceCamSource: params.faceCamSource }
+      : {}),
+    ...(params.screenSource
+      ? { screenSource: params.screenSource }
+      : {}),
     fps: params.fps ?? 30,
     width: params.width ?? 1920,
     height: params.height ?? 1080,
     durationSec: params.durationSec ?? lastEnd,
   };
-}
-
-/** Parse and validate a loaded words.json blob. Throws on malformed input. */
-export function parseRawWordsFile(json: unknown): RawWordsFile {
-  if (typeof json !== "object" || json === null) {
-    throw new Error("words.json: expected a JSON object");
-  }
-  const obj = json as Record<string, unknown>;
-  const words = obj.words;
-  if (!Array.isArray(words)) {
-    throw new Error("words.json: missing `words` array");
-  }
-  const parsed: Word[] = words.map((w, i) => {
-    if (typeof w !== "object" || w === null) {
-      throw new Error(`words.json: word ${i} is not an object`);
-    }
-    const rec = w as Record<string, unknown>;
-    if (typeof rec.text !== "string" || typeof rec.start !== "number" || typeof rec.end !== "number") {
-      throw new Error(`words.json: word ${i} missing text/start/end`);
-    }
-    return { text: rec.text, start: rec.start, end: rec.end };
-  });
-  return { text: typeof obj.text === "string" ? obj.text : "", words: parsed };
 }

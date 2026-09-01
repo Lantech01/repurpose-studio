@@ -1,0 +1,86 @@
+{
+  "mouse_click": {
+    "displayName": "Mouse Click",
+    "category": "Interaction",
+    "filename": "Mouse Click.wav",
+    "sourceDuration": 0.9288125,
+    "targetAmplitude": 0.5
+  },
+  "double_click": {
+    "displayName": "Double Click",
+    "category": "Interaction",
+    "filename": "mixkit-fast-double-click-on-mouse-275.wav",
+    "sourceDuration": 0.464988662,
+    "targetAmplitude": 0.5
+  },
+  "keyboard": {
+    "displayName": "Keyboard",
+    "category": "Interaction",
+    "filename": "Keyboard-Button-Click-06-c-FesliyanStudios.com_.wav",
+    "sourceDuration": 1.296,
+    "targetAmplitude": 0.2
+  },
+  "whoosh": {
+    "displayName": "Whoosh",
+    "category": "Transition",
+    "filename": "Whoosh 1.wav",
+    "sourceDuration": 2.188479167,
+    "targetAmplitude": 0.3
+  },
+  "air_hit": {
+    "displayName": "Air Hit",
+    "category": "Transition",
+    "filename": "mixkit-air-in-a-hit-2161.wav",
+    "sourceDuration": 1.276258503,
+    "targetAmplitude": 0.2
+  },
+  "ding": {
+    "displayName": "Correct Ding",
+    "category": "UI",
+    "filename": "Correct Ding.wav",
+    "sourceDuration": 2.951854167,
+    "targetAmplitude": 0.2
+  },
+  "notification": {
+    "displayName": "Notification",
+    "category": "UI",
+    "filename": "mixkit-bike-notification-bell-590.wav",
+    "sourceDuration": 0.974988662,
+    "targetAmplitude": 0.2
+  },
+  "camera_shutter": {
+    "displayName": "Camera Shutter",
+    "category": "Camera",
+    "filename": "Camera Shutter 5.wav",
+    "sourceDuration": 0.375,
+    "targetAmplitude": 0.2
+  },
+  "digital_shutter": {
+    "displayName": "Digital Shutter",
+    "category": "Camera",
+    "filename": "mixkit-camera-digital-shutter-1432.wav",
+    "sourceDuration": 1.511678005,
+    "targetAmplitude": 0.2
+  },
+  "riser": {
+    "displayName": "Riser",
+    "category": "Transition",
+    "filename": "Riser 3.wav",
+    "sourceDuration": 0.886375,
+    "targetAmplitude": 0.2
+  },
+  "impact": {
+    "displayName": "Impact",
+    "category": "Transition",
+    "filename": "Impact 7.wav",
+    "sourceDuration": 3.923145833,
+    "targetAmplitude": 0.2
+  },
+  "digital_readout": {
+    "displayName": "Digital Readout",
+    "category": "Signature",
+    "filename": "textdigitalreadout.wav",
+    "sourceDuration": 0.983604167,
+    "targetAmplitude": 0.2
+  }
+}

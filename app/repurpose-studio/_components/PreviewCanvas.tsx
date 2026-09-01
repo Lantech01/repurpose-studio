@@ -12,8 +12,8 @@
 //   - A DPR-correct <canvas> that calls the pure `drawFrame` (lib/repurpose/
 //     compositor.ts) every rAF / store change to composite screen (top) +
 //     face (bottom) per the current splitRatio and pan/zoom keyframes.
-//   - A draggable split-handle overlay (drag to change splitRatio, clamped
-//     0.4-0.6 by the store's setSplitRatio).
+//   - A draggable split-handle overlay (drag to change splitRatio across its
+//     full range, with endpoint snapping).
 //   - Per-region drag-to-pan and scroll-to-zoom, which write a new pan/zoom
 //     keyframe at the current playhead for that track.
 //
@@ -32,6 +32,16 @@ import {
   type OverlayDraw,
 } from "@/lib/repurpose/compositor";
 import { useRepurposeStore } from "@/lib/repurpose/store";
+import { synchronizeMediaTime } from "@/lib/repurpose/media-sync";
+import {
+  BASE_MEDIA_DRIFT_TOLERANCE_SEC,
+  EXTERNAL_SEEK_TOLERANCE_SEC,
+  OVERLAY_MEDIA_DRIFT_TOLERANCE_SEC,
+  reanchorTransport,
+  sampleTransport,
+  startTransport,
+  type TransportAnchor,
+} from "@/lib/repurpose/transport-clock";
 import {
   timelineToSourceTime,
   transitionProgressAt,
@@ -41,22 +51,40 @@ import {
   punchScaleAt,
 } from "@/lib/repurpose/time-map";
 import { gradeFilter } from "@/lib/repurpose/color-grade";
-import { drawCaptions } from "@/lib/repurpose/captions";
+import {
+  activeCaptionBlockAt,
+  drawCaptions,
+  type CaptionBlock,
+  type CaptionLayout,
+  type CaptionStyle,
+} from "@/lib/repurpose/captions";
 import { loadCaptionFonts } from "@/lib/repurpose/caption-fonts";
-import type { Clip } from "@/lib/repurpose/types";
+import type { Clip, Overlay } from "@/lib/repurpose/types";
 import {
   CONTIGUOUS_CUT_EPSILON,
   nextDiscontinuousCutsAfter,
   StandbySeeker,
 } from "@/lib/repurpose/preview-preseek";
 import type { PreviewRect } from "@/lib/repurpose/overlay-geometry";
-import { clampOverlayToTopHalf } from "@/lib/repurpose/overlay-geometry";
+import {
+  isOverlayBandVisible,
+  resolveEffectivePrimaryOverlay,
+} from "@/lib/repurpose/overlay-geometry";
+import {
+  resolveOverlayAppearanceAt,
+  type OverlayFrameSnapshot,
+} from "@/lib/repurpose/overlay-effects";
+import {
+  clampSplitRatio,
+  effectiveSplitRatio,
+  snapPointerSplitRatio,
+} from "@/lib/repurpose/split-ratio";
 import { GhostOverflowLayer } from "./GhostOverflowLayer";
 import { SnapGuides } from "./SnapGuides";
 import { useObjectSelection } from "./useObjectSelection";
 import { useDeselectOnOutsideClick } from "./useDeselectOnOutsideClick";
 import { useSfxPreview, useMusicPreview } from "./useSfxPreview";
-import { useFacecamProxy } from "./useFacecamProxy";
+import { useVideoProxy } from "./useVideoProxy";
 import { SelectionOverlay } from "./SelectionOverlay";
 import { SelectionToolbar } from "./SelectionToolbar";
 
@@ -74,12 +102,40 @@ export interface PreviewCanvasProps {
   height?: number;
   /** Extra className applied to the outer wrapper (sizing/positioning is the caller's job). */
   className?: string;
+  /** Test/dev injection for deterministic monotonic-frame scheduling. */
+  frameScheduler?: PreviewFrameScheduler;
 }
 
-const MIN_SPLIT = 0.4;
-const MAX_SPLIT = 0.6;
+export interface PreviewFrameScheduler {
+  request(callback: FrameRequestCallback): number;
+  cancel(id: number): void;
+  now(): number;
+}
+
+const BROWSER_FRAME_SCHEDULER: PreviewFrameScheduler = {
+  request: (callback) => requestAnimationFrame(callback),
+  cancel: (id) => cancelAnimationFrame(id),
+  now: () => performance.now(),
+};
+
 const ZOOM_MIN = 1;
 const ZOOM_MAX = 6;
+const BASE_MEDIA_LOAD_ERROR =
+  "Chrome could not load this video. Re-import it to create a compatible copy.";
+const BASE_MEDIA_PLAY_ERROR =
+  "Chrome could not start this video. Re-import it to create a compatible copy.";
+const BASE_MEDIA_FUTURE_DATA = 3;
+
+interface OverlayFailure {
+  id: string;
+  src: string;
+  reason: string;
+  wasActive: boolean;
+}
+
+function overlayFailureKey(id: string, src: string): string {
+  return `${id}\u0000${src}`;
+}
 
 // Size of the double-buffer video pool PER SOURCE: 1 active pair +
 // (SLOT_COUNT - 1) standby pairs. Depth 2 means the NEXT cut *and* the cut
@@ -90,20 +146,6 @@ const ZOOM_MAX = 6;
 const SLOT_COUNT = 3;
 const STANDBY_DEPTH = SLOT_COUNT - 1;
 const SLOT_INDICES = Array.from({ length: SLOT_COUNT }, (_, i) => i);
-
-// During playback the FACE video is the master clock: within one contiguous
-// clip we DERIVE the playhead from faceVideo.currentTime rather than advancing
-// it by wall time and re-seeking the video to match. That was the old glitch --
-// two independent clocks (the store playhead vs. the video's own currentTime)
-// disagreed every frame, so a >tolerance drift check hard-seeked the face video
-// back constantly, stuttering it. Now we only hard-seek at a CLIP CUT (a real
-// source discontinuity); mid-clip the video decodes smoothly and the playhead
-// follows it, so there is nothing to stutter.
-//
-// A tiny guard band: treat the video as "still inside this clip" until its
-// currentTime reaches within this many seconds of the clip's srcEnd, then hand
-// off to the next clip. One frame at 30fps.
-const CLIP_CUT_EPSILON = 1 / 30;
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
@@ -119,16 +161,6 @@ function activeClipAt(clips: readonly Clip[], t: number): Clip | null {
   }
   // At/just past the very end, the last kept clip is still the active one.
   if (lastKept && t >= lastKept.timelineEnd) return lastKept;
-  return null;
-}
-
-/** The next kept clip AFTER `clip` in array order, or null if it's the last. */
-function nextKeptClipAfter(clips: readonly Clip[], clip: Clip): Clip | null {
-  const idx = clips.indexOf(clip);
-  if (idx < 0) return null;
-  for (let i = idx + 1; i < clips.length; i++) {
-    if (clips[i].kept) return clips[i];
-  }
   return null;
 }
 
@@ -152,6 +184,127 @@ interface RegionDragState {
   startTransform: { x: number; y: number; scale: number };
 }
 
+interface SplitDividerGesture {
+  pointerId: number;
+  token: string;
+  element: HTMLDivElement;
+  onMove: (event: PointerEvent) => void;
+  onUp: (event: PointerEvent) => void;
+  onCancel: (event: PointerEvent) => void;
+}
+
+interface CaptionPointerGesture {
+  pointerId: number;
+  token: string;
+  element: HTMLDivElement;
+  blockId: string;
+  sourceFrame: number;
+  startClientY: number;
+  cssHeight: number;
+  startAnchorY: number;
+  finalAnchorY: number;
+  anchorRange: { min: number; max: number };
+  settledSplit: number;
+  attachedTargetAnchorY: number | null;
+  activated: boolean;
+  snapped: boolean;
+  onMove: (event: PointerEvent) => void;
+  onUp: (event: PointerEvent) => void;
+  onCancel: (event: PointerEvent) => void;
+}
+
+interface CaptionFrameLayout {
+  layout: CaptionLayout;
+  outputTime: number;
+  sourceTime: number;
+  renderedSplit: number;
+  settledSplit: number;
+  projectEpoch: number;
+  captionStyle: CaptionStyle;
+  captionBlocks: CaptionBlock[];
+  clips: Clip[];
+  keyboardPlacement: {
+    attached: boolean;
+    requestedPositionYPct: number;
+  } | null;
+}
+
+function updateCaptionSliderValue(
+  target: HTMLDivElement,
+  requestedPositionYPct: number,
+  attached: boolean
+): void {
+  const value = Math.round(
+    Math.max(0, Math.min(1, requestedPositionYPct)) * 100
+  );
+  target.setAttribute("aria-valuenow", String(value));
+  target.setAttribute(
+    "aria-valuetext",
+    `${attached ? "Attached to split" : "Detached"} at ${value}%`
+  );
+}
+
+function PreviewOverlayVideo({
+  overlay,
+  isPlaying,
+  register,
+  reportFailure,
+}: {
+  overlay: Overlay;
+  isPlaying: boolean;
+  register: (element: HTMLVideoElement | null, previewSrc: string) => void;
+  reportFailure: () => void;
+}) {
+  const proxy = useVideoProxy({
+    target: { kind: "overlay", id: overlay.id },
+    source: overlay.videoSource,
+    fallbackSrc: overlay.src,
+    durationSec: overlay.srcDuration,
+    isPlaying,
+  });
+  const previewSrc = proxy.src ?? overlay.src;
+
+  return (
+    <video
+      data-overlay-id={overlay.id}
+      data-overlay-src={previewSrc}
+      ref={(element) => register(element, previewSrc)}
+      src={previewSrc}
+      muted
+      playsInline
+      preload="auto"
+      className="hidden"
+      onError={() => {
+        if (proxy.usingProxy) proxy.onSrcError();
+        else reportFailure();
+      }}
+      onLoadedMetadata={(event) => {
+        const element = event.currentTarget;
+        if (element.videoWidth <= 0 || element.videoHeight <= 0) return;
+        const current = useRepurposeStore
+          .getState()
+          .overlays.find(
+            (candidate) =>
+              candidate.id === overlay.id && candidate.src === overlay.src
+          );
+        if (current && (current.naturalWidth <= 0 || current.naturalHeight <= 0)) {
+          useRepurposeStore.setState((state) => ({
+            overlays: state.overlays.map((candidate) =>
+              candidate.id === overlay.id
+                ? {
+                    ...candidate,
+                    naturalWidth: element.videoWidth,
+                    naturalHeight: element.videoHeight,
+                  }
+                : candidate
+            ),
+          }));
+        }
+      }}
+    />
+  );
+}
+
 /**
  * Live 1080x1920 split-screen compositor preview. Renders the current frame
  * via the pure `drawFrame` module, and exposes drag-to-pan / scroll-to-zoom /
@@ -161,6 +314,7 @@ export function PreviewCanvas({
   width = DEFAULT_WIDTH,
   height = DEFAULT_HEIGHT,
   className,
+  frameScheduler = BROWSER_FRAME_SCHEDULER,
 }: PreviewCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // The consolidated interaction-layer div -- held so the wheel-zoom handler can
@@ -170,7 +324,7 @@ export function PreviewCanvas({
   // DOUBLE-BUFFERED base videos: SLOT_COUNT
   // hidden <video> slots per source file, ordered by slotOrderRef -- a ring
   // where order[0] is the ACTIVE pair (the compositor paints it and the face
-  // element of that pair is the master clock + the audio) and order[1..] are
+  // element of that pair carries audio) and order[1..] are
   // the STANDBY pairs: paused, pre-seeked (by the StandbySeekers below) to the
   // next STANDBY_DEPTH discontinuous cuts' source in-points. Crossing a cut
   // ROTATES the ring (order[1] promotes to active, the freed active goes to
@@ -185,12 +339,6 @@ export function PreviewCanvas({
     Array(SLOT_COUNT).fill(null)
   );
   const slotOrderRef = useRef<number[]>([...SLOT_INDICES]);
-  // Monotonic swap counter: the async autoplay-rejection revert in the rAF
-  // loop must only undo the swap it belongs to. If a rapid double-cut (or a
-  // user pause) lands between a swap and its play-promise rejection, the
-  // generation won't match and the stale revert becomes a no-op instead of
-  // rotating slotOrderRef against the wrong baseline.
-  const swapGenRef = useRef(0);
   const activeScreen = useCallback(
     () => screenElsRef.current[slotOrderRef.current[0]],
     []
@@ -199,6 +347,15 @@ export function PreviewCanvas({
     () => faceElsRef.current[slotOrderRef.current[0]],
     []
   );
+  const normalizeBaseMute = useCallback(() => {
+    const activeSlot = slotOrderRef.current[0];
+    for (const video of screenElsRef.current) {
+      if (video) video.muted = true;
+    }
+    for (const [slot, video] of faceElsRef.current.entries()) {
+      if (video) video.muted = slot !== activeSlot;
+    }
+  }, []);
   // Serialized pre-seek managers, one per STANDBY ring position (k = 0 parks
   // at the next cut, k = 1 at the cut after, ...). getEl() is resolved fresh
   // on every call because WHICH element sits at each position rotates at every
@@ -223,27 +380,115 @@ export function PreviewCanvas({
   }
   const rafRef = useRef<number | null>(null);
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
-  // rAF timestamp of the previous playing frame; null forces the next frame to
-  // seed it (so the first frame after pressing play never takes a giant jump).
-  const lastTimestampRef = useRef<number | null>(null);
-  // The playhead value the rAF clock itself last wrote. While playing,
-  // the face video is the master clock: it DERIVES the playhead every frame,
-  // which silently overwrote any playhead someone ELSE set (timeline click,
-  // transcript word click) one frame later -- the "clicking the timeline does
-  // nothing during playback" bug. Each tick compares the store playhead to
-  // this ref: a mismatch beyond one frame means a deliberate external seek,
-  // which the clock must HONOR (hard-seek both videos there) instead of
-  // clobbering. null = playback just (re)started, nothing to compare yet.
+  // The sole playback authority: output time sampled from one monotonic anchor.
+  // Media currentTime values are followers and may only be drift-corrected.
+  const transportAnchorRef = useRef<TransportAnchor | null>(null);
+  const transportGenerationRef = useRef(0);
+  const playbackAttemptRef = useRef(0);
+  const transportConfirmedRef = useRef(false);
+  const sourceIdentityRef = useRef("");
+  const screenSourceIdentityRef = useRef("");
+  const faceSourceIdentityRef = useRef("");
+  const screenWorkingSourceIdentityRef = useRef("");
+  const mountedRef = useRef(true);
+  const overlayPlaybackSessionRef = useRef(0);
+  const overlayPlaybackAttemptRef = useRef(0);
+  const overlayPlayPendingRef = useRef<
+    Map<
+      string,
+      {
+        attempt: number;
+        session: number;
+        video: HTMLVideoElement;
+        src: string;
+      }
+    >
+  >(new Map());
+  const videoPoolRef = useRef<Map<string, HTMLVideoElement>>(new Map());
+  const overlayFailuresRef = useRef<Map<string, OverlayFailure>>(new Map());
+  const blockedOverlayFailureRef = useRef<string | null>(null);
+  const baseReadinessRef = useRef({
+    sourceIdentity: "",
+    screenErrorReason: null as string | null,
+    faceErrorReason: null as string | null,
+    playbackErrorReason: null as string | null,
+    screenReady: false,
+    faceReady: false,
+  });
+  // The last output time written by the transport. A larger mismatch means an
+  // external timeline/transcript seek, which re-anchors before the next sample.
   const expectedPlayheadRef = useRef<number | null>(null);
-  // The split ratio ACTUALLY composited this frame -- per-clip, eased across
-  // cuts (splitRatioAt). The rAF loop writes it here every frame so the split
-  // handle overlay + the pan/zoom region divider can sit on the real seam the
-  // video is drawn at, not the raw global default. A ref (read by the DOM handle
-  // position) + a throttled state mirror (to re-render the handle) so we don't
-  // setState 60x/sec. Seeded to the default split (0.5) for the very first paint;
-  // the loop overwrites it on frame 1 with the real per-scene value.
+  // The settled per-frame split, excluding direct divider manipulation. Mutation
+  // paths read only this ref; visual paths may layer transientSplitRef over it.
   const liveSplitRef = useRef<number>(0.5);
+  const transientSplitRef = useRef<number | null>(null);
+  const splitGestureRef = useRef<SplitDividerGesture | null>(null);
+  const splitGestureStoreUpdateRef = useRef(false);
+  const captionLayoutRef = useRef<CaptionLayout | null>(null);
+  const captionFrameRef = useRef<CaptionFrameLayout | null>(null);
+  const captionHitTargetRef = useRef<HTMLDivElement>(null);
+  const captionSnapGuideRef = useRef<HTMLDivElement>(null);
+  const captionTransientPositionRef = useRef<{
+    blockId: string;
+    positionYPct: number;
+  } | null>(null);
+  const captionGestureRef = useRef<CaptionPointerGesture | null>(null);
   const [handleSplit, setHandleSplit] = useState<number>(0.5);
+  const handleSplitRef = useRef<number>(0.5);
+  const getEffectiveSplitRatio = useCallback(
+    () =>
+      effectiveSplitRatio(
+        transientSplitRef.current ?? liveSplitRef.current,
+        height
+      ),
+    [height]
+  );
+  const getSettledSplitRatio = useCallback(() => liveSplitRef.current, []);
+  const overlayFrameSnapshotRef = useRef<OverlayFrameSnapshot | null>(null);
+  const getOverlayFrameSnapshot = useCallback(
+    () => overlayFrameSnapshotRef.current,
+    []
+  );
+  const publishCaptionLayout = useCallback(
+    (layout: CaptionLayout | null) => {
+      captionLayoutRef.current = layout;
+      const target = captionHitTargetRef.current;
+      const container = containerRef.current;
+      if (!target || !container || !layout) {
+        if (target) {
+          target.hidden = true;
+          target.style.pointerEvents = "none";
+          target.style.cursor = "";
+        }
+        return;
+      }
+      const rect = container.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) {
+        target.hidden = true;
+        target.style.pointerEvents = "none";
+        target.style.cursor = "";
+        return;
+      }
+      const bounds = layout.visualBounds;
+      target.style.left = `${(bounds.left / width) * rect.width}px`;
+      target.style.top = `${(bounds.top / height) * rect.height}px`;
+      target.style.width = `${((bounds.right - bounds.left) / width) * rect.width}px`;
+      target.style.height = `${((bounds.bottom - bounds.top) / height) * rect.height}px`;
+      target.style.pointerEvents = "auto";
+      target.style.cursor = "ns-resize";
+      updateCaptionSliderValue(
+        target,
+        layout.requestedAnchorY / height,
+        layout.style.pinToSplit
+      );
+      target.hidden = false;
+    },
+    [height, width]
+  );
+  const hideCaptionSnapGuide = useCallback(() => {
+    const guide = captionSnapGuideRef.current;
+    if (guide) guide.hidden = true;
+  }, []);
   // Alignment grid (rule-of-thirds + center crosshair) to eyeball-center an
   // overlay. Toggled from the top bar (store-owned so the navbar button and this
   // preview share one source of truth). DOM-only -- it is a sibling above the
@@ -267,8 +512,6 @@ export function PreviewCanvas({
   }, []);
 
   const splitRatio = useRepurposeStore((s) => s.splitRatio);
-  const setSplitRatio = useRepurposeStore((s) => s.setSplitRatio);
-  const setClipSplitRatio = useRepurposeStore((s) => s.setClipSplitRatio);
   const setClipFaceFraming = useRepurposeStore((s) => s.setClipFaceFraming);
   const setClipScreenFraming = useRepurposeStore((s) => s.setClipScreenFraming);
   const playhead = useRepurposeStore((s) => s.playhead);
@@ -286,26 +529,152 @@ export function PreviewCanvas({
   const captionStyle = useRepurposeStore((s) => s.captionStyle);
   const captionBlocks = useRepurposeStore((s) => s.captionBlocks);
   const overlays = useRepurposeStore((s) => s.overlays);
+  const sourceImportActive = useRepurposeStore(
+    (s) =>
+      s.sourceImportOwners.screen !== null ||
+      s.sourceImportOwners.face !== null
+  );
   const setPlayhead = useRepurposeStore((s) => s.setPlayhead);
   const pause = useRepurposeStore((s) => s.pause);
+  const setMediaReadiness = useRepurposeStore((s) => s.setMediaReadiness);
 
-  // Make the generated SFX bed audible during live preview, synced to the
-  // playhead and summing acoustically with the face-cam <video> audio.
-  const sfxTrack = useRepurposeStore((s) => s.sfxTrack);
-  useSfxPreview(sfxTrack);
+  const sfxClips = useRepurposeStore((s) => s.sfxClips);
+  const sfxAssets = useRepurposeStore((s) => s.sfxAssets);
+  const [sfxWarning, setSfxWarning] = useState<string | null>(null);
+  useSfxPreview(sfxClips, sfxAssets, setSfxWarning);
   const musicTrack = useRepurposeStore((s) => s.musicTrack);
   useMusicPreview(musicTrack);
 
-  // LOW-RES PREVIEW PROXY for the facecam raw. The hook hands back the
-  // src the face <video> slots should use: the original streaming URL until a
-  // one-time ffmpeg proxy is built server-side, then (on the next pause) the
-  // proxy URL -- tiny file, keyframe every 0.5s, so scrubbing and cold-cut
-  // fallback seeks are near-instant. EXPORT still reads footageMeta.faceCamPath
-  // directly and is untouched by this swap.
-  const faceProxy = useFacecamProxy(
-    footageMeta?.faceCamPath,
-    footageMeta?.durationSec,
-    isPlaying
+  const screenProxy = useVideoProxy({
+    target: { kind: "footage", role: "screen" },
+    source: footageMeta?.screenSource,
+    fallbackSrc: footageMeta?.screenPath || undefined,
+    durationSec: footageMeta?.durationSec,
+    isPlaying,
+  });
+  const faceProxy = useVideoProxy({
+    target: { kind: "footage", role: "face" },
+    source: footageMeta?.faceCamSource,
+    fallbackSrc: footageMeta?.faceCamPath || undefined,
+    durationSec: footageMeta?.durationSec,
+    isPlaying,
+  });
+  const screenSourceIdentity = screenProxy.src ?? "";
+  const faceSourceIdentity = faceProxy.src ?? "";
+  const baseSourceIdentity = `${screenSourceIdentity}\u0000${faceSourceIdentity}`;
+  const screenWorkingSourceIdentity = footageMeta?.screenSource
+    ? `${footageMeta.screenSource.workingPath}\u0000${footageMeta.screenSource.inspection.fingerprint}`
+    : footageMeta?.screenPath ?? "";
+
+  const reconcileMediaReadiness = useCallback(() => {
+    const state = useRepurposeStore.getState();
+    if (
+      state.sourceImportOwners.screen !== null ||
+      state.sourceImportOwners.face !== null
+    ) {
+      return;
+    }
+    let activeOverlayFailure: [string, OverlayFailure] | null = null;
+    for (const [key, failure] of overlayFailuresRef.current) {
+      const overlay = state.overlays.find(
+        (candidate) =>
+          candidate.id === failure.id &&
+          candidate.kind === "video" &&
+          candidate.src === failure.src
+      );
+      if (!overlay) {
+        overlayFailuresRef.current.delete(key);
+        continue;
+      }
+      const isActive =
+        state.playhead >= overlay.timelineStart &&
+        state.playhead < overlay.timelineEnd;
+      if (isActive) {
+        failure.wasActive = true;
+        activeOverlayFailure ??= [key, failure];
+      } else if (failure.wasActive) {
+        overlayFailuresRef.current.delete(key);
+      }
+    }
+
+    const cycle = baseReadinessRef.current;
+    const baseErrorReason =
+      cycle.playbackErrorReason ??
+      cycle.screenErrorReason ??
+      cycle.faceErrorReason;
+    if (
+      cycle.sourceIdentity === sourceIdentityRef.current &&
+      baseErrorReason
+    ) {
+      setMediaReadiness("error", baseErrorReason);
+      return;
+    }
+    if (activeOverlayFailure) {
+      const [key, failure] = activeOverlayFailure;
+      blockedOverlayFailureRef.current = key;
+      pause();
+      setMediaReadiness("error", failure.reason);
+      return;
+    }
+
+    blockedOverlayFailureRef.current = null;
+    if (!screenSourceIdentity || !faceSourceIdentity) {
+      setMediaReadiness("idle");
+      return;
+    }
+    setMediaReadiness(
+      cycle.screenReady && cycle.faceReady ? "ready" : "loading"
+    );
+  }, [faceSourceIdentity, pause, screenSourceIdentity, setMediaReadiness]);
+
+  const reportBaseCanPlay = useCallback(
+    (
+      role: "screen" | "face",
+      slot: number,
+      video: HTMLVideoElement
+    ) => {
+      const cycle = baseReadinessRef.current;
+      if (
+        cycle.sourceIdentity !== sourceIdentityRef.current ||
+        slotOrderRef.current[0] !== slot ||
+        video.readyState < BASE_MEDIA_FUTURE_DATA ||
+        video.videoWidth <= 0 ||
+        video.videoHeight <= 0
+      )
+        return;
+
+      if (role === "screen") cycle.screenReady = true;
+      else cycle.faceReady = true;
+      reconcileMediaReadiness();
+    },
+    [reconcileMediaReadiness]
+  );
+
+  const reportRequiredBaseError = useCallback(
+    (role: "screen" | "face", slot: number) => {
+      if (slotOrderRef.current[0] !== slot) {
+        const standbyIndex = slotOrderRef.current.indexOf(slot) - 1;
+        if (standbyIndex >= 0) {
+          const seekers =
+            role === "screen" ? screenSeekersRef.current : faceSeekersRef.current;
+          seekers?.[standbyIndex]?.reset();
+        }
+        return;
+      }
+      const cycle = baseReadinessRef.current;
+      if (
+        cycle.sourceIdentity !== sourceIdentityRef.current ||
+        (role === "screen"
+          ? cycle.screenErrorReason !== null
+          : cycle.faceErrorReason !== null)
+      )
+        return;
+      if (role === "screen") cycle.screenErrorReason = BASE_MEDIA_LOAD_ERROR;
+      else cycle.faceErrorReason = BASE_MEDIA_LOAD_ERROR;
+      pause();
+      reconcileMediaReadiness();
+    },
+    [pause, reconcileMediaReadiness]
   );
 
   // Keep latest store values in refs so the rAF loop (mounted once) always
@@ -365,6 +734,281 @@ export function PreviewCanvas({
     overlays,
   ]);
 
+  const invalidatePlaybackAttempt = useCallback(() => {
+    playbackAttemptRef.current += 1;
+    transportConfirmedRef.current = false;
+    transportAnchorRef.current = null;
+    expectedPlayheadRef.current = null;
+  }, []);
+
+  const invalidateOverlayPlayback = useCallback(() => {
+    overlayPlaybackSessionRef.current += 1;
+    overlayPlayPendingRef.current.clear();
+  }, []);
+
+  const playRequiredBaseMedia = useCallback(
+    (
+      screenVideo: HTMLVideoElement | null,
+      faceVideo: HTMLVideoElement | null,
+      preferredOutput?: number
+    ): number | null => {
+      invalidatePlaybackAttempt();
+      if (!screenVideo || !faceVideo) return null;
+      const attempt = playbackAttemptRef.current;
+      const sourceIdentity = sourceIdentityRef.current;
+      const failRequiredBaseMedia = () => {
+        const owners = useRepurposeStore.getState().sourceImportOwners;
+        if (owners.screen !== null || owners.face !== null) return;
+        const stillCurrent =
+          mountedRef.current &&
+          playbackAttemptRef.current === attempt &&
+          sourceIdentityRef.current === sourceIdentity &&
+          useRepurposeStore.getState().isPlaying;
+        if (!stillCurrent) return;
+        const cycle = baseReadinessRef.current;
+        if (cycle.sourceIdentity === sourceIdentity) {
+          cycle.playbackErrorReason = BASE_MEDIA_PLAY_ERROR;
+        }
+        screenVideo.pause();
+        faceVideo.pause();
+        pause();
+        reconcileMediaReadiness();
+      };
+      const playPromises = [screenVideo, faceVideo].map((video) => {
+        try {
+          return Promise.resolve(video.play());
+        } catch (error) {
+          return Promise.reject(error);
+        }
+      });
+      for (const playPromise of playPromises) {
+        void playPromise.catch(failRequiredBaseMedia);
+      }
+
+      void Promise.allSettled(playPromises).then((results) => {
+        const stillCurrent =
+          mountedRef.current &&
+          playbackAttemptRef.current === attempt &&
+          sourceIdentityRef.current === sourceIdentity &&
+          useRepurposeStore.getState().isPlaying;
+        if (!stillCurrent) return;
+
+        if (results.some((result) => result.status === "rejected")) {
+          failRequiredBaseMedia();
+          return;
+        }
+
+        const state = useRepurposeStore.getState();
+        const outputSec = preferredOutput ?? state.playhead;
+        const rate = state.playbackRate > 0 ? state.playbackRate : 1;
+        transportAnchorRef.current = startTransport(
+          outputSec,
+          frameScheduler.now(),
+          rate,
+          ++transportGenerationRef.current
+        );
+        expectedPlayheadRef.current = outputSec;
+        transportConfirmedRef.current = true;
+      });
+      return attempt;
+    },
+    [
+      frameScheduler,
+      invalidatePlaybackAttempt,
+      pause,
+      reconcileMediaReadiness,
+    ]
+  );
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      invalidateOverlayPlayback();
+      invalidatePlaybackAttempt();
+    };
+  }, [invalidateOverlayPlayback, invalidatePlaybackAttempt]);
+
+  useEffect(() => {
+    const previousCycle = baseReadinessRef.current;
+    const screenChanged =
+      screenSourceIdentityRef.current !== screenSourceIdentity;
+    const faceChanged = faceSourceIdentityRef.current !== faceSourceIdentity;
+    const screenWorkingChanged =
+      screenWorkingSourceIdentityRef.current !== screenWorkingSourceIdentity;
+    screenSourceIdentityRef.current = screenSourceIdentity;
+    faceSourceIdentityRef.current = faceSourceIdentity;
+    screenWorkingSourceIdentityRef.current = screenWorkingSourceIdentity;
+    sourceIdentityRef.current = baseSourceIdentity;
+    baseReadinessRef.current = {
+      sourceIdentity: baseSourceIdentity,
+      screenErrorReason: screenChanged
+        ? null
+        : previousCycle.screenErrorReason,
+      faceErrorReason: faceChanged ? null : previousCycle.faceErrorReason,
+      playbackErrorReason:
+        screenChanged || faceChanged
+          ? null
+          : previousCycle.playbackErrorReason,
+      screenReady: screenChanged ? false : previousCycle.screenReady,
+      faceReady: faceChanged ? false : previousCycle.faceReady,
+    };
+    if (screenWorkingChanged) {
+      slotOrderRef.current = [...SLOT_INDICES];
+      faceSeekersRef.current?.forEach((seeker) => seeker.reset());
+      screenSeekersRef.current?.forEach((seeker) => seeker.reset());
+    } else {
+      if (faceChanged) {
+        faceSeekersRef.current?.forEach((seeker) => seeker.reset());
+      }
+      if (screenChanged) {
+        screenSeekersRef.current?.forEach((seeker) => seeker.reset());
+      }
+    }
+    if (screenChanged || faceChanged) {
+      const live = liveRef.current;
+      const srcTime = timelineToSourceTime(live.clips, live.playhead);
+      const sourceIdentity = baseSourceIdentity;
+      const seekActive = (
+        role: "screen" | "face",
+        video: HTMLVideoElement | null
+      ) => {
+        if (!video || srcTime === null) return;
+        const apply = () => {
+          const current = role === "screen" ? activeScreen() : activeFace();
+          if (
+            sourceIdentityRef.current === sourceIdentity &&
+            current === video &&
+            Math.abs(video.currentTime - srcTime) > 1 / 60
+          ) {
+            video.currentTime = srcTime;
+          }
+        };
+        if (video.readyState >= 1) apply();
+        else video.addEventListener("loadedmetadata", apply, { once: true });
+      };
+      seekActive("screen", activeScreen());
+      seekActive("face", activeFace());
+      const cuts = nextDiscontinuousCutsAfter(
+        live.clips,
+        live.playhead,
+        STANDBY_DEPTH
+      );
+      cuts.forEach((cut, k) => {
+        faceSeekersRef.current?.[k]?.target(cut.seekSrc);
+        screenSeekersRef.current?.[k]?.target(cut.seekSrc);
+      });
+    }
+    normalizeBaseMute();
+    invalidateOverlayPlayback();
+    invalidatePlaybackAttempt();
+    reconcileMediaReadiness();
+    return invalidatePlaybackAttempt;
+  }, [
+    baseSourceIdentity,
+    faceSourceIdentity,
+    screenSourceIdentity,
+    screenWorkingSourceIdentity,
+    activeFace,
+    activeScreen,
+    invalidateOverlayPlayback,
+    invalidatePlaybackAttempt,
+    normalizeBaseMute,
+    reportBaseCanPlay,
+    reconcileMediaReadiness,
+  ]);
+
+  const reportOverlayFailure = useCallback(
+    (overlayId: string, src: string) => {
+      if (!mountedRef.current) return;
+      const key = overlayFailureKey(overlayId, src);
+      if (!overlayFailuresRef.current.has(key)) {
+        overlayFailuresRef.current.set(key, {
+          id: overlayId,
+          src,
+          reason: `Overlay video ${overlayId} could not play. Re-import it to create a compatible copy.`,
+          wasActive: false,
+        });
+      }
+      reconcileMediaReadiness();
+    },
+    [reconcileMediaReadiness]
+  );
+
+  const playActiveOverlay = useCallback(
+    (overlay: Overlay, video: HTMLVideoElement) => {
+      const session = overlayPlaybackSessionRef.current;
+      const pending = overlayPlayPendingRef.current.get(overlay.id);
+      if (
+        !video.paused ||
+        (pending &&
+          pending.session === session &&
+          pending.video === video &&
+          pending.src === overlay.src)
+      )
+        return;
+      const attempt = {
+        attempt: ++overlayPlaybackAttemptRef.current,
+        session,
+        video,
+        src: overlay.src,
+      };
+      overlayPlayPendingRef.current.set(overlay.id, attempt);
+      let playPromise: Promise<void>;
+      try {
+        playPromise = Promise.resolve(video.play());
+      } catch (error) {
+        playPromise = Promise.reject(error);
+      }
+      void playPromise.then(
+        () => {
+          if (overlayPlayPendingRef.current.get(overlay.id) === attempt) {
+            overlayPlayPendingRef.current.delete(overlay.id);
+          }
+        },
+        () => {
+          const state = useRepurposeStore.getState();
+          const currentOverlay = state.overlays.find(
+            (candidate) =>
+              candidate.id === overlay.id &&
+              candidate.kind === "video" &&
+              candidate.src === attempt.src
+          );
+          const isCurrent =
+            mountedRef.current &&
+            overlayPlaybackSessionRef.current === attempt.session &&
+            overlayPlayPendingRef.current.get(overlay.id) === attempt &&
+            videoPoolRef.current.get(overlay.id) === attempt.video &&
+            state.isPlaying &&
+            !!currentOverlay;
+          if (!isCurrent) return;
+          overlayPlayPendingRef.current.delete(overlay.id);
+          if (state.isPlaying) {
+            reportOverlayFailure(overlay.id, attempt.src);
+          }
+        }
+      );
+    },
+    [reportOverlayFailure]
+  );
+
+  useEffect(() => {
+    const currentSources = new Map(
+      overlays
+        .filter((overlay) => overlay.kind === "video")
+        .map((overlay) => [overlay.id, overlay.src])
+    );
+    for (const [id, pending] of overlayPlayPendingRef.current) {
+      if (currentSources.get(id) !== pending.src) {
+        overlayPlayPendingRef.current.delete(id);
+      }
+    }
+  }, [overlays]);
+
+  useEffect(() => {
+    reconcileMediaReadiness();
+  }, [overlays, playhead, sourceImportActive, reconcileMediaReadiness]);
+
   // --- Overlay media pools ----------------------------------------------------
   // Image overlays decode ONCE into an HTMLImageElement (kept in imgPoolRef,
   // keyed by overlay id). Video overlays get one hidden pooled <video> each
@@ -374,7 +1018,11 @@ export function PreviewCanvas({
   // like the two base videos. A video overlay is ALWAYS muted (an overlay never
   // emits audio); the pooled <video> below sets `muted`.
   const imgPoolRef = useRef<Map<string, HTMLImageElement>>(new Map());
-  const videoPoolRef = useRef<Map<string, HTMLVideoElement>>(new Map());
+  const overlayPreviewSrcRef = useRef<Map<string, string>>(new Map());
+  const getOverlayPreviewSrc = useCallback(
+    (overlayId: string) => overlayPreviewSrcRef.current.get(overlayId),
+    []
+  );
 
   // --- Register the caption faces for canvas text (once on mount) -------------
   // Captions are drawn via ctx.fillText, so the browser must have loaded + added
@@ -526,37 +1174,6 @@ export function PreviewCanvas({
     };
   }, [footageMeta]);
 
-  // --- Re-sync the face slots after a proxy src swap -------------------------
-  // Changing <video>.src resets every face element to t=0. The swap only ever
-  // happens while paused, so: reset the face seekers (their in-flight state
-  // died with the old src), re-seek the active slot to the frame under the
-  // playhead once its metadata is in, and re-issue the standbys' pre-seek
-  // targets directly (the pre-seek effect won't re-run on its own --
-  // clips/playhead/footageMeta are all unchanged by a src swap).
-  useEffect(() => {
-    if (!faceProxy.src) return;
-    faceSeekersRef.current?.forEach((s) => s.reset());
-    const live = liveRef.current;
-    const srcTime = timelineToSourceTime(live.clips, live.playhead);
-    // Direct-seek ONLY the active slot; each standby belongs to its seeker
-    // (re-targeted below), and two writers issuing currentTime on the same
-    // element would interleave unpredictably.
-    const v = activeFace();
-    if (v && srcTime !== null) {
-      const apply = () => {
-        if (Math.abs(v.currentTime - srcTime) > 1 / 60) v.currentTime = srcTime;
-      };
-      if (v.readyState >= 1) apply();
-      else v.addEventListener("loadedmetadata", apply, { once: true });
-    }
-    const cuts = nextDiscontinuousCutsAfter(
-      live.clips,
-      live.playhead,
-      STANDBY_DEPTH
-    );
-    cuts.forEach((cut, k) => faceSeekersRef.current?.[k]?.target(cut.seekSrc));
-  }, [faceProxy.src, activeFace]);
-
   // --- Start/stop the source <video>s in lockstep with isPlaying -------------
   // Synchronizing the real play state of two external <video> elements with the
   // store flag is a true external-system sync -> Effect (keyed on isPlaying).
@@ -568,46 +1185,39 @@ export function PreviewCanvas({
   // stray rejection so a blocked promise never throws.
   // When flipping FALSE (pause / end-of-region): .pause() both videos.
   useEffect(() => {
+    let attempt: number | null = null;
     const screenVideo = activeScreen();
     const faceVideo = activeFace();
     if (isPlaying) {
-      lastTimestampRef.current = null; // first playing frame seeds the delta
-      expectedPlayheadRef.current = null; // fresh start -- no false "external seek"
+      const live = liveRef.current;
       const srcTime = timelineToSourceTime(
-        liveRef.current.clips,
-        liveRef.current.playhead
+        live.clips,
+        live.playhead
       );
       if (srcTime !== null) {
-        if (screenVideo && Math.abs(screenVideo.currentTime - srcTime) > 1 / 60) {
-          screenVideo.currentTime = srcTime;
-        }
-        if (faceVideo && Math.abs(faceVideo.currentTime - srcTime) > 1 / 60) {
-          faceVideo.currentTime = srcTime;
-        }
+        if (screenVideo)
+          synchronizeMediaTime(
+            screenVideo,
+            srcTime,
+            BASE_MEDIA_DRIFT_TOLERANCE_SEC
+          );
+        if (faceVideo)
+          synchronizeMediaTime(
+            faceVideo,
+            srcTime,
+            BASE_MEDIA_DRIFT_TOLERANCE_SEC
+          );
       }
       // FACE carries the audio (see the unmuted FACE <video> below); SCREEN
       // stays muted, so only the narration plays. Both still .play() to keep
       // their frames advancing in real time. The playback-rate effect below
       // (keyed on isPlaying too) sets .playbackRate on both, so the first
       // playing frame already runs at the chosen speed.
-      screenVideo?.play().catch(() => {});
-      faceVideo?.play().catch(() => {});
-      // Overlay videos: only the ones ACTIVE at the current playhead start; the
-      // rest stay paused until the rAF loop reaches their window. Seek each to
-      // its source frame first so it starts on the right picture. Always muted.
-      const t0 = liveRef.current.playhead;
-      for (const ov of liveRef.current.overlays) {
-        if (ov.kind !== "video") continue;
-        const v = videoPoolRef.current.get(ov.id);
-        if (!v) continue;
-        if (t0 >= ov.timelineStart && t0 < ov.timelineEnd) {
-          v.currentTime = ov.srcStart + (t0 - ov.timelineStart);
-          v.play().catch(() => {});
-        } else {
-          v.pause();
-        }
-      }
+      normalizeBaseMute();
+      attempt = playRequiredBaseMedia(screenVideo, faceVideo);
     } else {
+      invalidatePlaybackAttempt();
+      invalidateOverlayPlayback();
       // Pause BOTH slots -- the standby pair is normally already paused (it
       // only ever sits pre-seeked), but a swap that raced the pause could have
       // left the freed pair rolling; belt-and-braces stop everything.
@@ -615,15 +1225,25 @@ export function PreviewCanvas({
       for (const v of faceElsRef.current) v?.pause();
       for (const v of videoPoolRef.current.values()) v.pause();
     }
-  }, [isPlaying, activeScreen, activeFace]);
+    return () => {
+      if (attempt !== null && playbackAttemptRef.current === attempt) {
+        invalidatePlaybackAttempt();
+      }
+    };
+  }, [
+    isPlaying,
+    activeScreen,
+    activeFace,
+    baseSourceIdentity,
+    invalidateOverlayPlayback,
+    invalidatePlaybackAttempt,
+    normalizeBaseMute,
+    playRequiredBaseMedia,
+  ]);
 
-  // --- Apply the playback-rate multiplier to both source <video>s ------------
-  // The FACE video is the master clock while playing (its currentTime derives
-  // the playhead), so setting its playbackRate is what actually makes playback
-  // fast/slow; the SCREEN video matches so the (silent) frames stay locked. Also
-  // re-applied when isPlaying flips true, because seeding a video can reset its
-  // rate. The wall-clock fallback in the rAF loop reads the same rate from the
-  // live ref, so BOTH clock paths honor it.
+  // --- Apply playback rate and re-anchor the one monotonic clock --------------
+  // Every media follower receives the same rate. A rate change during playback
+  // preserves the current output time and starts a fresh monotonic anchor.
   useEffect(() => {
     const rate = playbackRate > 0 ? playbackRate : 1;
     // BOTH slots get the rate -- the standby pair must already carry the right
@@ -631,10 +1251,20 @@ export function PreviewCanvas({
     // post-cut frames would run at 1x.
     for (const v of screenElsRef.current) if (v) v.playbackRate = rate;
     for (const v of faceElsRef.current) if (v) v.playbackRate = rate;
-    // Overlay videos honor J/K/L speed too so their motion stays locked to the
-    // base composite (they are never the master clock -- just rate-matched).
+    // Overlay videos honor J/K/L speed too so their motion stays rate-matched.
     for (const v of videoPoolRef.current.values()) v.playbackRate = rate;
-  }, [playbackRate, isPlaying]);
+    const anchor = transportAnchorRef.current;
+    if (isPlaying && anchor && anchor.rate !== rate) {
+      const outputSec = expectedPlayheadRef.current ?? liveRef.current.playhead;
+      transportAnchorRef.current = reanchorTransport(
+        anchor,
+        outputSec,
+        frameScheduler.now(),
+        rate
+      );
+      transportGenerationRef.current = transportAnchorRef.current.generation;
+    }
+  }, [playbackRate, isPlaying, frameScheduler]);
 
   // --- Canvas setup (DPR-correct backing store, resizes with container) -----
   useEffect(() => {
@@ -673,212 +1303,156 @@ export function PreviewCanvas({
   // regionEnd = outPoint ?? duration. Crossing regionEnd either wraps to
   // regionStart (loop) or clamps to regionEnd + pause()s and stops the videos.
   //
-  // Frame-lock: while playing the videos free-run as the real-time source, so
-  // each frame we compare the FACE video's currentTime to the EXPECTED source
-  // time for the current playhead; if it has drifted past PLAYBACK_DRIFT_TOLERANCE
-  // (e.g. crossing a clip cut, where source time jumps but wall time doesn't) we
-  // re-seek BOTH videos so trimmed/deleted retakes never leak in and screen+face
-  // stay locked.
+  // Frame-lock: source videos free-run as followers. Each sampled output time is
+  // mapped through the kept clips and only corrects media beyond its drift limit.
   useEffect(() => {
     const tick = (timestamp: number) => {
+      // The callback being executed is no longer pending. Only the single
+      // schedule at the bottom may populate rafRef again.
+      rafRef.current = null;
       const live = liveRef.current;
+      let sampledOutput: number | null = null;
       // Resolve the ACTIVE pair fresh every frame -- a cut swap in an earlier
       // frame changes which physical elements these are, so they can never be
       // captured once at effect mount like they used to be.
-      const screenVideo = screenElsRef.current[slotOrderRef.current[0]];
-      const faceVideo = faceElsRef.current[slotOrderRef.current[0]];
+      let screenVideo = screenElsRef.current[slotOrderRef.current[0]];
+      let faceVideo = faceElsRef.current[slotOrderRef.current[0]];
 
-      // 1) CLOCK -- the FACE video is the master timebase. Within one contiguous
-      // clip we DERIVE the playhead from faceVideo.currentTime (smooth, no
-      // re-seeking); we only hard-seek at a clip CUT, where source time jumps.
-      if (live.isPlaying) {
+      // 1) CLOCK -- output time comes only from the monotonic transport anchor.
+      // Base and overlay media follow the mapped source time within drift limits.
+      if (
+        live.isPlaying &&
+        transportConfirmedRef.current &&
+        captionGestureRef.current === null
+      ) {
         const regionStart = live.inPoint ?? 0;
         const regionEnd = live.outPoint ?? live.duration;
-        const last = lastTimestampRef.current;
-        lastTimestampRef.current = timestamp;
-
-        // EXTERNAL SEEK: the store playhead moved since this clock
-        // last wrote it -> a timeline/transcript click mid-playback. Honor it:
-        // hard-seek both videos to the clicked time so the clock re-derives
-        // from there, instead of dragging the playhead back to wherever the
-        // video happened to be (which read as "clicking does nothing").
-        // Threshold = well past one frame of self-written drift. The proxy
-        // makes this seek fast; the videoWidth render gate holds the last
-        // frame during it, exactly like any cut.
-        const expected = expectedPlayheadRef.current;
-        if (expected !== null && Math.abs(live.playhead - expected) > 0.25) {
-          const jumpSrc = timelineToSourceTime(live.clips, live.playhead);
-          if (jumpSrc !== null) {
-            if (faceVideo) faceVideo.currentTime = jumpSrc;
-            if (screenVideo) screenVideo.currentTime = jumpSrc;
-          }
-          expectedPlayheadRef.current = live.playhead;
+        const rate = live.playbackRate > 0 ? live.playbackRate : 1;
+        let anchor = transportAnchorRef.current;
+        if (!anchor) {
+          anchor = startTransport(
+            live.playhead,
+            timestamp,
+            rate,
+            ++transportGenerationRef.current
+          );
+          transportAnchorRef.current = anchor;
         }
 
-        const clip = activeClipAt(live.clips, live.playhead);
-        // Fall back to wall-clock advancement only when we can't read the video
-        // as a clock this frame (not ready, paused mid-buffer, or no clip).
-        const canUseVideoClock =
-          !!clip && !!faceVideo && faceVideo.readyState >= 2 && !faceVideo.paused;
-
-        if (last !== null) {
-          let next: number;
-          if (canUseVideoClock && clip) {
-            const src = faceVideo.currentTime;
-            if (src >= clip.srcEnd - CLIP_CUT_EPSILON) {
-              // Reached this clip's out point -> CUT. Move to the next kept clip.
-              next = clip.timelineEnd;
-              const nextClip = nextKeptClipAfter(live.clips, clip);
-              // Only hard-seek when the next clip's source in-point is
-              // DISCONTINUOUS from where we are (a retake was trimmed out, or the
-              // clips were reordered). When the next line simply continues the
-              // same take back-to-back, the videos are already decoding the right
-              // frames -- seeking would stall the stream for ~1s and freeze the
-              // last frame. So we let playback roll straight through: seamless.
-              const contiguous =
-                !!nextClip &&
-                Math.abs(nextClip.srcStart - clip.srcEnd) <= CONTIGUOUS_CUT_EPSILON;
-              if (!contiguous) {
-                const seekSrc = timelineToSourceTime(live.clips, next);
-                if (seekSrc !== null) {
-                  // DOUBLE-BUFFER SWAP: the FIRST standby
-                  // pair has (usually) been sitting paused, pre-seeked to
-                  // exactly this source in-point since the pre-seek effect saw
-                  // this cut coming. If it's warm, promote it: rotate the slot
-                  // ring, match rate, move the audio (unmute new face / mute
-                  // old), play the new pair, park the old. The canvas paints
-                  // the new pair NEXT frame -- no live seek, no ~1s freeze on
-                  // the byte-range stream. The freed pair goes to the BACK of
-                  // the ring; the standby that was parked at the FOLLOWING cut
-                  // moves up to first, so a rapid double-cut swaps warm again
-                  // immediately.
-                  const order = slotOrderRef.current;
-                  const standbyFace = faceElsRef.current[order[1]];
-                  const standbyScreen = screenElsRef.current[order[1]];
-                  const swapReady =
-                    !!standbyFace &&
-                    !!standbyScreen &&
-                    !!faceVideo &&
-                    !!screenVideo &&
-                    !!faceSeekersRef.current?.[0]?.readyAt(seekSrc) &&
-                    !!screenSeekersRef.current?.[0]?.readyAt(seekSrc);
-                  if (swapReady) {
-                    const rate = live.playbackRate > 0 ? live.playbackRate : 1;
-                    const prevOrder = [...order];
-                    const gen = ++swapGenRef.current;
-                    slotOrderRef.current = [...order.slice(1), order[0]];
-                    standbyFace.playbackRate = rate;
-                    standbyScreen.playbackRate = rate;
-                    standbyFace.muted = false; // narration moves to the new face
-                    const playPromise = standbyFace.play();
-                    standbyScreen.play().catch(() => {});
-                    faceVideo.muted = true;
-                    faceVideo.pause();
-                    screenVideo.pause();
-                    // Re-target every standby seeker RIGHT NOW at the cuts
-                    // ahead of this boundary -- the React pre-seek effect will
-                    // also fire, but only after this tick's setPlayhead
-                    // renders, and a rapid double-cut can arrive sooner. Each
-                    // seeker rebinds to the element now sitting at its ring
-                    // position; the one already parked at the right in-point
-                    // no-ops, the freed pair starts seeking to the farthest
-                    // tracked cut immediately.
-                    const upcoming = nextDiscontinuousCutsAfter(
-                      live.clips,
-                      next,
-                      STANDBY_DEPTH
-                    );
-                    upcoming.forEach((c, k) => {
-                      faceSeekersRef.current?.[k]?.target(c.seekSrc);
-                      screenSeekersRef.current?.[k]?.target(c.seekSrc);
-                    });
-                    playPromise?.catch(() => {
-                      // Autoplay refused (shouldn't happen mid-session after a
-                      // real play gesture, but never leave a silent frozen
-                      // preview): revert THIS swap and fall back to the old
-                      // hard-seek of the original pair. The revert fires
-                      // async, so it is generation-guarded -- if a newer swap
-                      // (rapid double-cut) already rotated the ring, undoing
-                      // it here would corrupt the active/standby roles + mute
-                      // state; the stale revert must be a no-op instead.
-                      if (swapGenRef.current !== gen) return;
-                      slotOrderRef.current = prevOrder;
-                      // Drop every seeker's in-flight state -- their bindings
-                      // were re-targeted for the rotated ring above and would
-                      // fight the restored one; the pre-seek effect re-parks
-                      // them cleanly on its next run.
-                      faceSeekersRef.current?.forEach((s) => s.reset());
-                      screenSeekersRef.current?.forEach((s) => s.reset());
-                      standbyFace.muted = true;
-                      standbyFace.pause();
-                      standbyScreen.pause();
-                      faceVideo.muted = false;
-                      faceVideo.currentTime = seekSrc;
-                      screenVideo.currentTime = seekSrc;
-                      // Only resume if the user is still in playback -- a
-                      // pause that landed between swap and rejection wins.
-                      if (liveRef.current.isPlaying) {
-                        faceVideo.play().catch(() => {});
-                        screenVideo.play().catch(() => {});
-                      }
-                    });
-                  } else {
-                    // Standby not warm (project just loaded, a rapid
-                    // double-cut, or a clip shorter than the seek took): fall
-                    // back to hard-seeking the active pair -- exactly the old
-                    // behavior, never worse than before.
-                    if (faceVideo) faceVideo.currentTime = seekSrc;
-                    if (screenVideo) screenVideo.currentTime = seekSrc;
-                  }
-                }
-              }
-            } else {
-              // Mid-clip: playhead follows the smoothly-decoding video exactly.
-              next = clip.timelineStart + (src - clip.srcStart);
-              // Keep the (silent) screen video locked to the face timebase only
-              // if it has drifted noticeably -- a rare correction, not per-frame.
-              if (screenVideo && Math.abs(screenVideo.currentTime - src) > 0.15) {
-                screenVideo.currentTime = src;
-              }
-            }
-          } else {
-            // No usable video clock -> advance by real elapsed wall time, scaled
-            // by the playback rate (the video-clock path gets this for free via
-            // the videos' own playbackRate, so only the fallback multiplies here).
-            const rate = live.playbackRate > 0 ? live.playbackRate : 1;
-            next = live.playhead + ((timestamp - last) / 1000) * rate;
+        let previousOutput = expectedPlayheadRef.current ?? live.playhead;
+        const isExternalSeek =
+          expectedPlayheadRef.current !== null &&
+          Math.abs(live.playhead - expectedPlayheadRef.current) >
+            EXTERNAL_SEEK_TOLERANCE_SEC;
+        if (isExternalSeek) {
+          anchor = reanchorTransport(anchor, live.playhead, timestamp, rate);
+          transportAnchorRef.current = anchor;
+          transportGenerationRef.current = anchor.generation;
+          previousOutput = live.playhead;
+          const externalSeekSource = timelineToSourceTime(
+            live.clips,
+            live.playhead
+          );
+          if (externalSeekSource !== null) {
+            screenVideo && (screenVideo.currentTime = externalSeekSource);
+            faceVideo && (faceVideo.currentTime = externalSeekSource);
           }
+        }
 
-          if (next >= regionEnd) {
-            if (live.loopPlayback) {
-              setPlayhead(regionStart);
-              expectedPlayheadRef.current = regionStart;
-              const wrapSrc = timelineToSourceTime(live.clips, regionStart);
-              if (wrapSrc !== null) {
-                if (screenVideo) screenVideo.currentTime = wrapSrc;
-                if (faceVideo) faceVideo.currentTime = wrapSrc;
-              }
-            } else {
-              setPlayhead(regionEnd);
-              expectedPlayheadRef.current = regionEnd;
-              pause();
-              // Pause EVERY base slot, not the pair captured at the top of
-              // this tick: if a cut swap happened earlier in this same tick,
-              // screenVideo/faceVideo are the just-retired pair and the
-              // freshly promoted (unmuted, playing) pair would sail on for a
-              // frame until the isPlaying effect catches it. Sweeping both
-              // slots closes that gap; pausing an already-paused standby is a
-              // no-op.
-              for (const v of screenElsRef.current) v?.pause();
-              for (const v of faceElsRef.current) v?.pause();
-              lastTimestampRef.current = null;
+        let next = sampleTransport(anchor, timestamp, regionStart, regionEnd);
+        let reachedEnd = next >= regionEnd;
+        if (reachedEnd && live.loopPlayback) {
+          next = regionStart;
+          reachedEnd = false;
+          anchor = reanchorTransport(anchor, next, timestamp, rate);
+          transportAnchorRef.current = anchor;
+          transportGenerationRef.current = anchor.generation;
+        }
+
+        const previousClip = activeClipAt(live.clips, previousOutput);
+        const nextClip = activeClipAt(live.clips, next);
+        const crossedCut =
+          !!previousClip && !!nextClip && previousClip.id !== nextClip.id;
+        if (crossedCut && previousClip && nextClip) {
+          const discontinuous =
+            Math.abs(nextClip.srcStart - previousClip.srcEnd) >
+            CONTIGUOUS_CUT_EPSILON;
+          if (discontinuous) {
+            const seekSrc = timelineToSourceTime(live.clips, next);
+            const order = slotOrderRef.current;
+            const standbyFace = faceElsRef.current[order[1]];
+            const standbyScreen = screenElsRef.current[order[1]];
+            const swapReady =
+              seekSrc !== null &&
+              !!standbyFace &&
+              !!standbyScreen &&
+              !!faceVideo &&
+              !!screenVideo &&
+              !!faceSeekersRef.current?.[0]?.readyAt(nextClip.srcStart) &&
+              !!screenSeekersRef.current?.[0]?.readyAt(nextClip.srcStart);
+            if (swapReady && standbyFace && standbyScreen) {
+              slotOrderRef.current = [...order.slice(1), order[0]];
+              faceSeekersRef.current?.forEach((seeker) => seeker.reset());
+              screenSeekersRef.current?.forEach((seeker) => seeker.reset());
+              standbyFace.playbackRate = rate;
+              standbyScreen.playbackRate = rate;
+              normalizeBaseMute();
+              faceVideo!.pause();
+              screenVideo!.pause();
+              playRequiredBaseMedia(standbyScreen, standbyFace, next);
+
+              const upcoming = nextDiscontinuousCutsAfter(
+                live.clips,
+                next,
+                STANDBY_DEPTH
+              );
+              upcoming.forEach((cut, index) => {
+                faceSeekersRef.current?.[index]?.target(cut.seekSrc);
+                screenSeekersRef.current?.[index]?.target(cut.seekSrc);
+              });
             }
-          } else {
-            setPlayhead(next);
-            expectedPlayheadRef.current = next;
           }
+          anchor = reanchorTransport(anchor, next, timestamp, rate);
+          transportAnchorRef.current = anchor;
+          transportGenerationRef.current = anchor.generation;
+        }
+
+        const targetSource = timelineToSourceTime(live.clips, next);
+        const currentScreen = activeScreen();
+        const currentFace = activeFace();
+        if (targetSource !== null) {
+          if (currentScreen)
+            synchronizeMediaTime(
+              currentScreen,
+              targetSource,
+              BASE_MEDIA_DRIFT_TOLERANCE_SEC
+            );
+          if (currentFace)
+            synchronizeMediaTime(
+              currentFace,
+              targetSource,
+              BASE_MEDIA_DRIFT_TOLERANCE_SEC
+            );
+        }
+        // Exactly one playhead write per playing tick.
+        sampledOutput = next;
+        setPlayhead(next);
+        expectedPlayheadRef.current = next;
+
+        if (reachedEnd) {
+          pause();
+          for (const video of screenElsRef.current) video?.pause();
+          for (const video of faceElsRef.current) video?.pause();
+          for (const video of videoPoolRef.current.values()) video.pause();
+          transportAnchorRef.current = null;
         }
       }
+
+      // A discontinuous cut may have rotated the ring above. Render the newly
+      // promoted pair in this same half-open-boundary frame, never the retired
+      // pair captured at the beginning of the tick.
+      screenVideo = activeScreen();
+      faceVideo = activeFace();
 
       // 3) RENDER -- composite the current frame (playing or paused). Read the
       // freshest playhead from the ref (setPlayhead above updates it next frame,
@@ -887,7 +1461,7 @@ export function PreviewCanvas({
       if (ctx) {
         const {
           splitRatio: globalSplit,
-          playhead: t,
+          playhead: storedPlayhead,
           clips: liveClips,
           screenGrade: sg,
           faceGrade: fg,
@@ -895,17 +1469,26 @@ export function PreviewCanvas({
           captionStyle: capStyle,
           captionBlocks: capBlocks,
           overlays: liveOverlays,
-          isPlaying: playing,
+          isPlaying: requestedPlaying,
         } = liveRef.current;
+        const t = sampledOutput ?? storedPlayhead;
+        const playing = requestedPlaying && transportConfirmedRef.current;
 
-        // PER-SCENE split, eased across cuts (splitRatioAt). This is the split
-        // actually composited this frame -- a scene Manthan tucked the face up on
-        // keeps its own value, and the seam glides at the cut into it. Publish it
-        // so the DOM handle overlay + region dividers sit on the real seam; mirror
-        // to state only when it changes enough to matter (avoid a 60fps setState).
-        const liveSplit = splitRatioAt(liveClips, t, globalSplit);
-        if (Math.abs(liveSplit - liveSplitRef.current) > 1e-4) {
-          liveSplitRef.current = liveSplit;
+        // Resolve the settled per-scene split first, then layer a direct divider
+        // gesture over visual consumers only. Persisted mutations keep reading
+        // liveSplitRef while the compositor, captions, hit tests, and DOM chrome
+        // use liveSplit. Mirror visual changes to state only when needed.
+        const settledSplit = effectiveSplitRatio(
+          splitRatioAt(liveClips, t, globalSplit),
+          height
+        );
+        liveSplitRef.current = settledSplit;
+        const liveSplit =
+          transientSplitRef.current === null
+            ? settledSplit
+            : effectiveSplitRatio(transientSplitRef.current, height);
+        if (Math.abs(liveSplit - handleSplitRef.current) > 1e-4) {
+          handleSplitRef.current = liveSplit;
           setHandleSplit(liveSplit);
         }
 
@@ -973,8 +1556,7 @@ export function PreviewCanvas({
         // bottom-to-top by zIndex. Built from the SAME overlays array + window
         // filter + z-sort the export uses, so preview == export for overlays.
         //
-        // Video overlays: the FACE video stays the master clock -- an overlay is
-        // NEVER the clock. While SCRUBBING (paused) we hard-seek each active
+        // Video overlays are never a clock. While SCRUBBING (paused) we hard-seek each active
         // overlay video to its source frame `want`. While PLAYING the pooled
         // <video> free-runs at playbackRate and we only issue a LIGHT drift
         // resync when it strays > 0.25s (a rare correction, not per-frame), and
@@ -985,7 +1567,20 @@ export function PreviewCanvas({
           .filter((o) => t >= o.timelineStart && t < o.timelineEnd)
           .sort((a, b) => a.zIndex - b.zIndex);
         const overlayDraws: OverlayDraw[] = [];
+        const outputRect = { left: 0, top: 0, width, height };
+        const appearances = new Map(
+          liveOverlays.map((overlay) => [
+            overlay.id,
+            resolveOverlayAppearanceAt(overlay, t, outputRect, liveSplit),
+          ] as const)
+        );
+        overlayFrameSnapshotRef.current = {
+          outputTime: t,
+          splitRatio: liveSplit,
+          appearances,
+        };
         for (const o of active) {
+          const appearance = appearances.get(o.id)!;
           if (o.kind === "image") {
             const img = imgPoolRef.current.get(o.id) ?? null;
             const ready = !!img && img.naturalWidth > 0 && img.naturalHeight > 0;
@@ -994,7 +1589,11 @@ export function PreviewCanvas({
               source: img,
               naturalWidth: img.naturalWidth,
               naturalHeight: img.naturalHeight,
-              transform: { ...o.transform, opacity: o.opacity },
+              transform: {
+                ...appearance.transform,
+                opacity: o.opacity * appearance.opacityMultiplier,
+              },
+              cornerRadius: appearance.cornerRadius,
               band: o.band,
             });
           } else {
@@ -1003,9 +1602,13 @@ export function PreviewCanvas({
             const want = o.srcStart + (t - o.timelineStart);
             if (playing) {
               // Light drift correction only -- the overlay is not the clock.
-              if (v.paused) v.play().catch(() => {});
-              if (Math.abs(v.currentTime - want) > 0.25) v.currentTime = want;
-            } else {
+              playActiveOverlay(o, v);
+              synchronizeMediaTime(
+                v,
+                want,
+                OVERLAY_MEDIA_DRIFT_TOLERANCE_SEC
+              );
+            } else if (!requestedPlaying) {
               // Scrub: hard-seek to the exact source frame for this output time.
               if (Math.abs(v.currentTime - want) > 1 / 30) v.currentTime = want;
             }
@@ -1013,7 +1616,11 @@ export function PreviewCanvas({
               source: v,
               naturalWidth: v.videoWidth,
               naturalHeight: v.videoHeight,
-              transform: { ...o.transform, opacity: o.opacity },
+              transform: {
+                ...appearance.transform,
+                opacity: o.opacity * appearance.opacityMultiplier,
+              },
+              cornerRadius: appearance.cornerRadius,
               band: o.band,
             });
           }
@@ -1070,7 +1677,8 @@ export function PreviewCanvas({
         // SOURCE seconds, so map the current playhead t -> source time first.
         if (capsOn) {
           const srcT = timelineToSourceTime(liveClips, t);
-          drawCaptions(ctx, {
+          const transientPosition = captionTransientPositionRef.current;
+          const captionLayout = drawCaptions(ctx, {
             style: capStyle,
             blocks: capBlocks,
             srcT,
@@ -1079,56 +1687,502 @@ export function PreviewCanvas({
             // Pin captions to the split seam so dragging the split (face-cam up/
             // down) carries the captions with it -- see CaptionStyle.pinToSplit.
             splitRatio: liveSplit,
+            ...(transientPosition ? { transientPosition } : {}),
           });
+          captionFrameRef.current =
+            captionLayout && srcT !== null
+              ? {
+                  layout: captionLayout,
+                  outputTime: t,
+                  sourceTime: srcT,
+                  renderedSplit: liveSplit,
+                  settledSplit,
+                  projectEpoch: useRepurposeStore.getState().projectEpoch,
+                  captionStyle: capStyle,
+                  captionBlocks: capBlocks,
+                  clips: liveClips,
+                  keyboardPlacement: null,
+                }
+              : null;
+          publishCaptionLayout(captionLayout);
+        } else {
+          captionFrameRef.current = null;
+          publishCaptionLayout(null);
         }
       }
-      rafRef.current = requestAnimationFrame(tick);
+      if (rafRef.current === null) {
+        rafRef.current = frameScheduler.request(tick);
+      }
     };
 
-    rafRef.current = requestAnimationFrame(tick);
+    if (rafRef.current === null) {
+      rafRef.current = frameScheduler.request(tick);
+    }
     return () => {
-      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      if (rafRef.current !== null) {
+        frameScheduler.cancel(rafRef.current);
+        rafRef.current = null;
+      }
     };
-  }, [width, height, setPlayhead, pause]);
+  }, [
+    width,
+    height,
+    setPlayhead,
+    pause,
+    activeScreen,
+    activeFace,
+    frameScheduler,
+    normalizeBaseMute,
+    playActiveOverlay,
+    playRequiredBaseMedia,
+    publishCaptionLayout,
+  ]);
+
+  const finishCaptionGesture = useCallback(
+    (
+      gesture: CaptionPointerGesture,
+      mode: "end" | "cancel" | "store-cancel"
+    ) => {
+      if (captionGestureRef.current !== gesture) return;
+      captionGestureRef.current = null;
+      window.removeEventListener("pointermove", gesture.onMove);
+      window.removeEventListener("pointerup", gesture.onUp);
+      window.removeEventListener("pointercancel", gesture.onCancel);
+      try {
+        gesture.element.releasePointerCapture(gesture.pointerId);
+      } catch {
+        // Capture may already be gone after browser cancellation or node removal.
+      }
+      captionTransientPositionRef.current = null;
+      hideCaptionSnapGuide();
+      if (mode === "store-cancel") return;
+      const store = useRepurposeStore.getState();
+      if (mode === "end" && gesture.activated) {
+        store.completeCaptionGesture(
+          gesture.token,
+          gesture.snapped
+            ? { kind: "attach" }
+            : {
+                kind: "detach",
+                positionYPct: gesture.finalAnchorY / height,
+              }
+        );
+      } else {
+        store.cancelCaptionGesture(gesture.token);
+      }
+    },
+    [height, hideCaptionSnapGuide]
+  );
+
+  useEffect(() => {
+    const unsubscribeCancellation = useRepurposeStore
+      .getState()
+      .subscribeCaptionGestureCancellation(() => {
+        const gesture = captionGestureRef.current;
+        if (gesture) finishCaptionGesture(gesture, "store-cancel");
+      });
+    const unsubscribeStore = useRepurposeStore.subscribe((state, previous) => {
+      const gesture = captionGestureRef.current;
+      if (!gesture) return;
+      if (
+        state.projectEpoch !== previous.projectEpoch ||
+        state.captionBlocks !== previous.captionBlocks ||
+        !state.captionsEnabled ||
+        !state.captionBlocks.some((block) => block.id === gesture.blockId)
+      ) {
+        finishCaptionGesture(gesture, "cancel");
+      }
+    });
+    return () => {
+      unsubscribeCancellation();
+      unsubscribeStore();
+      const gesture = captionGestureRef.current;
+      if (gesture) finishCaptionGesture(gesture, "cancel");
+    };
+  }, [finishCaptionGesture]);
+
+  const currentCaptionFrame = useCallback((): CaptionFrameLayout | null => {
+    const frame = captionFrameRef.current;
+    if (!frame) return null;
+    const store = useRepurposeStore.getState();
+    const sourceTime = timelineToSourceTime(store.clips, store.playhead);
+    const activeBlock =
+      sourceTime === null
+        ? null
+        : activeCaptionBlockAt(store.captionBlocks, sourceTime);
+    if (
+      !store.captionsEnabled ||
+      store.projectEpoch !== frame.projectEpoch ||
+      store.playhead !== frame.outputTime ||
+      sourceTime !== frame.sourceTime ||
+      store.captionStyle !== frame.captionStyle ||
+      store.captionBlocks !== frame.captionBlocks ||
+      store.clips !== frame.clips ||
+      activeBlock?.id !== frame.layout.activeBlock.id ||
+      frame.layout.activeBlockId !== frame.layout.activeBlock.id
+    ) {
+      captionFrameRef.current = null;
+      publishCaptionLayout(null);
+      return null;
+    }
+    return frame;
+  }, [publishCaptionLayout]);
+
+  const settledCaptionAnchorY = useCallback(
+    (frame: CaptionFrameLayout): number | null =>
+      frame.renderedSplit === frame.settledSplit
+        ? frame.layout.attachedTargetAnchorY
+        : Math.min(
+            frame.layout.anchorRange.max,
+            Math.max(
+              frame.layout.anchorRange.min,
+              (frame.settledSplit + frame.layout.style.splitOffsetPct) * height
+            )
+          ),
+    [height]
+  );
+
+  const handleCaptionPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const frame = currentCaptionFrame();
+      const layout = frame?.layout ?? null;
+      const container = containerRef.current;
+      if (!frame || !layout || !container) return;
+      const rect = container.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      const outputX = ((event.clientX - rect.left) / rect.width) * width;
+      const outputY = ((event.clientY - rect.top) / rect.height) * height;
+      const bounds = layout.visualBounds;
+      if (
+        outputX < bounds.left ||
+        outputX > bounds.right ||
+        outputY < bounds.top ||
+        outputY > bounds.bottom
+      ) {
+        return;
+      }
+      const store = useRepurposeStore.getState();
+      const previous = captionGestureRef.current;
+      if (previous) finishCaptionGesture(previous, "cancel");
+      pause();
+      store.selectCaptionBlock(layout.activeBlockId);
+      const token = store.beginCaptionGesture(layout.activeBlockId);
+      if (token === null) return;
+      const pointerId = event.pointerId;
+      const element = event.currentTarget;
+      try {
+        element.setPointerCapture(pointerId);
+      } catch {
+        // Window listeners still provide safe cleanup where capture is unavailable.
+      }
+      const attachedTargetAnchorY = settledCaptionAnchorY(frame);
+      const onMove = (moveEvent: PointerEvent) => {
+        const gesture = captionGestureRef.current;
+        if (
+          !gesture ||
+          gesture.token !== token ||
+          moveEvent.pointerId !== pointerId
+        ) {
+          return;
+        }
+        const deltaCss = moveEvent.clientY - gesture.startClientY;
+        if (!gesture.activated && Math.abs(deltaCss) < 3) return;
+        gesture.activated = true;
+        const deltaLogical = (deltaCss / gesture.cssHeight) * height;
+        const rawAnchor = Math.min(
+          gesture.anchorRange.max,
+          Math.max(gesture.anchorRange.min, gesture.startAnchorY + deltaLogical)
+        );
+        const snapDistanceCss =
+          gesture.attachedTargetAnchorY === null
+            ? Infinity
+            : (Math.abs(rawAnchor - gesture.attachedTargetAnchorY) /
+                height) *
+              gesture.cssHeight;
+        gesture.snapped = snapDistanceCss <= 12;
+        gesture.finalAnchorY = gesture.snapped
+          ? gesture.attachedTargetAnchorY!
+          : rawAnchor;
+        captionTransientPositionRef.current = {
+          blockId: gesture.blockId,
+          positionYPct: gesture.finalAnchorY / height,
+        };
+        const guide = captionSnapGuideRef.current;
+        if (guide) {
+          guide.hidden = !gesture.snapped;
+          if (gesture.snapped) {
+            guide.style.top = `${
+              (gesture.finalAnchorY / height) * gesture.cssHeight
+            }px`;
+          }
+        }
+      };
+      const onUp = (upEvent: PointerEvent) => {
+        if (upEvent.pointerId !== pointerId) return;
+        const gesture = captionGestureRef.current;
+        if (gesture?.token === token) finishCaptionGesture(gesture, "end");
+      };
+      const onCancel = (cancelEvent: PointerEvent) => {
+        if (cancelEvent.pointerId !== pointerId) return;
+        const gesture = captionGestureRef.current;
+        if (gesture?.token === token) finishCaptionGesture(gesture, "cancel");
+      };
+      captionGestureRef.current = {
+        pointerId,
+        token,
+        element,
+        blockId: layout.activeBlockId,
+        sourceFrame: frame.sourceTime,
+        startClientY: event.clientY,
+        cssHeight: rect.height,
+        startAnchorY: layout.anchorY,
+        finalAnchorY: layout.anchorY,
+        anchorRange: { ...layout.anchorRange },
+        settledSplit: frame.settledSplit,
+        attachedTargetAnchorY,
+        activated: false,
+        snapped: false,
+        onMove,
+        onUp,
+        onCancel,
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onCancel);
+    },
+    [
+      currentCaptionFrame,
+      finishCaptionGesture,
+      height,
+      pause,
+      settledCaptionAnchorY,
+      width,
+    ]
+  );
+
+  const handleCaptionKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>) => {
+      const isAttach = event.key === "Enter" || event.key === " ";
+      const isPosition = ["ArrowUp", "ArrowDown", "Home", "End"].includes(
+        event.key
+      );
+      if (!isAttach && !isPosition) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.currentTarget.hidden) return;
+      const frame = currentCaptionFrame();
+      if (!frame) return;
+
+      const store = useRepurposeStore.getState();
+      let keyboardPlacement: NonNullable<CaptionFrameLayout["keyboardPlacement"]>;
+      if (isAttach) {
+        store.attachCaptionBlock(frame.layout.activeBlockId);
+        const attachedAnchorY = settledCaptionAnchorY(frame);
+        keyboardPlacement = {
+          attached: true,
+          requestedPositionYPct:
+            (attachedAnchorY ?? frame.layout.requestedAnchorY) / height,
+        };
+      } else {
+        const attachedAnchorY = settledCaptionAnchorY(frame);
+        const current = frame.keyboardPlacement
+          ? frame.keyboardPlacement.requestedPositionYPct
+          : frame.layout.style.pinToSplit
+            ? (attachedAnchorY ?? frame.layout.requestedAnchorY) / height
+            : frame.layout.requestedAnchorY / height;
+        const step = event.shiftKey ? 0.1 : 0.01;
+        const next =
+          event.key === "Home"
+            ? 0
+            : event.key === "End"
+              ? 1
+              : Math.max(
+                  0,
+                  Math.min(
+                    1,
+                    current + (event.key === "ArrowUp" ? -step : step)
+                  )
+                );
+        store.detachCaptionBlock(frame.layout.activeBlockId, next, {
+          discrete: true,
+        });
+        keyboardPlacement = {
+          attached: false,
+          requestedPositionYPct: next,
+        };
+      }
+      const nextStore = useRepurposeStore.getState();
+      captionFrameRef.current = {
+        ...frame,
+        projectEpoch: nextStore.projectEpoch,
+        captionBlocks: nextStore.captionBlocks,
+        keyboardPlacement,
+      };
+      updateCaptionSliderValue(
+        event.currentTarget,
+        keyboardPlacement.requestedPositionYPct,
+        keyboardPlacement.attached
+      );
+    },
+    [currentCaptionFrame, height, settledCaptionAnchorY]
+  );
 
   // ---------------------------------------------------------------------
-  // Split-handle drag: pointer on the divider adjusts the split for the SCENE
-  // under the playhead (per-clip), not the whole reel. Whichever kept clip owns
-  // the current playhead gets its own splitRatio; the cut into it eases from the
-  // previous scene's split. Falls back to the global default only when the
-  // playhead is over no kept clip (empty timeline / a collapsed region), so the
-  // handle is never dead. Reads the active clip fresh from the store each move
-  // (liveRef holds the current playhead + clips) so a clip edit mid-session is
-  // always respected.
+  // Split-handle drag: freeze the scene/global target and store transaction at
+  // pointer-down. A local transient ratio bypasses cut easing during direct
+  // manipulation; releasing returns every consumer to frame-resolved playback.
   // ---------------------------------------------------------------------
+  const finishSplitGesture = useCallback(
+    (
+      gesture: SplitDividerGesture,
+      mode: "end" | "cancel",
+      restoreFrame = true
+    ) => {
+      if (splitGestureRef.current !== gesture) return;
+      splitGestureRef.current = null;
+      window.removeEventListener("pointermove", gesture.onMove);
+      window.removeEventListener("pointerup", gesture.onUp);
+      window.removeEventListener("pointercancel", gesture.onCancel);
+      try {
+        gesture.element.releasePointerCapture(gesture.pointerId);
+      } catch {
+        // Capture may already have been released by the browser or node removal.
+      }
+      transientSplitRef.current = null;
+      const store = useRepurposeStore.getState();
+      if (mode === "end") store.endSplitRatioGesture(gesture.token);
+      else store.cancelSplitRatioGesture(gesture.token);
+
+      if (restoreFrame) {
+        const resolved = effectiveSplitRatio(
+          splitRatioAt(store.clips, store.playhead, store.splitRatio),
+          height
+        );
+        liveSplitRef.current = resolved;
+        handleSplitRef.current = resolved;
+        setHandleSplit(resolved);
+      }
+    },
+    [height]
+  );
+
+  useEffect(() => {
+    const unsubscribe = useRepurposeStore.subscribe((state, previous) => {
+      const gesture = splitGestureRef.current;
+      if (!gesture || splitGestureStoreUpdateRef.current) return;
+      if (
+        state.projectEpoch !== previous.projectEpoch ||
+        state.clips !== previous.clips ||
+        state.splitRatio !== previous.splitRatio
+      ) {
+        finishSplitGesture(gesture, "cancel");
+      }
+    });
+    const unsubscribeCancellation = useRepurposeStore
+      .getState()
+      .subscribeSplitRatioGestureCancellation(() => {
+        const gesture = splitGestureRef.current;
+        if (gesture) finishSplitGesture(gesture, "cancel");
+      });
+    return () => {
+      unsubscribe();
+      unsubscribeCancellation();
+      const gesture = splitGestureRef.current;
+      if (gesture) finishSplitGesture(gesture, "cancel", false);
+    };
+  }, [finishSplitGesture]);
+
   const handleDividerPointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
       e.preventDefault();
       e.stopPropagation();
       const container = containerRef.current;
       if (!container) return;
+
+      const previous = splitGestureRef.current;
+      if (previous) finishSplitGesture(previous, "cancel");
+
+      pause();
+      const store = useRepurposeStore.getState();
+      const active = activeClipAt(store.clips, store.playhead);
+      const gestureTarget = active
+        ? ({ kind: "clip", id: active.id } as const)
+        : ({ kind: "global" } as const);
+      const token = store.beginSplitRatioGesture(gestureTarget);
+      if (token === null) return;
+
       const pointerId = e.pointerId;
       const target = e.currentTarget;
       target.setPointerCapture(pointerId);
-
       const onMove = (moveEvent: PointerEvent) => {
+        const gesture = splitGestureRef.current;
+        if (!gesture || gesture.token !== token || moveEvent.pointerId !== pointerId) {
+          return;
+        }
         const rect = container.getBoundingClientRect();
+        if (rect.height <= 0) return;
         const localY = moveEvent.clientY - rect.top;
-        const ratio = clamp(localY / rect.height, MIN_SPLIT, MAX_SPLIT);
-        // Target the clip under the playhead so only THIS scene's split changes.
-        const { clips: liveClips, playhead: t } = liveRef.current;
-        const active = activeClipAt(liveClips, t);
-        if (active) setClipSplitRatio(active.id, ratio);
-        else setSplitRatio(ratio); // no scene here -> nudge the global default
+        const ratio = snapPointerSplitRatio(localY / rect.height);
+        transientSplitRef.current = ratio;
+        const effective = effectiveSplitRatio(ratio, height);
+        handleSplitRef.current = effective;
+        setHandleSplit(effective);
+        splitGestureStoreUpdateRef.current = true;
+        try {
+          useRepurposeStore
+            .getState()
+            .updateSplitRatioGesture(token, ratio);
+        } finally {
+          splitGestureStoreUpdateRef.current = false;
+        }
       };
-      const onUp = () => {
-        window.removeEventListener("pointermove", onMove);
-        window.removeEventListener("pointerup", onUp);
+      const onUp = (upEvent: PointerEvent) => {
+        if (upEvent.pointerId !== pointerId) return;
+        const gesture = splitGestureRef.current;
+        if (gesture?.token === token) finishSplitGesture(gesture, "end");
+      };
+      const onCancel = (cancelEvent: PointerEvent) => {
+        if (cancelEvent.pointerId !== pointerId) return;
+        const gesture = splitGestureRef.current;
+        if (gesture?.token === token) finishSplitGesture(gesture, "cancel");
+      };
+      splitGestureRef.current = {
+        pointerId,
+        token,
+        element: target,
+        onMove,
+        onUp,
+        onCancel,
       };
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onCancel);
     },
-    [setSplitRatio, setClipSplitRatio]
+    [finishSplitGesture, height, pause]
+  );
+
+  const handleDividerKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      let delta = 0;
+      let endpoint: number | null = null;
+      if (e.key === "ArrowUp" || e.key === "ArrowLeft") delta = -0.01;
+      else if (e.key === "ArrowDown" || e.key === "ArrowRight") delta = 0.01;
+      else if (e.key === "Home") endpoint = 0;
+      else if (e.key === "End") endpoint = 1;
+      else return;
+      e.preventDefault();
+
+      const store = useRepurposeStore.getState();
+      const active = activeClipAt(store.clips, store.playhead);
+      const current = active?.splitRatio ?? store.splitRatio;
+      const next = endpoint ?? clampSplitRatio(current + delta);
+      if (next === null) return;
+      if (active) store.setClipSplitRatio(active.id, next);
+      else store.setSplitRatio(next);
+    },
+    []
   );
 
   // ---------------------------------------------------------------------
@@ -1244,14 +2298,21 @@ export function PreviewCanvas({
       if (!el) return;
       const rect = el.getBoundingClientRect();
       const localY = e.clientY - rect.top;
+      const split = getEffectiveSplitRatio();
       const track: "screen" | "face" =
-        localY / rect.height < liveSplitRef.current ? "screen" : "face";
+        split <= 0
+          ? "face"
+          : split >= 1
+            ? "screen"
+            : localY / rect.height < split
+              ? "screen"
+              : "face";
       const current = currentTransformFor(track);
       const zoomDelta = -e.deltaY * 0.0015;
       const nextScale = clamp(current.scale * (1 + zoomDelta), ZOOM_MIN, ZOOM_MAX);
       writeTransform(track, { x: current.x, y: current.y, scale: nextScale });
     },
-    [currentTransformFor, writeTransform]
+    [currentTransformFor, getEffectiveSplitRatio, writeTransform]
   );
 
   // Bind the wheel-zoom handler as a NON-PASSIVE native listener so its
@@ -1279,7 +2340,10 @@ export function PreviewCanvas({
     return { left: r.left, top: r.top, width: r.width, height: r.height };
   }, []);
 
-  const { routePointerDown, beginHandleGesture } = useObjectSelection({ getRect });
+  const { routePointerDown, beginHandleGesture, adjustHandleByKeyboard } = useObjectSelection({
+    getRect,
+    getFrameSnapshot: getOverlayFrameSnapshot,
+  });
 
   // Clicking ANYWHERE outside the preview container (transcript rail, inspector,
   // timeline, top bar, or the dark margin around the 9:16) clears the canvas
@@ -1320,7 +2384,7 @@ export function PreviewCanvas({
         // band's share of the container per the composited split.
         const rect = e.currentTarget.getBoundingClientRect();
         const regionWidthPx = rect.width;
-        const split = liveSplitRef.current;
+        const split = getEffectiveSplitRatio();
         const regionHeightPx =
           route.region === "screen" ? rect.height * split : rect.height * (1 - split);
         beginRegionReframe(route.region, e, regionWidthPx, regionHeightPx);
@@ -1330,7 +2394,13 @@ export function PreviewCanvas({
       selectOverlay(null);
       selectClip(null);
     },
-    [routePointerDown, beginRegionReframe, selectClip, selectOverlay]
+    [
+      routePointerDown,
+      beginRegionReframe,
+      selectClip,
+      selectOverlay,
+      getEffectiveSplitRatio,
+    ]
   );
 
   // ---------------------------------------------------------------------
@@ -1345,9 +2415,9 @@ export function PreviewCanvas({
   //     screen-px -> normalized mapping the drag paths use, so nudge and drag agree.
   //   - Cmd/Ctrl+] bring forward, Cmd/Ctrl+[ send backward (setOverlayZ).
   //   - Esc clears the selection.
-  // Every nudge re-runs the HARD top-half keep-out (clampOverlayToTopHalf) so the
-  // overlay bottom can never be nudged across the split seam -- the same invariant
-  // drag/resize/duplicate/add enforce. Gated off the transcript panel + any
+  // Nudge writes only the explicit user delta onto the persisted transform. The
+  // frame resolver keeps the rendered overlay seam-safe without baking a
+  // transition's temporary correction. Gated off the transcript panel + any
   // editable target so typing never nudges or re-stacks an overlay.
   // ---------------------------------------------------------------------
   const updateOverlayTransform = useRepurposeStore((s) => s.updateOverlayTransform);
@@ -1363,12 +2433,34 @@ export function PreviewCanvas({
       ) {
         return;
       }
-      const id = useRepurposeStore.getState().selectedOverlayId;
-      if (!id) return;
+      const store = useRepurposeStore.getState();
+      if (!store.selectedOverlayId && store.selectedOverlayIds.length === 0) return;
 
       if (e.key === "Escape") {
         e.preventDefault();
-        useRepurposeStore.getState().selectOverlay(null);
+        store.selectOverlay(null);
+        return;
+      }
+
+      const settledSplit = getSettledSplitRatio();
+      const primary = resolveEffectivePrimaryOverlay(
+        store.overlays,
+        store.selectedOverlayIds,
+        store.selectedOverlayId,
+        settledSplit
+      );
+      if (!primary) return;
+      const id = primary.id;
+
+      // Overlay Cmd/Ctrl+D belongs here rather than Timeline: only the preview
+      // owns the current CSS rect and frame-effective (possibly per-scene) split.
+      if ((e.metaKey || e.ctrlKey) && e.code === "KeyD") {
+        const rect = getRect();
+        if (!rect) return;
+        e.preventDefault();
+        useRepurposeStore
+          .getState()
+          .duplicateOverlay(id, rect, settledSplit);
         return;
       }
 
@@ -1411,23 +2503,14 @@ export function PreviewCanvas({
       const ov = useRepurposeStore.getState().overlays.find((o) => o.id === id);
       if (!ov) return;
 
-      const nextX = ov.transform.x + (signX * px) / rect.width;
-      const nextY = ov.transform.y + (signY * px) / rect.height;
-      // HARD top-half keep-out -- correct the moved transform so the bottom edge
-      // never crosses the seam (splitRatio read fresh, like the drag paths).
-      const clampSplit = useRepurposeStore.getState().splitRatio;
-      const clamped = clampOverlayToTopHalf(
-        { ...ov.transform, x: nextX, y: nextY },
-        ov.naturalWidth,
-        ov.naturalHeight,
-        rect,
-        clampSplit
-      );
-      updateOverlayTransform(id, { x: clamped.x, y: clamped.y });
+      updateOverlayTransform(id, {
+        x: ov.transform.x + (signX * px) / rect.width,
+        y: ov.transform.y + (signY * px) / rect.height,
+      });
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [updateOverlayTransform, getRect]);
+  }, [updateOverlayTransform, getRect, getSettledSplitRatio]);
 
   // ---------------------------------------------------------------------
   // "P" = drop a mid-clip ZOOM PUNCH-IN at the playhead on the active scene.
@@ -1494,6 +2577,11 @@ export function PreviewCanvas({
       className={`relative w-full select-none overflow-visible shadow-2xl ${className ?? ""}`}
       style={{ aspectRatio: `${width} / ${height}` }}
     >
+      {sfxWarning && (
+        <div role="status" aria-label="Sound effect preview warning" className="absolute left-2 right-2 top-2 z-[90] rounded bg-amber-950/90 px-2 py-1 text-[10px] text-amber-100 shadow">
+          {sfxWarning}
+        </div>
+      )}
       {/* Hidden source videos -- decoded frames only, never displayed directly. */}
       {/* src omitted until footage loads -- passing "" makes the browser try to
           load the page URL and logs an error. undefined leaves the element idle. */}
@@ -1507,33 +2595,52 @@ export function PreviewCanvas({
           the imperative flips stick. */}
       {SLOT_INDICES.map((slot) => (
         <video
-          key={`screen-${slot}`}
+          key={`screen-${screenSourceIdentity}-${slot}`}
+          data-source-role="screen"
+          data-slot-index={slot}
           ref={(el) => {
             screenElsRef.current[slot] = el;
+            if (el) normalizeBaseMute();
           }}
-          src={footageMeta?.screenPath || undefined}
+          src={screenProxy.src}
           muted
           playsInline
           preload="auto"
           className="hidden"
+          onCanPlay={(event) =>
+            reportBaseCanPlay("screen", slot, event.currentTarget)
+          }
+          onError={() => {
+            if (screenProxy.usingProxy) screenProxy.onSrcError();
+            else reportRequiredBaseError("screen", slot);
+          }}
         />
       ))}
       {/* Face slots read faceProxy.src -- the original streaming URL until the
           low-res preview proxy is built + a pause lets it swap in. Export
           never sees this: it reads footageMeta.faceCamPath directly. onError
-          falls back to the original if a purged proxy cache 404s mid-session. */}
+          falls back for a purged proxy, but reports a real raw-source failure. */}
       {SLOT_INDICES.map((slot) => (
         <video
-          key={`face-${slot}`}
+          key={`face-${faceSourceIdentity}-${slot}`}
+          data-source-role="face"
+          data-slot-index={slot}
           ref={(el) => {
             faceElsRef.current[slot] = el;
+            if (el) normalizeBaseMute();
           }}
           src={faceProxy.src}
-          muted={slot !== 0}
+          muted
           playsInline
           preload="auto"
           className="hidden"
-          onError={faceProxy.onSrcError}
+          onCanPlay={(event) =>
+            reportBaseCanPlay("face", slot, event.currentTarget)
+          }
+          onError={() => {
+            if (faceProxy.usingProxy) faceProxy.onSrcError();
+            else reportRequiredBaseError("face", slot);
+          }}
         />
       ))}
 
@@ -1545,34 +2652,24 @@ export function PreviewCanvas({
       {overlays
         .filter((o) => o.kind === "video")
         .map((o) => (
-          <video
-            key={o.id}
-            ref={(el) => {
-              if (el) videoPoolRef.current.set(o.id, el);
-              else videoPoolRef.current.delete(o.id);
-            }}
-            src={o.src}
-            muted
-            playsInline
-            preload="auto"
-            className="hidden"
-            onLoadedMetadata={(e) => {
-              const el = e.currentTarget;
-              if (el.videoWidth <= 0 || el.videoHeight <= 0) return;
-              const cur = useRepurposeStore
-                .getState()
-                .overlays.find((ov) => ov.id === o.id);
-              if (cur && (cur.naturalWidth <= 0 || cur.naturalHeight <= 0)) {
-                // Metadata backfill only (bypasses history via setState).
-                useRepurposeStore.setState((s) => ({
-                  overlays: s.overlays.map((ov) =>
-                    ov.id === o.id
-                      ? { ...ov, naturalWidth: el.videoWidth, naturalHeight: el.videoHeight }
-                      : ov
-                  ),
-                }));
+          <PreviewOverlayVideo
+            key={`${o.id}\u0000${o.src}`}
+            overlay={o}
+            isPlaying={isPlaying}
+            register={(el, previewSrc) => {
+              if (el) {
+                videoPoolRef.current.set(o.id, el);
+                overlayPreviewSrcRef.current.set(o.id, previewSrc);
+              } else if (
+                videoPoolRef.current.get(o.id)?.dataset.overlaySrc === previewSrc
+              ) {
+                videoPoolRef.current.delete(o.id);
+                if (overlayPreviewSrcRef.current.get(o.id) === previewSrc) {
+                  overlayPreviewSrcRef.current.delete(o.id);
+                }
               }
             }}
+            reportFailure={() => reportOverlayFailure(o.id, o.src)}
           />
         ))}
       {/* GHOSTED OFF-FRAME OVERFLOW -- a dim, non-interactive copy of
@@ -1583,7 +2680,11 @@ export function PreviewCanvas({
           OUTSIDE the frame shows through, at reduced opacity -- so an overlay
           dragged/zoomed off-frame stays visible + grabbable without any change to
           the clipped canvas render or the export (DOM-only, like the grid). */}
-      <GhostOverflowLayer getRect={getRect} />
+      <GhostOverflowLayer
+        getRect={getRect}
+        getFrameSnapshot={getOverlayFrameSnapshot}
+        getOverlayPreviewSrc={getOverlayPreviewSrc}
+      />
 
       {/* The composited video. FLAT-edged to match the exported reel exactly --
           the real 1080x1920 output has no rounded corners, so the preview must not
@@ -1627,9 +2728,9 @@ export function PreviewCanvas({
           pass runs in the background. DOM-only (never in the export), gone the
           moment the proxy is ready. Playback keeps using the original file
           until the swap, so this is purely informational. */}
-      {faceProxy.buildProgress !== null && (
+      {(faceProxy.buildProgress !== null || screenProxy.buildProgress !== null) && (
         <div className="pointer-events-none absolute bottom-2 left-2 z-10 rounded-full bg-black/70 px-2.5 py-1 text-[10px] font-medium tracking-wide text-white/75">
-          Preparing fast preview {Math.round(faceProxy.buildProgress * 100)}%
+          Preparing fast preview {Math.round(Math.max(faceProxy.buildProgress ?? 0, screenProxy.buildProgress ?? 0) * 100)}%
         </div>
       )}
 
@@ -1644,19 +2745,59 @@ export function PreviewCanvas({
       <div
         ref={interactionLayerRef}
         className={`absolute inset-0 z-[2] ${cloneModifier ? "cursor-copy" : "cursor-move"}`}
+        style={{ zIndex: 2, pointerEvents: "auto" }}
         onPointerDown={onLayerPointerDown}
         title="Click an overlay to select; drag to move it. Shift-click to multi-select, Cmd/Ctrl-drag to clone. Drag the canvas to pan / scroll to zoom."
       />
 
-      {/* Split handle -- the seam stays fully draggable (same hit strip, same
-          cursor, same onPointerDown), but the always-on coral pill is GONE: it
+      {/* Bounds-sized transparent caption surface. The render loop projects the
+          exact layout it just painted into CSS pixels without scheduling React. */}
+      <div
+        ref={captionHitTargetRef}
+        role="slider"
+        aria-label="Move active caption"
+        aria-orientation="vertical"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={0}
+        tabIndex={0}
+        className="absolute touch-none"
+        style={{ zIndex: 15 }}
+        hidden
+        onPointerDown={handleCaptionPointerDown}
+        onKeyDown={handleCaptionKeyDown}
+      />
+      <div
+        ref={captionSnapGuideRef}
+        data-caption-snap-guide
+        className="pointer-events-none absolute inset-x-0"
+        style={{ zIndex: 16, height: 1, backgroundColor: "#FF6B35" }}
+        hidden
+      />
+
+      {/* Split handle -- the seam stays draggable and keyboard-adjustable, but
+          the always-on coral pill is GONE: it
           overlapped the captions sitting on the seam and got in the way. The pill
           now shows ONLY on hover, so the divider is discoverable when you reach
-          for it yet invisible the rest of the time. Functionality is unchanged. */}
+          for it yet invisible the rest of the time. */}
       <div
-        className="group absolute inset-x-0 z-10 flex cursor-ns-resize items-center justify-center"
-        style={{ top: `${topPct}%`, height: 16, marginTop: -8 }}
+        role="separator"
+        aria-label="Adjust screen and face split"
+        aria-orientation="horizontal"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={topPct}
+        tabIndex={0}
+        className="group absolute inset-x-0 z-10 flex touch-none cursor-ns-resize items-center justify-center"
+        style={{
+          top: `${topPct}%`,
+          height: 16,
+          marginTop: -8,
+          zIndex: 10,
+          pointerEvents: "auto",
+        }}
         onPointerDown={handleDividerPointerDown}
+        onKeyDown={handleDividerKeyDown}
       >
         <div className="h-[3px] w-10 rounded-full bg-[#FF6B35] opacity-0 shadow-[0_0_0_3px_rgba(0,0,0,0.35)] transition-opacity group-hover:opacity-100" />
       </div>
@@ -1665,9 +2806,18 @@ export function PreviewCanvas({
           export stays clean). The box body is pointer-events:none so a drag on
           the media falls through to the router above; only the 8 resize handles
           + the rotate grip opt in and forward to beginHandleGesture. */}
-      <SelectionOverlay getRect={getRect} beginHandleGesture={beginHandleGesture} />
+      <SelectionOverlay
+        getRect={getRect}
+        getFrameSnapshot={getOverlayFrameSnapshot}
+        beginHandleGesture={beginHandleGesture}
+        adjustHandleByKeyboard={adjustHandleByKeyboard}
+      />
       {/* Floating, always-upright toolbar for whatever is selected. */}
-      <SelectionToolbar getRect={getRect} />
+      <SelectionToolbar
+        getRect={getRect}
+        getFrameSnapshot={getOverlayFrameSnapshot}
+        getSettledSplitRatio={getSettledSplitRatio}
+      />
     </div>
   );
 }

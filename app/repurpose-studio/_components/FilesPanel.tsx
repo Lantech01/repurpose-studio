@@ -17,7 +17,7 @@
 // error UI). Coral accent to match the Files metaphor.
 // ===========================================================================
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   FolderOpen,
   Plus,
@@ -29,6 +29,18 @@ import {
 } from "@phosphor-icons/react";
 import { useRepurposeStore } from "@/lib/repurpose/store";
 import { overlayUrlForPath } from "@/lib/repurpose/overlay-ingest";
+import { effectiveSplitRatio } from "@/lib/repurpose/split-ratio";
+import { splitRatioAt } from "@/lib/repurpose/time-map";
+import {
+  importVideoFile,
+  VideoImportError,
+  videoUrlForWorkingSource,
+} from "@/lib/repurpose/video-import-client";
+import { ensureVideoProxy } from "@/lib/repurpose/video-proxy-client";
+import {
+  VideoImportProgress,
+  type VideoImportProgressState,
+} from "./VideoImportProgress";
 
 /** kebab-case a filename stem for the asset route's `name` field (2..61 chars). */
 function kebabName(fileName: string): string {
@@ -52,46 +64,59 @@ interface MediaProbe {
 }
 
 /** Read an image's intrinsic pixel size off a throwaway <img>. */
-function probeImage(url: string): Promise<MediaProbe> {
+function probeImage(url: string, signal: AbortSignal): Promise<MediaProbe> {
   return new Promise((resolve, reject) => {
     const img = new Image();
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      img.onload = null;
+      img.onerror = null;
+      img.src = "";
+      reject(new DOMException("Image probe aborted", "AbortError"));
+    };
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
     img.onload = () => {
+      cleanup();
       resolve({ width: img.naturalWidth, height: img.naturalHeight, duration: 0 });
     };
-    img.onerror = () => reject(new Error("Could not decode that image"));
+    img.onerror = () => {
+      cleanup();
+      reject(new Error("Could not decode that image"));
+    };
     img.src = url;
   });
 }
 
-/** Read a video's intrinsic size + duration off a throwaway <video> (muted, metadata). */
-function probeVideo(url: string): Promise<MediaProbe> {
-  return new Promise((resolve, reject) => {
-    const video = document.createElement("video");
-    video.preload = "metadata";
-    video.muted = true;
-    video.onloadedmetadata = () => {
-      const duration = Number.isFinite(video.duration) ? video.duration : 0;
-      resolve({
-        width: video.videoWidth,
-        height: video.videoHeight,
-        duration: Math.max(0, duration),
-      });
-    };
-    video.onerror = () => reject(new Error("Could not decode that video"));
-    video.src = url;
-  });
-}
-
 /** Read an audio file's intrinsic duration off a throwaway <audio>. */
-function probeAudio(url: string): Promise<MediaProbe> {
+function probeAudio(url: string, signal: AbortSignal): Promise<MediaProbe> {
   return new Promise((resolve, reject) => {
     const audio = new Audio();
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      audio.onloadedmetadata = null;
+      audio.onerror = null;
+      audio.src = "";
+      reject(new DOMException("Audio probe aborted", "AbortError"));
+    };
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
     audio.preload = "metadata";
     audio.onloadedmetadata = () => {
+      cleanup();
       const d = Number.isFinite(audio.duration) ? audio.duration : 0;
       resolve({ width: 0, height: 0, duration: Math.max(0, d) });
     };
-    audio.onerror = () => reject(new Error("Could not decode that audio file"));
+    audio.onerror = () => {
+      cleanup();
+      reject(new Error("Could not decode that audio file"));
+    };
     audio.src = url;
   });
 }
@@ -102,11 +127,12 @@ function kindLabel(kind: "image" | "video" | "audio"): string {
 }
 
 // Extension -> kind maps. The single source of truth for classifying a file by
-// its NAME when the MIME type is missing/unreliable. Kept in sync with the asset
-// route's ALLOWED_EXT set (app/api/repurpose/asset/route.ts).
+// its NAME when the MIME type is missing/unreliable. Images/audio match the asset
+// route; videos match the compatibility pipeline's supported media extensions.
 const IMAGE_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
-const VIDEO_EXT = new Set(["mp4", "mov", "m4v", "webm"]);
+const VIDEO_EXT = new Set(["mp4", "mov", "m4v", "webm", "mkv"]);
 const AUDIO_EXT = new Set(["mp3", "wav", "m4a", "aac", "ogg"]);
+const CANONICAL_PREVIEW_RECT = { left: 0, top: 0, width: 1080, height: 1920 };
 
 /** Classify by file extension alone (the fallback when MIME is empty). */
 function kindFromExt(nameOrPath: string): "image" | "video" | "audio" | null {
@@ -138,8 +164,13 @@ export function FilesPanel() {
   const setMusicTrack = useRepurposeStore((s) => s.setMusicTrack);
 
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const importRef = useRef<AbortController | null>(null);
+  const proxyControllersRef = useRef(new Set<AbortController>());
+  const mountedRef = useRef(true);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [videoProgress, setVideoProgress] =
+    useState<VideoImportProgressState | null>(null);
   // Id of the row that just flashed an "Added" confirmation (~1s).
   const [placedId, setPlacedId] = useState<string | null>(null);
   // "Add by path" field -- lets Manthan (or Claude, handing over a path) register
@@ -148,6 +179,18 @@ export function FilesPanel() {
   // True while a FILE drag hovers the panel -- paints the coral drop ring so it
   // reads as a live drop target (Canva/Descript-style).
   const [dragging, setDragging] = useState(false);
+
+  useEffect(() => {
+    const proxyControllers = proxyControllersRef.current;
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      importRef.current?.abort();
+      importRef.current = null;
+      for (const controller of proxyControllers) controller.abort();
+      proxyControllers.clear();
+    };
+  }, []);
 
   const openPicker = useCallback(() => {
     if (uploading) return;
@@ -161,10 +204,23 @@ export function FilesPanel() {
     async (picked: File[]) => {
       if (picked.length === 0) return;
 
+      importRef.current?.abort();
+      const controller = new AbortController();
+      importRef.current = controller;
+      const projectEpoch = useRepurposeStore.getState().projectEpoch;
+      const ownsLifecycle = () =>
+        mountedRef.current &&
+        importRef.current === controller &&
+        useRepurposeStore.getState().projectEpoch === projectEpoch;
+      const isCurrent = () =>
+        ownsLifecycle() && !controller.signal.aborted;
       setError(null);
+      setVideoProgress(null);
       setUploading(true);
       try {
         let skipped = 0;
+        let cancelled = false;
+        const videoFailures: string[] = [];
         for (const file of picked) {
           // Classify by MIME first, then fall back to the file extension -- some
           // sources (Finder drags, certain OSes) hand over a File with an empty
@@ -177,15 +233,78 @@ export function FilesPanel() {
           }
 
           try {
+            if (kind === "video") {
+              const videoSource = await importVideoFile(file, {
+                role: "library",
+                signal: controller.signal,
+                onProgress: (state) => {
+                  if (ownsLifecycle()) {
+                    setVideoProgress(state);
+                  }
+                },
+              });
+              if (!isCurrent()) {
+                cancelled = controller.signal.aborted;
+                break;
+              }
+              const assetId = addMediaAsset({
+                kind,
+                name: file.name,
+                src: videoUrlForWorkingSource(videoSource),
+                sourcePath: videoSource.workingPath,
+                videoSource,
+                naturalWidth: Math.max(1, videoSource.inspection.video.width),
+                naturalHeight: Math.max(1, videoSource.inspection.video.height),
+                srcDuration:
+                  videoSource.inspection.durationSec > 0
+                    ? videoSource.inspection.durationSec
+                    : undefined,
+              });
+              const proxyController = new AbortController();
+              proxyControllersRef.current.add(proxyController);
+              const unsubscribe = useRepurposeStore.subscribe((state) => {
+                if (state.projectEpoch !== projectEpoch) proxyController.abort();
+              });
+              void ensureVideoProxy(videoSource, proxyController.signal)
+                .then((nextSource) => {
+                  const state = useRepurposeStore.getState();
+                  const current = state.mediaAssets.find(
+                    (asset) => asset.id === assetId
+                  );
+                  if (
+                    !proxyController.signal.aborted &&
+                    state.projectEpoch === projectEpoch &&
+                    current?.videoSource === videoSource
+                  ) {
+                    state.setVideoSourceRecord(
+                      { kind: "asset", id: assetId },
+                      nextSource
+                    );
+                  }
+                })
+                .catch(() => undefined)
+                .finally(() => {
+                  unsubscribe();
+                  proxyControllersRef.current.delete(proxyController);
+                });
+              continue;
+            }
+
             // 1. Copy the bytes to disk -> stable absolute path.
             const form = new FormData();
             form.append("file", file);
             form.append("name", kebabName(file.name || "media-file"));
-            const res = await fetch("/api/repurpose/asset", { method: "POST", body: form });
+            const res = await fetch("/api/repurpose/asset", {
+              method: "POST",
+              body: form,
+              signal: controller.signal,
+            });
+            if (!isCurrent()) break;
             if (!res.ok) {
               throw new Error(`Upload failed (${res.status})`);
             }
             const json = (await res.json()) as { ok?: boolean; path?: string; error?: string };
+            if (!isCurrent()) break;
             if (!json.ok || !json.path) {
               throw new Error(json.error || "Upload returned no path");
             }
@@ -200,11 +319,10 @@ export function FilesPanel() {
 
             // 3. Read intrinsic dims/duration off a throwaway element.
             const probe: MediaProbe =
-              kind === "video"
-                ? await probeVideo(src)
-                : kind === "audio"
-                  ? await probeAudio(src)
-                  : await probeImage(src);
+              kind === "audio"
+                ? await probeAudio(src, controller.signal)
+                : await probeImage(src, controller.signal);
+            if (!isCurrent()) break;
 
             // 4. Register into the bin ONLY (dedupes on sourcePath in the store).
             addMediaAsset({
@@ -217,22 +335,60 @@ export function FilesPanel() {
               srcDuration: probe.duration > 0 ? probe.duration : undefined,
             });
           } catch (err) {
-            // One bad file shouldn't abort the rest of a multi-file import.
-            console.error("Files import failed for", file.name, err);
-            setError(
-              err instanceof Error ? err.message : `Could not import ${file.name}.`
-            );
+            const wasCancelled =
+              controller.signal.aborted ||
+              (err instanceof VideoImportError &&
+                [
+                  "VIDEO_IMPORT_CANCELLED",
+                  "COMPATIBILITY_CANCELLED",
+                  "MEDIA_PROBE_ABORTED",
+                ].includes(err.code));
+            if (wasCancelled) {
+              cancelled = true;
+              break;
+            }
+            if (kind === "video") {
+              videoFailures.push(
+                err instanceof VideoImportError
+                  ? err.message
+                  : "Não foi possível importar o vídeo."
+              );
+            } else {
+              // One bad file shouldn't abort the rest of a multi-file import.
+              if (isCurrent()) {
+                console.error("Files import failed for", file.name, err);
+                setError(
+                  err instanceof Error
+                    ? err.message
+                    : `Could not import ${file.name}.`
+                );
+              }
+            }
           }
         }
         // Never fail silently: if every picked file was an unsupported type, say so
         // instead of leaving the panel looking like nothing happened.
-        if (skipped > 0) {
+        if (skipped > 0 && isCurrent()) {
           setError(
             `Skipped ${skipped} file${skipped > 1 ? "s" : ""} -- unsupported type. Use an image, video, or audio file.`
           );
         }
+        if (
+          !cancelled &&
+          videoFailures.length > 0 &&
+          isCurrent()
+        ) {
+          setVideoProgress({
+            phase: "error",
+            progress: null,
+            error: videoFailures[0],
+          });
+        }
       } finally {
-        setUploading(false);
+        if (mountedRef.current && importRef.current === controller) {
+          importRef.current = null;
+          setUploading(false);
+        }
       }
     },
     [addMediaAsset]
@@ -319,13 +475,27 @@ export function FilesPanel() {
       setError(`Unsupported file type ".${ext}". Use an image, video, or audio file.`);
       return;
     }
+    if (kind === "video") {
+      setError(
+        "Para importar vídeos, use o seletor de arquivos para verificar a compatibilidade."
+      );
+      return;
+    }
 
+    importRef.current?.abort();
+    const controller = new AbortController();
+    importRef.current = controller;
+    const projectEpoch = useRepurposeStore.getState().projectEpoch;
+    const isCurrent = () =>
+      mountedRef.current &&
+      !controller.signal.aborted &&
+      importRef.current === controller &&
+      useRepurposeStore.getState().projectEpoch === projectEpoch;
     setError(null);
     setUploading(true);
     try {
       // A raw OS path proxies through the asset/video route; an already-proxied URL
-      // is used as-is. overlayUrlForPath handles both for image/video; audio always
-      // rides the asset route.
+      // is used as-is. Images use overlayUrlForPath; audio rides the asset route.
       const src =
         /^\/api\//.test(raw)
           ? raw
@@ -334,11 +504,10 @@ export function FilesPanel() {
             : overlayUrlForPath(osPath, kind);
 
       const probe: MediaProbe =
-        kind === "video"
-          ? await probeVideo(src)
-          : kind === "audio"
-            ? await probeAudio(src)
-            : await probeImage(src);
+        kind === "audio"
+            ? await probeAudio(src, controller.signal)
+            : await probeImage(src, controller.signal);
+      if (!isCurrent()) return;
 
       const name = osPath.split(/[\\/]/).pop() || osPath;
       addMediaAsset({
@@ -352,13 +521,18 @@ export function FilesPanel() {
       });
       setPathInput("");
     } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Could not load that path. Check the file exists and is in an allowed folder."
-      );
+      if (isCurrent()) {
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Could not load that path. Check the file exists and is in an allowed folder."
+        );
+      }
     } finally {
-      setUploading(false);
+      if (mountedRef.current && importRef.current === controller) {
+        importRef.current = null;
+        setUploading(false);
+      }
     }
   }, [pathInput, uploading, addMediaAsset]);
 
@@ -378,16 +552,26 @@ export function FilesPanel() {
           gain: 1,
         });
       } else {
-        const atTime = useRepurposeStore.getState().playhead;
-        addOverlay({
-          kind: asset.kind,
-          src: asset.src,
-          sourcePath: asset.sourcePath,
-          naturalWidth: asset.naturalWidth ?? 1,
-          naturalHeight: asset.naturalHeight ?? 1,
-          atTime,
-          srcDuration: asset.kind === "video" ? asset.srcDuration : undefined,
-        });
+        const state = useRepurposeStore.getState();
+        const atTime = state.playhead;
+        const frameSplit = effectiveSplitRatio(
+          splitRatioAt(state.clips, atTime, state.splitRatio),
+          CANONICAL_PREVIEW_RECT.height
+        );
+        addOverlay(
+          {
+            kind: asset.kind,
+            src: asset.src,
+            sourcePath: asset.sourcePath,
+            videoSource: asset.videoSource,
+            naturalWidth: asset.naturalWidth ?? 1,
+            naturalHeight: asset.naturalHeight ?? 1,
+            atTime,
+            srcDuration: asset.kind === "video" ? asset.srcDuration : undefined,
+          },
+          CANONICAL_PREVIEW_RECT,
+          frameSplit
+        );
       }
 
       // Flash an inline "Added" confirmation on the placed row for ~1s.
@@ -455,6 +639,14 @@ export function FilesPanel() {
           </>
         )}
       </button>
+
+      {videoProgress && (
+        <VideoImportProgress
+          state={videoProgress}
+          onCancel={() => importRef.current?.abort()}
+          className="mt-2"
+        />
+      )}
 
       {/* Add by path -- register a file already on disk (Claude hands over a path,
           or paste a proxied /api/... URL). Enter or the + button submits. */}

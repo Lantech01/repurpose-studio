@@ -53,7 +53,18 @@ import {
 } from "./time-map";
 import { drawCaptions, type CaptionStyle, type CaptionBlock } from "./captions";
 import { loadCaptionFonts } from "./caption-fonts";
-import type { Clip, FootageMeta, MusicTrack, Overlay, SfxTrack } from "./types";
+import { footageUrlForPath } from "./ingest";
+import { overlayUrlForPath } from "./overlay-ingest";
+import { effectiveSplitRatio } from "./split-ratio";
+import { resolveOverlayAppearanceAt } from "./overlay-effects";
+import type { Clip, FootageMeta, MusicTrack, Overlay, SfxAsset, SfxClip } from "./types";
+import {
+  clampPcmChannels,
+  mixPreparedSfxIntoBuffer,
+  prepareSfxForExport,
+  sumPcmChannels,
+} from "./sfx-export";
+export { mixSfxClipsPcm } from "./sfx-export";
 
 /**
  * Output resolution presets. Both are 9:16 vertical. "1080p" is the standard
@@ -72,6 +83,61 @@ const RESOLUTION_DIMENSIONS: Record<ExportResolution, { width: number; height: n
 
 /** Fallback framerate when footageMeta carries no usable fps (see resolveFps). */
 const DEFAULT_FPS = 30;
+
+export interface ResolvedExportSources {
+  screen: string | undefined;
+  face: string | undefined;
+}
+
+function exportUrlForPath(path: string | undefined): string | undefined {
+  if (!path || path === "reconnect:") return undefined;
+  return footageUrlForPath(path);
+}
+
+export function resolveExportSources(
+  meta: FootageMeta | null
+): ResolvedExportSources {
+  if (!meta) return { screen: undefined, face: undefined };
+  return {
+    screen: exportUrlForPath(
+      meta.screenSource ? meta.screenSource.workingPath : meta.screenPath
+    ),
+    face: exportUrlForPath(
+      meta.faceCamSource ? meta.faceCamSource.workingPath : meta.faceCamPath
+    ),
+  };
+}
+
+export function resolveExportOverlaySource(
+  overlay: Overlay
+): string | undefined {
+  const source =
+    (overlay.kind === "video" ? overlay.videoSource?.workingPath : undefined) ||
+    overlay.sourcePath ||
+    overlay.src;
+  if (!source || source === "reconnect:") return undefined;
+  return overlayUrlForPath(source, overlay.kind);
+}
+
+export function actionableExportError(cause: unknown): Error {
+  if (isAbortError(cause)) return cause as Error;
+  if (!(cause instanceof Error)) return new Error("Export failed.");
+  if (
+    /WebCodecs|supported video codec|encoder creation failed|configuration not supported/i.test(
+      cause.message
+    )
+  ) {
+    const detail = cause.message
+      .replace(/[\u0000-\u001f\u007f]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 240);
+    return new Error(
+      `This browser has no available H.264/HEVC WebCodecs encoder for the selected export resolution. Try the latest Chrome or a lower resolution.${detail ? ` Details: ${detail}` : ""}`
+    );
+  }
+  return cause;
+}
 
 /** Resolve the export framerate from the footage, falling back to 30. */
 function resolveFps(footageMeta: FootageMeta | null): number {
@@ -98,17 +164,10 @@ export interface ExportShortInput {
    * Omitted/undefined/empty -> byte-identical to a no-overlay export.
    */
   overlays?: Overlay[];
-  /**
-   * The reel's generated SOUND-EFFECTS track (or null/absent for none). A single
-   * full-length WAV, additively mixed INTO the assembled face-cam audio at
-   * `sfxTrack.gain` before muxing -- so the exported MP4 carries VO + SFX, matching
-   * the preview. Decoded/resampled to the assembled buffer's rate+layout and hard-
-   * clamped to [-1,1] after summing. If the face-cam has no audio, the SFX plays
-   * alone over a fresh silent bed so an SFX-only reel still exports. Mixing is
-   * best-effort: any failure logs and falls back to the face-cam-only audio (never
-   * fails the export). Omitted/undefined/null -> byte-identical to a no-SFX export.
-   */
-  sfxTrack?: SfxTrack | null;
+  /** Editable sound-effect clips mixed deterministically into output time. */
+  sfxClips?: SfxClip[];
+  /** Project-owned imported source inventory used by SFX clips. */
+  sfxAssets?: SfxAsset[];
   /**
    * The reel's BACKGROUND-MUSIC bed (or null/absent for none). A single music
    * file added manually, additively mixed INTO the assembled audio the SAME way
@@ -151,6 +210,8 @@ export interface ExportShortInput {
    * a no-download caller owns revoking the url when it's done with it.
    */
   download?: boolean;
+  /** Cancels setup, frame rendering, audio assembly, and muxing. */
+  abortSignal?: AbortSignal;
 }
 
 /** What {@link exportShort} resolves to: the object-URL of the finished MP4 and
@@ -160,6 +221,16 @@ export interface ExportShortInput {
 export interface ExportShortResult {
   url: string;
   blob: Blob;
+  warnings: string[];
+}
+
+const NARRATION_AUDIO_WARNING =
+  "The video exported, but narration/source audio could not be decoded and may be missing.";
+const SILENT_EXPORT_WARNING =
+  "The video exported, but audio could not be muxed and the downloaded file may be silent.";
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
 }
 
 // Output -> source time mapping is shared with the preview and the store's
@@ -168,17 +239,40 @@ export interface ExportShortResult {
 // (same half-open [start, end) cut boundary, so no one-frame flash at cuts).
 
 /** Load a <video> from a src and resolve once it can render frames. */
-function loadVideo(src: string | undefined): Promise<HTMLVideoElement | null> {
+async function loadVideo(
+  src: string | undefined,
+  abortSignal?: AbortSignal
+): Promise<HTMLVideoElement | null> {
+  abortSignal?.throwIfAborted();
   if (!src) return Promise.resolve(null);
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const v = document.createElement("video");
     v.muted = true;
     v.playsInline = true;
     v.preload = "auto";
     v.src = src;
-    const onReady = () => resolve(v);
+    const cleanup = () => {
+      v.removeEventListener("loadeddata", onReady);
+      v.removeEventListener("error", onError);
+      abortSignal?.removeEventListener("abort", onAbort);
+    };
+    const onReady = () => {
+      cleanup();
+      resolve(v);
+    };
+    const onError = () => {
+      cleanup();
+      unloadVideo(v);
+      resolve(null);
+    };
+    const onAbort = () => {
+      cleanup();
+      unloadVideo(v);
+      reject(new DOMException("Export aborted", "AbortError"));
+    };
     v.addEventListener("loadeddata", onReady, { once: true });
-    v.addEventListener("error", () => resolve(null), { once: true });
+    v.addEventListener("error", onError, { once: true });
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
     v.load();
   });
 }
@@ -190,7 +284,13 @@ function loadVideo(src: string | undefined): Promise<HTMLVideoElement | null> {
  * not a silent stall with the progress bar frozen.
  */
 const SEEK_TIMEOUT_MS = 10_000; // far beyond any real seek, even on a cold 4K file
-function seekVideo(video: HTMLVideoElement, time: number, fps: number): Promise<void> {
+function seekVideo(
+  video: HTMLVideoElement,
+  time: number,
+  fps: number,
+  abortSignal?: AbortSignal
+): Promise<void> {
+  abortSignal?.throwIfAborted();
   return new Promise((resolve, reject) => {
     const clamped = Math.max(0, video.duration && isFinite(video.duration) ? Math.min(time, video.duration) : time);
     if (Math.abs(video.currentTime - clamped) < 1 / (fps * 4)) {
@@ -202,6 +302,7 @@ function seekVideo(video: HTMLVideoElement, time: number, fps: number): Promise<
       clearTimeout(timer);
       video.removeEventListener("seeked", onSeeked);
       video.removeEventListener("error", onError);
+      abortSignal?.removeEventListener("abort", onAbort);
     };
     const onSeeked = () => {
       cleanup();
@@ -211,8 +312,13 @@ function seekVideo(video: HTMLVideoElement, time: number, fps: number): Promise<
       cleanup();
       reject(new Error(`seekVideo: video element errored seeking to ${clamped.toFixed(3)}s`));
     };
+    const onAbort = () => {
+      cleanup();
+      reject(new DOMException("Export aborted", "AbortError"));
+    };
     video.addEventListener("seeked", onSeeked, { once: true });
     video.addEventListener("error", onError, { once: true });
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
     timer = window.setTimeout(() => {
       cleanup();
       reject(new Error(`seekVideo: seeked never fired for ${clamped.toFixed(3)}s (decoder wedged?)`));
@@ -283,10 +389,13 @@ async function makeDecodeFrameSource(
   path: string | undefined,
   timestamps: readonly FrameTimestamp[],
   outWidth: number,
-  outHeight: number
+  outHeight: number,
+  abortSignal?: AbortSignal
 ): Promise<TrackFrameSource | null> {
+  abortSignal?.throwIfAborted();
   if (!path) return null;
   const { Input, UrlSource, ALL_FORMATS, CanvasSink } = await import("mediabunny");
+  abortSignal?.throwIfAborted();
 
   const input = new Input({ source: new UrlSource(path), formats: ALL_FORMATS });
   let videoTrack;
@@ -294,6 +403,10 @@ async function makeDecodeFrameSource(
     videoTrack = await input.getPrimaryVideoTrack();
   } catch {
     videoTrack = null;
+  }
+  if (abortSignal?.aborted) {
+    await disposeInput(input);
+    abortSignal.throwIfAborted();
   }
   if (!videoTrack) {
     await disposeInput(input);
@@ -307,6 +420,10 @@ async function makeDecodeFrameSource(
   } catch {
     await disposeInput(input);
     return null;
+  }
+  if (abortSignal?.aborted) {
+    await disposeInput(input);
+    abortSignal.throwIfAborted();
   }
 
   // Decode at native display size (fit metadata handled by the sink); the
@@ -389,12 +506,23 @@ async function disposeInput(input: unknown): Promise<void> {
  * unreachable. HEAD isn't supported on blob: URLs; a ranged GET is, and it moves
  * almost nothing on a live /api/repurpose/video source.
  */
-async function isFootageReachable(path: string | undefined): Promise<boolean> {
+async function isFootageReachable(
+  path: string | undefined,
+  abortSignal?: AbortSignal
+): Promise<boolean> {
+  abortSignal?.throwIfAborted();
   if (!path) return false;
   try {
-    const res = await fetch(path, { headers: { Range: "bytes=0-0" } });
+    const res = await fetch(path, {
+      headers: { Range: "bytes=0-0" },
+      signal: abortSignal,
+    });
     return res.ok || res.status === 206;
-  } catch {
+  } catch (error) {
+    if (isAbortError(error) || abortSignal?.aborted) {
+      abortSignal?.throwIfAborted();
+      throw error;
+    }
     return false;
   }
 }
@@ -411,7 +539,8 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
     splitRatio,
     footageMeta,
     overlays = [],
-    sfxTrack,
+    sfxClips = [],
+    sfxAssets = [],
     musicTrack,
     fileName = "repurpose-short.mp4",
     onProgress,
@@ -422,9 +551,14 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
     captionBlocks,
     resolution = "1080p",
     download = true,
+    abortSignal,
   } = input;
 
   if (duration <= 0) return null;
+  abortSignal?.throwIfAborted();
+  const audibleSfxClips = sfxClips.filter((clip) => !clip.muted);
+
+  const exportSources = resolveExportSources(footageMeta);
 
   // Preflight: both footage sources must be fetchable BEFORE we spin up the
   // decode/encode pipeline. After a page reload a restored project's blob: URLs
@@ -433,17 +567,32 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
   // actionable message (surfaced verbatim in the page's export-error banner) so
   // Manthan knows to re-select his Screen + Face files via the re-import banner.
   const [screenOk, faceOk] = await Promise.all([
-    isFootageReachable(footageMeta?.screenPath),
-    isFootageReachable(footageMeta?.faceCamPath),
+    isFootageReachable(exportSources.screen, abortSignal),
+    isFootageReachable(exportSources.face, abortSignal),
   ]);
   if (!screenOk || !faceOk) {
     const missing = [!screenOk && "Screen", !faceOk && "Face"]
       .filter(Boolean)
       .join(" + ");
     throw new Error(
-      `Can't reach the ${missing} footage. If you reloaded the page, re-select your video files (Screen + Face) to reconnect, then export again.`
+      `The ${missing} working source is unreadable. Re-import or reconvert the affected video, then export again.`
     );
   }
+
+  // Resolve and decode every audible SFX source before any encoder/output is
+  // acquired. A missing or corrupt unmuted clip therefore fails atomically by name.
+  const preparedSfx = await prepareSfxForExport(audibleSfxClips, sfxAssets, abortSignal);
+
+  const acquiredDecodes = new Set<TrackFrameSource>();
+  const acquiredVideos = new Set<HTMLVideoElement>();
+  const overlayBitmaps = new Map<string, ImageBitmap>();
+  let pendingVideoUrl: string | null = null;
+  const trackVideo = (video: HTMLVideoElement | null): HTMLVideoElement | null => {
+    if (video) acquiredVideos.add(video);
+    return video;
+  };
+
+  try {
 
   const fps = resolveFps(footageMeta);
   const { width: OUT_WIDTH, height: OUT_HEIGHT } = RESOLUTION_DIMENSIONS[resolution];
@@ -461,18 +610,34 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
   // seeking). If a track can't be decoded (unsupported codec, no track), we
   // fall back to the legacy <video>-seek source for THAT track only, so the
   // export never breaks -- it just isn't as fast for the un-decodable track.
-  const [screenDecode, faceDecode] = await Promise.all([
-    makeDecodeFrameSource(footageMeta?.screenPath, frameTimestamps, OUT_WIDTH, OUT_HEIGHT),
-    makeDecodeFrameSource(footageMeta?.faceCamPath, frameTimestamps, OUT_WIDTH, OUT_HEIGHT),
-  ]);
+  const screenDecode = await makeDecodeFrameSource(
+    exportSources.screen,
+    frameTimestamps,
+    OUT_WIDTH,
+    OUT_HEIGHT,
+    abortSignal
+  );
+  if (screenDecode) acquiredDecodes.add(screenDecode);
+  const faceDecode = await makeDecodeFrameSource(
+    exportSources.face,
+    frameTimestamps,
+    OUT_WIDTH,
+    OUT_HEIGHT,
+    abortSignal
+  );
+  if (faceDecode) acquiredDecodes.add(faceDecode);
 
   // Legacy <video> elements: created up front for tracks that failed to decode,
   // and lazily on demand for a decode track that RETIRES mid-export (the worker
   // path threw and exportVideo restarted the walk from frame 0, spending the
   // single-use decode iterator -- see makeDecodeFrameSource / pullRegionSource).
   // A <video> is re-seekable, so it serves any frame index on the restart pass.
-  let screenVideo = screenDecode ? null : await loadVideo(footageMeta?.screenPath);
-  let faceVideo = faceDecode ? null : await loadVideo(footageMeta?.faceCamPath);
+  let screenVideo = screenDecode
+    ? null
+    : trackVideo(await loadVideo(exportSources.screen, abortSignal));
+  let faceVideo = faceDecode
+    ? null
+    : trackVideo(await loadVideo(exportSources.face, abortSignal));
   // Memoized per-path <video> loads so a retired decode track lazy-loads its
   // fallback exactly once even though frames pull concurrently (Promise.all).
   const lazyVideoLoads = new Map<string, Promise<HTMLVideoElement | null>>();
@@ -480,7 +645,7 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
     if (!path) return Promise.resolve(null);
     let p = lazyVideoLoads.get(path);
     if (!p) {
-      p = loadVideo(path);
+      p = loadVideo(path, abortSignal).then(trackVideo);
       lazyVideoLoads.set(path, p);
     }
     return p;
@@ -499,7 +664,6 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
   //
   // Overlays whose whole window sits at/after `duration` are unreachable by the
   // frame walk (frames only run 0..totalFrames-1) -- we SKIP them up front.
-  const overlayBitmaps = new Map<string, ImageBitmap>();
   // Per video overlay: its WebCodecs decode source (null when the codec can't be
   // decoded -> falls back to the pooled <video>), plus a lazily-loaded, re-seekable
   // <video> used both as the primary source (no decode) and the restart fallback.
@@ -514,7 +678,12 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
   const overlayVideos = new Map<string, OverlayVideoState>();
 
   // Sort a stable ascending-z copy ONCE so drawOneFrame just filters by window.
-  const overlaysByZ = [...overlays].sort((a, b) => a.zIndex - b.zIndex);
+  const overlaysByZ = overlays
+    .map((overlay) => ({
+      ...overlay,
+      src: resolveExportOverlaySource(overlay) ?? "",
+    }))
+    .sort((a, b) => a.zIndex - b.zIndex);
 
   // The output time of frame i is i / fps; an overlay is active on frame i when
   // that time lies in [timelineStart, timelineEnd). This is the SAME half-open
@@ -535,27 +704,28 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
       continue;
     }
     // Reachable but the source URL is dead (restored blob: URL) -> skip, warn.
-    if (!(await isFootageReachable(o.src))) {
+    if (!(await isFootageReachable(o.src, abortSignal))) {
       console.warn(
-        `exportShort: overlay ${o.id} source is unreachable (${o.src}) -- skipping. Re-import the asset if you reloaded.`
+        `exportShort: overlay ${o.id} working source is unreadable -- skipping. Re-import or reconvert the asset, then export again.`
       );
       continue;
     }
     reachableOverlays.push(o);
   }
 
-  await Promise.all(
-    reachableOverlays.map(async (o) => {
+  for (const o of reachableOverlays) {
+      abortSignal?.throwIfAborted();
       if (o.kind === "image") {
         try {
-          const res = await fetch(o.src);
+          const res = await fetch(o.src, { signal: abortSignal });
           const blob = await res.blob();
           const bitmap = await createImageBitmap(blob);
           overlayBitmaps.set(o.id, bitmap);
         } catch (err) {
+          if (isAbortError(err) || abortSignal?.aborted) throw err;
           console.warn(`exportShort: overlay image ${o.id} failed to decode -- skipping.`, err);
         }
-        return;
+        continue;
       }
       // Video: build its own monotonic active-frame timestamp list, then an
       // isolated decode source over exactly those frames. Inactive frames are
@@ -567,17 +737,23 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
           ? o.srcStart + (i / fps - o.timelineStart)
           : null;
       }
-      const decode = await makeDecodeFrameSource(o.src, timestamps, OUT_WIDTH, OUT_HEIGHT);
+      const decode = await makeDecodeFrameSource(
+        o.src,
+        timestamps,
+        OUT_WIDTH,
+        OUT_HEIGHT,
+        abortSignal
+      );
+      if (decode) acquiredDecodes.add(decode);
       overlayVideos.set(o.id, {
         overlay: o,
         decode,
         // When the codec can't be decoded up front, prime the <video> fallback now.
-        video: decode ? null : await loadVideo(o.src),
+        video: decode ? null : trackVideo(await loadVideo(o.src, abortSignal)),
         videoLoad: null,
         timestamps,
       });
-    })
-  );
+  }
 
   const canvas =
     typeof OffscreenCanvas !== "undefined"
@@ -600,7 +776,7 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
     video: HTMLVideoElement
   ): Promise<DecodedFrame> => {
     const srcTime = frameTimestamps[frameIndex];
-    if (srcTime !== null) await seekVideo(video, srcTime, fps);
+    if (srcTime !== null) await seekVideo(video, srcTime, fps, abortSignal);
     const ready = video.readyState >= 2;
     return {
       source: ready ? (video as DrawableSource) : null,
@@ -653,17 +829,22 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
       const decoded = await st.decode.next(frameIndex);
       if (decoded) return decoded;
       // Retired on a restart pass -- drop to the re-seekable <video> from here on.
+      const retiredDecode = st.decode;
       st.decode = null;
+      acquiredDecodes.delete(retiredDecode);
+      await retiredDecode.dispose();
     }
     let video = st.video;
     if (!video) {
-      if (!st.videoLoad) st.videoLoad = loadVideo(st.overlay.src);
+      if (!st.videoLoad) {
+        st.videoLoad = loadVideo(st.overlay.src, abortSignal).then(trackVideo);
+      }
       video = await st.videoLoad;
       st.video = video;
     }
     if (!video) return { source: null, width: 0, height: 0 };
     const srcTime = st.timestamps[frameIndex];
-    if (srcTime !== null) await seekVideo(video, srcTime, fps);
+    if (srcTime !== null) await seekVideo(video, srcTime, fps, abortSignal);
     const ready = video.readyState >= 2;
     return {
       source: ready ? (video as DrawableSource) : null,
@@ -702,14 +883,14 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
         screenDecode,
         () => screenVideo,
         (v) => { screenVideo = v; },
-        footageMeta?.screenPath
+        exportSources.screen
       ),
       pullRegionSource(
         i,
         faceDecode,
         () => faceVideo,
         (v) => { faceVideo = v; },
-        footageMeta?.faceCamPath
+        exportSources.face
       ),
       ...overlayVideoPulls,
     ]);
@@ -765,7 +946,10 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
     // loop uses with the SAME output `time`, so the exported seam is identical
     // to what Manthan framed per scene (a tucked-up face on one scene, more room
     // on the next). `splitRatio` is the global default fallback.
-    const frameSplit = splitRatioAt(clips, time, splitRatio);
+    const frameSplit = effectiveSplitRatio(
+      splitRatioAt(clips, time, splitRatio),
+      OUT_HEIGHT
+    );
 
     // FREE-FLOATING OVERLAYS -- resolve every overlay active at this output frame
     // into an OverlayDraw the compositor draws ON TOP of the base composite,
@@ -775,8 +959,15 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
     // ready yet (missing bitmap / no decoded video frame) is skipped this frame
     // -- never a black rectangle (no-blank-first-frame convention).
     const overlayDraws: OverlayDraw[] = [];
+    const outputRect = {
+      left: 0,
+      top: 0,
+      width: OUT_WIDTH,
+      height: OUT_HEIGHT,
+    };
     for (const o of overlaysByZ) {
       if (!overlayActiveAt(o, i)) continue;
+      const appearance = resolveOverlayAppearanceAt(o, time, outputRect, frameSplit);
       if (o.kind === "image") {
         const bitmap = overlayBitmaps.get(o.id);
         if (!bitmap) continue;
@@ -784,7 +975,11 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
           source: bitmap,
           naturalWidth: bitmap.width,
           naturalHeight: bitmap.height,
-          transform: { ...o.transform, opacity: o.opacity },
+          transform: {
+            ...appearance.transform,
+            opacity: o.opacity * appearance.opacityMultiplier,
+          },
+          cornerRadius: appearance.cornerRadius,
           band: o.band,
         });
       } else {
@@ -794,7 +989,11 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
           source: df.source,
           naturalWidth: df.width,
           naturalHeight: df.height,
-          transform: { ...o.transform, opacity: o.opacity },
+          transform: {
+            ...appearance.transform,
+            opacity: o.opacity * appearance.opacityMultiplier,
+          },
+          cornerRadius: appearance.cornerRadius,
           band: o.band,
         });
       }
@@ -892,30 +1091,26 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
       ...(canBuildVideoFrame ? { renderVideoFrame } : {}),
       // H.264 for broad editor compatibility (Descript etc.).
       forceH264: true,
+      abortSignal,
     });
-  } finally {
-    // Release the WebCodecs decoders + their inputs regardless of outcome --
-    // the two base tracks AND every video overlay's isolated decode source.
-    await Promise.all([
-      screenDecode?.dispose() ?? Promise.resolve(),
-      faceDecode?.dispose() ?? Promise.resolve(),
-      ...[...overlayVideos.values()].map(
-        (st) => st.decode?.dispose() ?? Promise.resolve()
-      ),
-    ]);
-    // Close every decoded overlay ImageBitmap so its backing memory is freed
-    // (many overlays => many bitmaps; leaving them open leaks GPU/heap memory).
-    for (const bitmap of overlayBitmaps.values()) bitmap.close();
-    overlayBitmaps.clear();
+    pendingVideoUrl = videoResult.url;
+  } catch (error) {
+    throw actionableExportError(error);
   }
 
   // ── 2 + 3. Assemble face-cam audio (+ mix SFX) and mux it into the MP4 ────
-  let finalBlob = videoResult.blob;
+  const warnings: string[] = [];
+  const warnAudio = (message: string) => {
+    if (!warnings.includes(message)) warnings.push(message);
+  };
+  let audioBuffer: AudioBuffer | null = null;
   try {
-    let audioBuffer = await assembleClipAudio(
-      footageMeta?.faceCamPath,
+    audioBuffer = await assembleClipAudio(
+      exportSources.face,
       clips,
-      duration
+      duration,
+      warnAudio,
+      abortSignal
     );
     // Additively mix the manual BACKGROUND-MUSIC bed on top of the face-cam audio
     // (or, when the face-cam had no audio, onto a fresh silent bed so a music-only
@@ -924,36 +1119,129 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
     // buffer -- music must never fail the whole export. Both music and SFX are
     // additive, so the mix order between them doesn't matter.
     if (musicTrack) {
-      audioBuffer = await mixMusicIntoBuffer(audioBuffer, musicTrack, duration);
-    }
-    // Additively mix the generated SFX bed on top of the face-cam audio (or,
-    // when the face-cam had no audio, onto a fresh silent bed so an SFX-only
-    // reel still carries sound). Best-effort: on any failure this returns the
-    // untouched face-cam buffer -- SFX must never fail the whole export.
-    if (sfxTrack) {
-      audioBuffer = await mixSfxIntoBuffer(audioBuffer, sfxTrack, duration);
-    }
-    if (audioBuffer) {
-      finalBlob = await muxAudioIntoMp4(videoResult.blob, audioBuffer, fps);
-    } else {
-      console.warn(
-        "exportShort: face-cam has no decodable audio track -- shipping silent video."
+      audioBuffer = await mixMusicIntoBuffer(
+        audioBuffer,
+        musicTrack,
+        duration,
+        warnAudio,
+        abortSignal
       );
     }
+    if (audibleSfxClips.length > 0) {
+      audioBuffer = mixPreparedSfxIntoBuffer(
+        audioBuffer,
+        audibleSfxClips,
+        sfxAssets,
+        preparedSfx,
+        duration,
+        abortSignal
+      );
+    }
+    if (audioBuffer) {
+      const completedAudio = audioBuffer;
+      clampPcmChannels(Array.from(
+        { length: completedAudio.numberOfChannels },
+        (_, channel) => completedAudio.getChannelData(channel)
+      ));
+    }
   } catch (err) {
-    // Never fail the whole export because audio muxing hit a snag -- ship the
-    // (silent) picture we already encoded and surface why.
+    if (isAbortError(err) || abortSignal?.aborted) throw err;
+    // Layer mixers are best-effort already, but keep an outer boundary so an
+    // unexpected Web Audio failure still ships the encoded picture visibly.
     console.warn(
-      "exportShort: audio mux failed, shipping silent video instead:",
+      "exportShort: audio assembly failed, shipping silent video instead:",
       err
     );
-    finalBlob = videoResult.blob;
+    warnAudio(SILENT_EXPORT_WARNING);
+    audioBuffer = null;
+  }
+
+  const result = await finalizeExportAudio({
+    videoResult,
+    audioBuffer,
+    fps,
+    warnings,
+    download,
+    fileName,
+    abortSignal,
+  });
+  pendingVideoUrl = null;
+  return result;
+  } finally {
+    await Promise.all([...acquiredDecodes].map((decode) => decode.dispose()));
+    acquiredDecodes.clear();
+    for (const bitmap of overlayBitmaps.values()) bitmap.close();
+    overlayBitmaps.clear();
+    for (const video of acquiredVideos) unloadVideo(video);
+    acquiredVideos.clear();
+    if (pendingVideoUrl) URL.revokeObjectURL(pendingVideoUrl);
+  }
+}
+
+function unloadVideo(video: HTMLVideoElement): void {
+  try {
+    video.pause();
+  } catch {
+    /* ignore */
+  }
+  video.removeAttribute("src");
+  try {
+    video.load();
+  } catch {
+    /* ignore */
+  }
+}
+
+export async function finalizeExportAudio(input: {
+  videoResult: { url: string; blob: Blob };
+  audioBuffer: AudioBuffer | null;
+  fps: number;
+  warnings: string[];
+  download: boolean;
+  fileName: string;
+  abortSignal?: AbortSignal;
+}): Promise<ExportShortResult> {
+  const { videoResult, audioBuffer, fps, download, fileName, abortSignal } = input;
+  abortSignal?.throwIfAborted();
+  const warnings = [...new Set(input.warnings)];
+  const warnAudio = (message: string) => {
+    if (!warnings.includes(message)) warnings.push(message);
+  };
+  let finalBlob = videoResult.blob;
+
+  if (!audioBuffer) {
+    console.warn(
+      "exportShort: no decodable audio buffer was assembled -- shipping silent video."
+    );
+    warnAudio(SILENT_EXPORT_WARNING);
+  } else {
+    try {
+      const muxed = await muxAudioIntoMp4(
+        videoResult.blob,
+        audioBuffer,
+        fps,
+        abortSignal
+      );
+      if (muxed && muxed !== videoResult.blob) {
+        finalBlob = muxed;
+      } else {
+        console.warn(
+          "exportShort: audio mux produced no output -- shipping silent video."
+        );
+        warnAudio(SILENT_EXPORT_WARNING);
+      }
+    } catch (err) {
+      if (isAbortError(err) || abortSignal?.aborted) throw err;
+      console.warn(
+        "exportShort: audio mux failed, shipping silent video instead:",
+        err
+      );
+      warnAudio(SILENT_EXPORT_WARNING);
+    }
   }
 
   // If we produced a distinct (muxed) blob, the old video-only URL is dead.
-  if (finalBlob !== videoResult.blob) {
-    URL.revokeObjectURL(videoResult.url);
-  }
+  if (finalBlob !== videoResult.blob) URL.revokeObjectURL(videoResult.url);
 
   // Only save to disk when asked (the default). The smooth in-editor preview
   // passes download:false -- it just wants the blob URL to feed a <video>, with
@@ -962,13 +1250,14 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
   // minting: leaving it live pins the full multi-hundred-MB MP4 blob in memory
   // for the rest of the session, once per export.
   if (download) {
+    abortSignal?.throwIfAborted();
     await downloadBlob(finalBlob, fileName);
     if (finalBlob === videoResult.blob) URL.revokeObjectURL(videoResult.url);
-    return { url: "", blob: finalBlob };
+    return { url: "", blob: finalBlob, warnings };
   }
   const url =
     finalBlob === videoResult.blob ? videoResult.url : URL.createObjectURL(finalBlob);
-  return { url, blob: finalBlob };
+  return { url, blob: finalBlob, warnings };
 }
 
 // ===========================================================================
@@ -982,13 +1271,20 @@ export async function exportShort(input: ExportShortInput): Promise<ExportShortR
  * when there is no usable audio (no path, no audio track, or Web Audio /
  * mediabunny unavailable) so the caller can fall back to a silent export.
  */
-async function assembleClipAudio(
+export async function assembleClipAudio(
   faceCamPath: string | undefined,
   clips: readonly Clip[],
-  duration: number
+  duration: number,
+  onWarning: (message: string) => void = () => {},
+  abortSignal?: AbortSignal
 ): Promise<AudioBuffer | null> {
-  if (!faceCamPath) return null;
-  if (typeof AudioBuffer === "undefined") return null;
+  abortSignal?.throwIfAborted();
+  const unavailable = () => {
+    onWarning(NARRATION_AUDIO_WARNING);
+    return null;
+  };
+  if (!faceCamPath) return unavailable();
+  if (typeof AudioBuffer === "undefined") return unavailable();
 
   const OfflineCtx =
     (typeof OfflineAudioContext !== "undefined" && OfflineAudioContext) ||
@@ -996,15 +1292,22 @@ async function assembleClipAudio(
       (globalThis as { webkitOfflineAudioContext?: typeof OfflineAudioContext })
         .webkitOfflineAudioContext) ||
     null;
-  if (!OfflineCtx) return null;
+  if (!OfflineCtx) return unavailable();
 
-  const { Input, UrlSource, ALL_FORMATS, AudioBufferSink } = await import("mediabunny");
-
-  const input = new Input({ source: new UrlSource(faceCamPath), formats: ALL_FORMATS });
+  let input: { dispose?: () => Promise<void> | void } | null = null;
   try {
-    const audioTrack = await input.getPrimaryAudioTrack();
-    if (!audioTrack) return null;
-    if (!(await audioTrack.canDecode())) return null;
+    const { Input, UrlSource, ALL_FORMATS, AudioBufferSink } = await import("mediabunny");
+    abortSignal?.throwIfAborted();
+    const mediaInput = new Input({
+      source: new UrlSource(faceCamPath),
+      formats: ALL_FORMATS,
+    });
+    input = mediaInput;
+    const audioTrack = await mediaInput.getPrimaryAudioTrack();
+    abortSignal?.throwIfAborted();
+    if (!audioTrack) return unavailable();
+    if (!(await audioTrack.canDecode())) return unavailable();
+    abortSignal?.throwIfAborted();
 
     const sampleRate = audioTrack.sampleRate;
     const numberOfChannels = Math.max(1, audioTrack.numberOfChannels);
@@ -1018,6 +1321,7 @@ async function assembleClipAudio(
 
     let wroteAny = false;
     for (const clip of clips) {
+      abortSignal?.throwIfAborted();
       if (!clip.kept) continue;
       const srcStart = clip.srcStart;
       const srcEnd = clip.srcEnd;
@@ -1026,6 +1330,7 @@ async function assembleClipAudio(
       // Iterate decoded buffers overlapping this clip's SOURCE range and copy
       // only the overlapping slice into the OUTPUT position.
       for await (const { buffer, timestamp } of sink.buffers(srcStart, srcEnd)) {
+        abortSignal?.throwIfAborted();
         const bufStart = timestamp;
         const bufEnd = timestamp + buffer.duration;
 
@@ -1066,11 +1371,18 @@ async function assembleClipAudio(
       }
     }
 
-    return wroteAny ? out : null;
+    return wroteAny ? out : unavailable();
+  } catch (err) {
+    if (isAbortError(err) || abortSignal?.aborted) throw err;
+    console.warn(
+      "assembleClipAudio: narration/source audio decode failed -- continuing without narration:",
+      err
+    );
+    return unavailable();
   } finally {
     // Input is disposable; release its underlying reader.
     try {
-      await (input as unknown as { dispose?: () => Promise<void> | void }).dispose?.();
+      await input?.dispose?.();
     } catch {
       /* ignore */
     }
@@ -1078,117 +1390,9 @@ async function assembleClipAudio(
 }
 
 /**
- * Additively mix the reel's generated SFX WAV into the assembled face-cam
- * buffer and return the (possibly newly-created) result.
- *
- *  - When `base` exists, the SFX is decoded, resampled to the base buffer's
- *    sampleRate + channel layout AND gained (all in one OfflineAudioContext
- *    render pass), then summed into a copy of the base per channel.
- *  - When `base` is null (face-cam had no audio), a fresh silent bed sized
- *    `duration` at 48000/2ch is created so an SFX-only reel still exports.
- *  - After summing, every touched sample is HARD-CLAMPED to [-1, 1] (additive
- *    mixing can push VO + SFX past full-scale; there is no limiter upstream).
- *
- * The SFX bed is already full output-length (0..duration), so it lands at
- * output sample offset 0. Best-effort: any decode/resample failure logs a
- * warning and returns `base` unchanged so SFX never fails the export.
- */
-async function mixSfxIntoBuffer(
-  base: AudioBuffer | null,
-  sfxTrack: SfxTrack,
-  duration: number
-): Promise<AudioBuffer | null> {
-  if (typeof AudioBuffer === "undefined") return base;
-
-  const OfflineCtx =
-    (typeof OfflineAudioContext !== "undefined" && OfflineAudioContext) ||
-    (typeof globalThis !== "undefined" &&
-      (globalThis as { webkitOfflineAudioContext?: typeof OfflineAudioContext })
-        .webkitOfflineAudioContext) ||
-    null;
-  if (!OfflineCtx) return base;
-
-  try {
-    // Target layout: match the face-cam bed when present so summing is 1:1;
-    // otherwise a sane stereo/48k default for an SFX-only export.
-    const targetRate = base ? base.sampleRate : 48000;
-    const targetChannels = base ? base.numberOfChannels : 2;
-    const targetFrames = base
-      ? base.length
-      : Math.max(1, Math.ceil(duration * targetRate));
-
-    // Fetch + decode the SFX WAV. Decode happens at the file's own rate; the
-    // render pass below resamples it to targetRate.
-    const res = await fetch(sfxTrack.src);
-    if (!res.ok) {
-      console.warn(
-        `mixSfxIntoBuffer: SFX fetch failed (${res.status}) -- shipping without SFX.`
-      );
-      return base;
-    }
-    const sfxBytes = await res.arrayBuffer();
-
-    // decodeAudioData wants its own context; a tiny scratch ctx at the target
-    // rate is fine -- decodeAudioData ignores the ctx rate and decodes at the
-    // file's native rate (the render pass does the actual resample).
-    const decodeCtx = new OfflineCtx(1, 1, targetRate);
-    const decoded = await decodeCtx.decodeAudioData(sfxBytes);
-
-    // ONE pass: resample decoded -> targetRate AND apply the track's gain.
-    const render = new OfflineCtx(
-      targetChannels,
-      targetFrames,
-      targetRate
-    );
-    const srcNode = render.createBufferSource();
-    srcNode.buffer = decoded;
-    const g = render.createGain();
-    g.gain.value = sfxTrack.gain;
-    srcNode.connect(g).connect(render.destination);
-    srcNode.start(0);
-    const resampled = await render.startRendering();
-
-    // Output = a copy of the base bed (or a fresh silent bed) so we never
-    // mutate the assembled face-cam buffer in place.
-    const outCtx = new OfflineCtx(targetChannels, targetFrames, targetRate);
-    const out = outCtx.createBuffer(targetChannels, targetFrames, targetRate);
-    if (base) {
-      for (let ch = 0; ch < targetChannels; ch++) {
-        out.getChannelData(ch).set(base.getChannelData(ch));
-      }
-    }
-
-    // Additively sum the resampled+gained SFX into the output, per channel,
-    // starting at sample 0. mono SFX -> stereo out reuses channel 0 (mirrors
-    // assembleClipAudio's mono->stereo fallback).
-    const sumLen = Math.min(targetFrames, resampled.length);
-    for (let ch = 0; ch < targetChannels; ch++) {
-      const srcCh = ch < resampled.numberOfChannels ? ch : 0;
-      const srcData = resampled.getChannelData(srcCh);
-      const dstData = out.getChannelData(ch);
-      for (let i = 0; i < sumLen; i++) {
-        // Sum then HARD-CLAMP to [-1, 1] -- additive mix can exceed full scale.
-        let v = dstData[i] + srcData[i];
-        if (v > 1) v = 1;
-        else if (v < -1) v = -1;
-        dstData[i] = v;
-      }
-    }
-
-    return out;
-  } catch (err) {
-    console.warn(
-      "mixSfxIntoBuffer: SFX mix failed, shipping face-cam audio only:",
-      err
-    );
-    return base;
-  }
-}
-
-/**
  * Additively mix the reel's manual BACKGROUND-MUSIC file into the assembled
- * audio and return the (possibly newly-created) result. This mirrors
- * {@link mixSfxIntoBuffer} exactly EXCEPT the music lands at an OUTPUT-time
+  * audio and return the (possibly newly-created) result. Unlike SFX clip mixing,
+  * the music lands at an OUTPUT-time
  * START OFFSET instead of at sample 0:
  *
  *  - When `base` exists, the music is decoded, resampled to the base buffer's
@@ -1199,8 +1403,8 @@ async function mixSfxIntoBuffer(
  *    silent bed sized `duration` at 48000/2ch is created so a music-only reel
  *    still exports.
  *  - Only samples that land WITHIN the base buffer are written; music that runs
- *    past the reel end is clipped. After summing, every touched sample is HARD-
- *    CLAMPED to [-1, 1] (additive mix can exceed full scale; no limiter upstream).
+ *    past the reel end is clipped. Clamping is deferred until narration, music,
+ *    and every SFX contribution have been summed.
  *
  * Best-effort: any decode/resample failure logs a warning and returns `base`
  * unchanged so music never fails the export.
@@ -1208,9 +1412,15 @@ async function mixSfxIntoBuffer(
 async function mixMusicIntoBuffer(
   base: AudioBuffer | null,
   musicTrack: MusicTrack,
-  duration: number
+  duration: number,
+  onWarning: (message: string) => void,
+  abortSignal?: AbortSignal
 ): Promise<AudioBuffer | null> {
-  if (typeof AudioBuffer === "undefined") return base;
+  abortSignal?.throwIfAborted();
+  if (typeof AudioBuffer === "undefined") {
+    onWarning("The video exported, but the music layer could not be mixed.");
+    return base;
+  }
 
   const OfflineCtx =
     (typeof OfflineAudioContext !== "undefined" && OfflineAudioContext) ||
@@ -1218,7 +1428,10 @@ async function mixMusicIntoBuffer(
       (globalThis as { webkitOfflineAudioContext?: typeof OfflineAudioContext })
         .webkitOfflineAudioContext) ||
     null;
-  if (!OfflineCtx) return base;
+  if (!OfflineCtx) {
+    onWarning("The video exported, but the music layer could not be mixed.");
+    return base;
+  }
 
   try {
     // Target layout: match the base bed when present so summing is 1:1;
@@ -1231,17 +1444,20 @@ async function mixMusicIntoBuffer(
 
     // Fetch + decode the music file. Decode happens at the file's own rate; the
     // render pass below resamples it to targetRate.
-    const res = await fetch(musicTrack.src);
+    const res = await fetch(musicTrack.src, { signal: abortSignal });
     if (!res.ok) {
       console.warn(
         `mixMusicIntoBuffer: music fetch failed (${res.status}) -- shipping without music.`
       );
+      onWarning("The video exported, but the music layer could not be mixed.");
       return base;
     }
     const musicBytes = await res.arrayBuffer();
+    abortSignal?.throwIfAborted();
 
     const decodeCtx = new OfflineCtx(1, 1, targetRate);
     const decoded = await decodeCtx.decodeAudioData(musicBytes);
+    abortSignal?.throwIfAborted();
 
     // ONE pass: resample decoded -> targetRate AND apply the track's gain.
     const render = new OfflineCtx(targetChannels, targetFrames, targetRate);
@@ -1252,6 +1468,7 @@ async function mixMusicIntoBuffer(
     srcNode.connect(g).connect(render.destination);
     srcNode.start(0);
     const resampled = await render.startRendering();
+    abortSignal?.throwIfAborted();
 
     // Output = a copy of the base bed (or a fresh silent bed) so we never
     // mutate the incoming buffer in place.
@@ -1271,26 +1488,23 @@ async function mixMusicIntoBuffer(
 
     // How many resampled samples fit between writeStart and the reel end -- clip
     // any music that runs past the end.
-    const sumLen = Math.min(resampled.length, targetFrames - writeStart);
-    for (let ch = 0; ch < targetChannels; ch++) {
-      const srcCh = ch < resampled.numberOfChannels ? ch : 0;
-      const srcData = resampled.getChannelData(srcCh);
-      const dstData = out.getChannelData(ch);
-      for (let i = 0; i < sumLen; i++) {
-        // Sum then HARD-CLAMP to [-1, 1] -- additive mix can exceed full scale.
-        let v = dstData[writeStart + i] + srcData[i];
-        if (v > 1) v = 1;
-        else if (v < -1) v = -1;
-        dstData[writeStart + i] = v;
-      }
-    }
+    sumPcmChannels(
+      Array.from({ length: targetChannels }, (_, channel) => out.getChannelData(channel)),
+      Array.from(
+        { length: resampled.numberOfChannels },
+        (_, channel) => resampled.getChannelData(channel)
+      ),
+      writeStart
+    );
 
     return out;
   } catch (err) {
+    if (isAbortError(err) || abortSignal?.aborted) throw err;
     console.warn(
       "mixMusicIntoBuffer: music mix failed, shipping audio without music:",
       err
     );
+    onWarning("The video exported, but the music layer could not be mixed.");
     return base;
   }
 }
@@ -1308,8 +1522,10 @@ async function mixMusicIntoBuffer(
 async function muxAudioIntoMp4(
   videoOnlyMp4: Blob,
   audioBuffer: AudioBuffer,
-  fps: number
-): Promise<Blob> {
+  fps: number,
+  abortSignal?: AbortSignal
+): Promise<Blob | null> {
+  abortSignal?.throwIfAborted();
   const {
     Input,
     BlobSource,
@@ -1323,20 +1539,25 @@ async function muxAudioIntoMp4(
     getFirstEncodableAudioCodec,
     QUALITY_HIGH,
   } = await import("mediabunny");
+  abortSignal?.throwIfAborted();
 
   const input = new Input({ source: new BlobSource(videoOnlyMp4), formats: ALL_FORMATS });
+  let outputToCancel: { cancel: () => Promise<void> } | null = null;
+  let outputCancelled = false;
+  let outputFinalized = false;
 
   try {
     const videoTrack = await input.getPrimaryVideoTrack();
+    abortSignal?.throwIfAborted();
     if (!videoTrack) {
-      // Nothing to remux against -- return the original.
-      return videoOnlyMp4;
+      throw new Error("The encoded video track could not be read for audio muxing.");
     }
 
     const decoderConfig = await videoTrack.getDecoderConfig();
+    abortSignal?.throwIfAborted();
     const videoCodec = videoTrack.codec;
     if (!decoderConfig || !videoCodec) {
-      return videoOnlyMp4;
+      throw new Error("The encoded video configuration could not be read for audio muxing.");
     }
 
     // Pick an audio codec the browser can actually encode with our layout.
@@ -1344,8 +1565,9 @@ async function muxAudioIntoMp4(
       numberOfChannels: audioBuffer.numberOfChannels,
       sampleRate: audioBuffer.sampleRate,
     });
+    abortSignal?.throwIfAborted();
     if (!audioCodec) {
-      return videoOnlyMp4;
+      throw new Error("No browser audio encoder is available for MP4 muxing.");
     }
 
     const target = new BufferTarget();
@@ -1353,6 +1575,7 @@ async function muxAudioIntoMp4(
       format: new Mp4OutputFormat({ fastStart: "in-memory" }),
       target,
     });
+    outputToCancel = output;
 
     const videoSource = new EncodedVideoPacketSource(videoCodec);
     output.addVideoTrack(videoSource, { frameRate: fps });
@@ -1364,25 +1587,38 @@ async function muxAudioIntoMp4(
     output.addAudioTrack(audioSource);
 
     await output.start();
+    abortSignal?.throwIfAborted();
 
     // Copy every encoded video packet, in decode order. The first packet
     // carries the decoder config (required by EncodedVideoPacketSource.add).
     const sink = new EncodedPacketSink(videoTrack);
     let first = true;
     for await (const packet of sink.packets()) {
+      abortSignal?.throwIfAborted();
       await videoSource.add(packet, first ? { decoderConfig } : undefined);
       first = false;
     }
 
     // Feed the assembled audio (starts at output timestamp 0).
     await audioSource.add(audioBuffer);
+    abortSignal?.throwIfAborted();
 
     await output.finalize();
+    outputFinalized = true;
+    abortSignal?.throwIfAborted();
 
     const buffer = target.buffer;
-    if (!buffer) return videoOnlyMp4;
+    if (!buffer) return null;
     return new Blob([buffer], { type: "video/mp4" });
   } finally {
+    if (outputToCancel && !outputFinalized && !outputCancelled) {
+      outputCancelled = true;
+      try {
+        await outputToCancel.cancel();
+      } catch {
+        // Preserve the original muxing error while still attempting cleanup.
+      }
+    }
     try {
       await (input as unknown as { dispose?: () => Promise<void> | void }).dispose?.();
     } catch {

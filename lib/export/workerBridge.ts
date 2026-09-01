@@ -44,9 +44,15 @@ export function prespawnWorker(): void {
   if (warmWorker) return;
   if (!isWorkerEncodingSupported()) return;
   try {
-    warmWorker = new Worker(
+    const worker = new Worker(
       new URL("./encode.worker.ts", import.meta.url)
     );
+    worker.onerror = (event) => {
+      event.preventDefault();
+      if (warmWorker === worker) warmWorker = null;
+      worker.terminate();
+    };
+    warmWorker = worker;
   } catch {
     warmWorker = null;
   }
@@ -101,6 +107,7 @@ export class EncodeWorkerBridge {
     };
 
     this.worker.onerror = (e) => {
+      e.preventDefault();
       const errorMsg = e.message || "Worker error";
       this.handleFatalError(errorMsg);
     };

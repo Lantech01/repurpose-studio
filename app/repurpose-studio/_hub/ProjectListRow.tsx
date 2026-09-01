@@ -28,7 +28,11 @@ export function ProjectListRow({
         <GradientTile
           id={p.id}
           compact
-          thumbSrc={`/api/repurpose/thumb?id=${encodeURIComponent(p.id)}&v=${encodeURIComponent(p.updatedAt)}`}
+          thumbSrc={
+            p.durationSec > 0
+              ? `/api/repurpose/thumb?id=${encodeURIComponent(p.id)}&v=${encodeURIComponent(p.updatedAt)}`
+              : undefined
+          }
         />
 
         <div className="min-w-0 flex-1">

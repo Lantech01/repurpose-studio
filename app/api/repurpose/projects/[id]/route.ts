@@ -5,7 +5,10 @@ import { NextResponse } from 'next/server';
 import {
   deleteProject,
   isValidProjectId,
+  ProjectMutationLockTimeoutError,
+  projectFileExists,
   readProject,
+  withProjectMutationLock,
 } from '@/lib/repurpose/projects';
 
 export const runtime = 'nodejs';
@@ -21,6 +24,18 @@ export async function GET(_req: Request, { params }: Ctx) {
   }
   const project = readProject(id);
   if (!project) {
+    if (projectFileExists(id)) {
+      return NextResponse.json(
+        {
+          error: {
+            code: 'PROJECT_FILE_CORRUPT',
+            message: 'Project file is corrupt and must be recovered.',
+          },
+          project: { id },
+        },
+        { status: 409 },
+      );
+    }
     return NextResponse.json({ error: 'not found' }, { status: 404 });
   }
   return NextResponse.json({ project });
@@ -32,8 +47,20 @@ export async function DELETE(_req: Request, { params }: Ctx) {
   if (!isValidProjectId(id)) {
     return NextResponse.json({ error: 'invalid id' }, { status: 400 });
   }
-  if (!deleteProject(id)) {
-    return NextResponse.json({ error: 'not found' }, { status: 404 });
+  try {
+    return await withProjectMutationLock(id, async () => {
+      if (!(await deleteProject(id))) {
+        return NextResponse.json({ error: 'not found' }, { status: 404 });
+      }
+      return NextResponse.json({ ok: true });
+    });
+  } catch (error) {
+    if (error instanceof ProjectMutationLockTimeoutError) {
+      return NextResponse.json(
+        { error: { code: error.code, message: 'Project is busy; retry delete.' } },
+        { status: 503 },
+      );
+    }
+    throw error;
   }
-  return NextResponse.json({ ok: true });
 }

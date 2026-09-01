@@ -13,7 +13,7 @@ export const ZOOM_STEP = 1.25;
 export const TRACK_HEIGHT = 56;
 export const TRACK_GAP = 6;
 export const RULER_HEIGHT = 28;
-export const SNAP_PX = 8; // snap threshold in screen pixels, independent of zoom
+export const SNAP_PX = 4; // snap threshold in screen pixels, independent of zoom
 
 // One overlay sub-lane's height. The Overlay row grows DYNAMICALLY: its height is
 // laneCount * OVERLAY_LANE_HEIGHT, where laneCount is the max number of overlays
@@ -24,6 +24,8 @@ export const SNAP_PX = 8; // snap threshold in screen pixels, independent of zoo
 // overlay lane is a thin media strip, not a waveform-bearing scene track.
 export const OVERLAY_LANE_HEIGHT = 30;
 export const OVERLAY_LANE_GAP = 3;
+export const SFX_LANE_HEIGHT = 30;
+export const SFX_LANE_GAP = 3;
 
 /** Format seconds as mm:ss (or mm:ss.d when sub-second precision matters). */
 export function formatTimecode(seconds: number, withTenths = false): string {
@@ -90,6 +92,51 @@ export function snapTime(
     return { time: best, snapped: true, snapTarget: best };
   }
   return { time: candidate, snapped: false, snapTarget: null };
+}
+
+export function snapMovedSpan(
+  candidateStart: number,
+  duration: number,
+  targets: readonly number[],
+  thresholdSeconds: number
+): {
+  start: number;
+  snapped: boolean;
+  snapTarget: number | null;
+  edge: "leading" | "trailing" | null;
+} {
+  const candidates = targets.flatMap((target) => ([
+    {
+      target,
+      edge: "leading" as const,
+      delta: target - candidateStart,
+    },
+    {
+      target,
+      edge: "trailing" as const,
+      delta: target - (candidateStart + duration),
+    },
+  ])).filter((candidate) => Math.abs(candidate.delta) <= thresholdSeconds);
+  candidates.sort((a, b) => {
+    const distanceDelta = Math.abs(a.delta) - Math.abs(b.delta);
+    if (Math.abs(distanceDelta) > 1e-12) return distanceDelta;
+    if (a.edge !== b.edge) return a.edge === "leading" ? -1 : 1;
+    return a.target - b.target;
+  });
+  const best = candidates[0];
+  return best
+    ? {
+        start: best.edge === "leading" ? best.target : best.target - duration,
+        snapped: true,
+        snapTarget: best.target,
+        edge: best.edge,
+      }
+    : {
+        start: candidateStart,
+        snapped: false,
+        snapTarget: null,
+        edge: null,
+      };
 }
 
 /** A time-window item to be lane-packed (any object carrying a start/end). */

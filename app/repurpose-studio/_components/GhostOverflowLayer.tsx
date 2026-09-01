@@ -30,7 +30,11 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRepurposeStore } from "@/lib/repurpose/store";
-import { overlayCornersNorm, type PreviewRect } from "@/lib/repurpose/overlay-geometry";
+import type { OverlayFrameSnapshot } from "@/lib/repurpose/overlay-effects";
+import {
+  overlayCornersNorm,
+  type PreviewRect,
+} from "@/lib/repurpose/overlay-geometry";
 import type { Overlay } from "@/lib/repurpose/types";
 
 /** Opacity of the ghosted off-frame bleed -- dim enough to read as "outside". */
@@ -51,6 +55,8 @@ interface GhostBox {
   h: number;
   /** Rotation in degrees. */
   rotation: number;
+  cornerRadiusPx: number;
+  opacity: number;
 }
 
 /**
@@ -81,7 +87,13 @@ function bleedsOffFrame(
  * scale*W, height derived from the intrinsic aspect, rotation in degrees). This is
  * what makes the ghost line up pixel-for-pixel with the on-canvas render.
  */
-function resolveGhost(ov: Overlay, rect: PreviewRect): GhostBox {
+function resolveGhost(
+  ov: Overlay,
+  rect: PreviewRect,
+  cornerRadius: number,
+  opacityMultiplier: number,
+  previewSrc: string | undefined
+): GhostBox {
   const aspect =
     ov.naturalHeight > 0 && ov.naturalWidth > 0
       ? ov.naturalHeight / ov.naturalWidth
@@ -91,21 +103,29 @@ function resolveGhost(ov: Overlay, rect: PreviewRect): GhostBox {
   return {
     id: ov.id,
     kind: ov.kind,
-    src: ov.src,
+    src: ov.kind === "video" ? previewSrc ?? ov.src : ov.src,
     srcTime: ov.srcStart,
     cx: ov.transform.x * rect.width,
     cy: ov.transform.y * rect.height,
     w: wPx,
     h: hPx,
     rotation: ov.transform.rotation,
+    cornerRadiusPx: cornerRadius * Math.min(wPx, hPx),
+    opacity: ov.opacity * opacityMultiplier,
   };
 }
 
 export function GhostOverflowLayer({
   getRect,
+  getFrameSnapshot,
+  getOverlayPreviewSrc,
 }: {
   /** Reads the preview canvas's live on-screen rect (CSS px). Null if unmounted. */
   getRect: () => PreviewRect | null;
+  /** Reads the exact overlay sample used by the latest compositor frame. */
+  getFrameSnapshot: () => OverlayFrameSnapshot | null;
+  /** Returns the exact preview URL owned by PreviewCanvas's decoder for this overlay. */
+  getOverlayPreviewSrc?: (overlayId: string) => string | undefined;
 }) {
   // Mirror the set of ghost boxes to draw into state via a rAF loop (reading the
   // same store the compositor reads), so the ghosts follow the media as a gesture
@@ -122,20 +142,31 @@ export function GhostOverflowLayer({
   useEffect(() => {
     const tick = () => {
       const rect = getRect();
-      const { overlays, playhead } = useRepurposeStore.getState();
+      const { overlays } = useRepurposeStore.getState();
+      const frame = getFrameSnapshot();
       const next: GhostBox[] = [];
-      if (rect) {
+      if (rect && frame) {
         for (const ov of overlays) {
-          // Same window filter the compositor uses -- only overlays active at the
-          // current playhead can bleed.
-          if (playhead < ov.timelineStart || playhead >= ov.timelineEnd) continue;
           if (ov.naturalWidth <= 0 || ov.naturalHeight <= 0) continue;
+          const appearance = frame.appearances.get(ov.id);
+          if (!appearance) continue;
+          if (!appearance.interactive) continue;
+          const frameOverlay = {
+            ...ov,
+            transform: appearance.transform,
+          };
           // Only overlays that actually extend past the frame need a ghost.
-          if (!bleedsOffFrame(ov, rect)) continue;
-          const g = resolveGhost(ov, rect);
+          if (!bleedsOffFrame(frameOverlay, rect)) continue;
+          const g = resolveGhost(
+            frameOverlay,
+            rect,
+            appearance.cornerRadius,
+            appearance.opacityMultiplier,
+            getOverlayPreviewSrc?.(ov.id)
+          );
           // Video: the source frame to show at this output time.
           if (ov.kind === "video") {
-            g.srcTime = ov.srcStart + (playhead - ov.timelineStart);
+            g.srcTime = ov.srcStart + (frame.outputTime - ov.timelineStart);
           }
           next.push(g);
         }
@@ -156,7 +187,9 @@ export function GhostOverflowLayer({
             Math.abs(a.cy - b.cy) > 0.25 ||
             Math.abs(a.w - b.w) > 0.25 ||
             Math.abs(a.h - b.h) > 0.25 ||
-            Math.abs(a.rotation - b.rotation) > 0.05
+            Math.abs(a.rotation - b.rotation) > 0.05 ||
+            Math.abs(a.cornerRadiusPx - b.cornerRadiusPx) > 0.1 ||
+            Math.abs(a.opacity - b.opacity) > 0.001
           ) {
             changed = true;
             break;
@@ -185,7 +218,7 @@ export function GhostOverflowLayer({
     return () => {
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     };
-  }, [getRect]);
+  }, [getRect, getFrameSnapshot, getOverlayPreviewSrc]);
 
   if (boxes.length === 0) return null;
 
@@ -211,6 +244,9 @@ export function GhostOverflowLayer({
             // ghost sits exactly under the real render.
             transform: `translate(${g.cx - g.w / 2}px, ${g.cy - g.h / 2}px) rotate(${g.rotation}deg)`,
             transformOrigin: "center center",
+            borderRadius: g.cornerRadiusPx,
+            overflow: "hidden",
+            opacity: g.opacity,
           }}
         >
           {g.kind === "image" ? (

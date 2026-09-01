@@ -224,6 +224,7 @@ async function exportVideoWithWorker(
         totalFrames,
         addWatermark,
         estimatedBytes,
+        forceH264,
         resolvedCodec: resolvedCodec ?? undefined,
       },
       {
@@ -352,6 +353,7 @@ async function exportVideoMainThread(
     fps,
     forceH264
   );
+  abortSignal?.throwIfAborted();
   if (!resolvedCodec) {
     throw new Error("No supported video codec found.");
   }
@@ -367,24 +369,30 @@ async function exportVideoMainThread(
 
   const target = new BufferTarget();
   const format = new Mp4OutputFormat({ fastStart: "in-memory" });
-  const output = new Output({ format, target });
-
   const codecIsHevc =
     resolvedCodec.startsWith("hvc1") || resolvedCodec.startsWith("hev1");
   const videoSource = new EncodedVideoPacketSource(
     codecIsHevc ? "hevc" : "avc"
   );
-  output.addVideoTrack(videoSource, { frameRate: fps });
-  await output.start();
+  const output = new Output({ format, target });
+  let outputCancelled = false;
+  let outputFinalized = false;
+  let encoder: VideoEncoder | null = null;
+  let encoderClosed = false;
+  let sourceClosed = false;
 
-  let encoder = new VideoEncoder({
-    output: (chunk, meta) => {
-      videoSource.add(EncodedPacket.fromEncodedChunk(chunk), meta);
-    },
-    error: (err) => {
-      console.error("VideoEncoder error:", err);
-    },
-  });
+  try {
+    output.addVideoTrack(videoSource, { frameRate: fps });
+    await output.start();
+
+    encoder = new VideoEncoder({
+      output: (chunk, meta) => {
+        videoSource.add(EncodedPacket.fromEncodedChunk(chunk), meta);
+      },
+      error: (err) => {
+        console.error("VideoEncoder error:", err);
+      },
+    });
 
   // configure() can throw OperationError even when isConfigSupported() passed.
   // Hardware encoders on macOS (VideoToolbox) may reject configs due to:
@@ -463,33 +471,51 @@ async function exportVideoMainThread(
 
   for (let i = 0; i < totalFrames; i++) {
     if (abortSignal?.aborted) {
-      encoder.close();
       throw new DOMException("Export aborted", "AbortError");
     }
 
     const time = i / fps;
     let bitmap = await renderFrame(time);
+    if (abortSignal?.aborted) {
+      bitmap.close();
+      abortSignal.throwIfAborted();
+    }
 
     // Apply watermark for free tier exports
     if (addWatermark) {
-      const watermarked = await applyWatermarkToBitmap(bitmap);
-      bitmap.close();
-      bitmap = watermarked;
+      const sourceBitmap = bitmap;
+      try {
+        bitmap = await applyWatermarkToBitmap(sourceBitmap);
+      } finally {
+        sourceBitmap.close();
+      }
+      if (abortSignal?.aborted) {
+        bitmap.close();
+        abortSignal.throwIfAborted();
+      }
     }
 
     const frameTimestampUs = Math.round((i * 1_000_000) / fps);
     const nextTimestampUs = Math.round(((i + 1) * 1_000_000) / fps);
 
-    const videoFrame = new VideoFrame(bitmap, {
-      timestamp: frameTimestampUs,
-      duration: nextTimestampUs - frameTimestampUs,
-    });
+    let videoFrame: VideoFrame;
+    try {
+      videoFrame = new VideoFrame(bitmap, {
+        timestamp: frameTimestampUs,
+        duration: nextTimestampUs - frameTimestampUs,
+      });
+    } finally {
+      bitmap.close();
+    }
 
     const keyFrameInterval = Math.max(1, Math.round(fps));
-    encoder.encode(videoFrame, {
-      keyFrame: i % keyFrameInterval === 0,
-    });
-    videoFrame.close();
+    try {
+      encoder.encode(videoFrame, {
+        keyFrame: i % keyFrameInterval === 0,
+      });
+    } finally {
+      videoFrame.close();
+    }
 
     onProgress({
       status: "rendering",
@@ -513,9 +539,12 @@ async function exportVideoMainThread(
 
   await encoder.flush();
   encoder.close();
+  encoderClosed = true;
 
   videoSource.close();
+  sourceClosed = true;
   await output.finalize();
+  outputFinalized = true;
 
   const buffer = target.buffer!;
   const blob = new Blob([buffer], { type: "video/mp4" });
@@ -529,6 +558,30 @@ async function exportVideoMainThread(
   });
 
   return { blob, url };
+  } finally {
+    if (!outputFinalized && !outputCancelled) {
+      outputCancelled = true;
+      try {
+        await output.cancel();
+      } catch {
+        // Preserve the original export error while still attempting cleanup.
+      }
+    }
+    if (encoder && !encoderClosed) {
+      try {
+        encoder.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    if (!sourceClosed) {
+      try {
+        videoSource.close();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
 }
 
 // ── Export facade ─────────────────────────────────────────

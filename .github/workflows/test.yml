@@ -1,0 +1,40 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.19.x
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        # Keep CI on the exact uv release used to verify the committed lockfile.
+        run: python -m pip install uv==0.11.2
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+
+      - name: Verify libx265 encoder
+        run: ffmpeg -hide_banner -encoders 2>&1 | grep -q libx265
+
+      - run: npm ci
+      - run: uv sync --frozen --project scripts/sfx-engine
+      - run: npm run fixtures:media
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build

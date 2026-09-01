@@ -24,27 +24,24 @@
 //
 // FROZEN START SNAPSHOT: every gesture captures the overlay transform + pointer
 // position ONCE at pointer-down (GestureStart) and derives each frame from that
-// snapshot, so a gesture never compounds. updateOverlayTransform coalesces the
-// whole gesture into ONE undo step via its `ovxform:${id}` key.
+// snapshot, so a gesture never compounds. A store-issued token owns the whole
+// transaction and captures exactly one undo snapshot on its first effective write.
 //
-// SNAP + TOP-HALF CLAMP: a MOVE gesture runs its raw (un-snapped)
-// solveMove output through a MAGNETIC PULL then solveSnap (alignment guides)
-// unless Alt is held, THEN through clampOverlayToTopHalf. Ordering is exactly:
-//   solveMove -> (magnetic pull -> snap detent, unless Alt) -> clamp (ALWAYS).
-// The clamp is a HARD keep-out (overlay bottom can never cross the split seam),
-// so it runs even when Alt defeats the snap; only the magnetic snap is modifier-
-// defeatable. Resize gestures skip snapping (v1) but STILL clamp, so growing the
-// bottom past the seam is corrected. Because snap/clamp always operate on
-// solveMove's frozen-derived output (never last frame's snapped result), the
-// gesture never compounds and the "pull in / break free" stickiness stays
-// natural. The live guide lines are pushed to the store (activeSnapGuides) for
+// SNAP + PERSISTENCE: a MOVE gesture runs its raw visual-space solve through a
+// MAGNETIC PULL then solveSnap unless Alt is held. Only the resulting user delta
+// is mapped onto the frozen persisted transform; the frame resolver's temporary
+// seam translation is never written. Resize/rotate follow the same two-baseline
+// rule. Because snapping always operates on solveMove's frozen-derived output
+// (never last frame's snapped result), the gesture never compounds and the
+// "pull in / break free" stickiness stays natural. The live guide lines are
+// pushed to the store (activeSnapGuides) for
 // PreviewCanvas to draw as pointer-events:none DOM -- they NEVER bake into the
 // export, same discipline as the grid -- and are cleared to [] on
 // pointer-up / cancel.
 //
 // FEEL LAYER: the MOVE gesture does NOT write the solved position
-// straight to the store. Each pointermove computes the exact TARGET (solveMove
-// -> magnetic pull -> snap detent -> clamp) and parks it in moveTargetRef; a tiny
+// straight to the store. Each pointermove computes the exact persisted TARGET
+// from its visual-space delta and parks it in moveTargetRef; a tiny
 // rAF FOLLOWER critically-eases the store's transform toward that target
 // (~0.55/frame, position only) so a fast flick reads as a smooth glide instead
 // of a hard teleport, while the target stays exact. On pointer-up the follower is
@@ -56,12 +53,15 @@
 // pointer each frame so nothing glues. Resize / rotate bypass the follower and
 // write raw (crisp). A transient `overlayDragging` store flag drives the chrome
 // LIFT + grab cursor. The whole gesture is still ONE undo step
-// (updateOverlayTransform coalesces via `ovxform:${id}`): every eased frame + the
-// final flush merge into it.
+// (the store token accepts every eased frame + the final flush under one owner).
 // ===========================================================================
 
 import { useCallback, useEffect, useRef } from "react";
 import { useRepurposeStore } from "@/lib/repurpose/store";
+import {
+  solvePersistedOverlayTransformForVisual,
+  type OverlayFrameSnapshot,
+} from "@/lib/repurpose/overlay-effects";
 import {
   normFromClient,
   hitTestOverlay,
@@ -69,10 +69,11 @@ import {
   solveCornerResize,
   solveEdgeResize,
   solveRotate,
+  overlayCornersNorm,
   buildSnapTargets,
   applyMagneticPull,
   solveSnap,
-  clampOverlayToTopHalf,
+  resolveEffectivePrimaryOverlay,
   type GestureStart,
   type HandleId,
   type PreviewRect,
@@ -102,8 +103,13 @@ export type PointerRoute =
 
 /** The active drag, if any. `move` and the 8 handle ids share one machine. */
 interface ActiveGesture {
+  token: string;
   overlayId: string;
   handle: HandleId | "move";
+  overlay: Overlay;
+  outputTime: number;
+  splitRatio: number;
+  persistedTransform: OverlayTransform;
   start: GestureStart;
   pointerId: number;
 }
@@ -111,6 +117,8 @@ interface ActiveGesture {
 export interface UseObjectSelectionArgs {
   /** Reads the preview canvas's current on-screen rect (CSS px). Null if unmounted. */
   getRect: () => PreviewRect | null;
+  /** Reads the exact overlay sample used by the latest compositor frame. */
+  getFrameSnapshot: () => OverlayFrameSnapshot | null;
 }
 
 export interface UseObjectSelection {
@@ -128,14 +136,35 @@ export interface UseObjectSelection {
    * snapshot and drives the matching solver until pointer-up.
    */
   beginHandleGesture: (handle: HandleId, e: React.PointerEvent) => void;
+  /** Apply one arrow-key step to a focused resize or rotation handle. */
+  adjustHandleByKeyboard: (
+    handle: HandleId,
+    key: string,
+    shift: boolean
+  ) => void;
 }
 
 export function useObjectSelection(
   args: UseObjectSelectionArgs
 ): UseObjectSelection {
-  const { getRect } = args;
+  const { getRect, getFrameSnapshot } = args;
   const selectOverlay = useRepurposeStore((s) => s.selectOverlay);
   const updateOverlayTransform = useRepurposeStore((s) => s.updateOverlayTransform);
+  const beginOverlayTransformGesture = useRepurposeStore(
+    (s) => s.beginOverlayTransformGesture
+  );
+  const updateOverlayTransformGesture = useRepurposeStore(
+    (s) => s.updateOverlayTransformGesture
+  );
+  const endOverlayTransformGesture = useRepurposeStore(
+    (s) => s.endOverlayTransformGesture
+  );
+  const cancelOverlayTransformGesture = useRepurposeStore(
+    (s) => s.cancelOverlayTransformGesture
+  );
+  const subscribeOverlayTransformGestureCancellation = useRepurposeStore(
+    (s) => s.subscribeOverlayTransformGestureCancellation
+  );
   const setActiveSnapGuides = useRepurposeStore((s) => s.setActiveSnapGuides);
   const setOverlayDragging = useRepurposeStore((s) => s.setOverlayDragging);
   const duplicateOverlay = useRepurposeStore((s) => s.duplicateOverlay);
@@ -148,11 +177,11 @@ export function useObjectSelection(
   const cleanupRef = useRef<(() => void) | null>(null);
 
   // --- MOVE smoothing follower ----------------------------------------------
-  // moveTargetRef: the exact solved TARGET (post snap + clamp) the latest
+  // moveTargetRef: the exact persisted TARGET the latest
   // pointermove computed. moveRenderRef: the eased position currently written to
   // the store. followRafRef: the follower's rAF handle (null when idle). The
   // follower critically-lerps render -> target each frame and commits render via
-  // updateOverlayTransform (one coalesced undo step). Refs, not state -- the
+  // the active store transaction (one undo step). Refs, not state -- the
   // follower must run off the store without re-rendering this hook.
   const moveTargetRef = useRef<OverlayTransform | null>(null);
   const moveRenderRef = useRef<{ x: number; y: number } | null>(null);
@@ -171,7 +200,7 @@ export function useObjectSelection(
   // target, write it to the store (coalesced), and keep going until it has
   // arrived (within FOLLOW_ARRIVE_EPS on both axes) -- then idle, leaving the
   // media parked exactly on target. Scale/rotation ride the target verbatim (a
-  // move never changes them, but if a snap/clamp did we pass them through).
+  // move never changes them, but the visual-to-persisted mapping passes them through).
   const followTick = useCallback(() => {
     const g = gestureRef.current;
     const target = moveTargetRef.current;
@@ -189,11 +218,11 @@ export function useObjectSelection(
     const x = arrived ? target.x : nx;
     const y = arrived ? target.y : ny;
     moveRenderRef.current = { x, y };
-    updateOverlayTransform(g.overlayId, { ...target, x, y });
+    updateOverlayTransformGesture(g.token, { ...target, x, y });
     // Keep ticking while still catching up; idle once arrived (a new pointermove
     // moves the target and restarts the loop). No inertia -- we never overshoot.
     followRafRef.current = arrived ? null : requestAnimationFrame(followTick);
-  }, [updateOverlayTransform]);
+  }, [updateOverlayTransformGesture]);
 
   // Ensure the follower loop is running (no-op if already scheduled).
   const ensureFollower = useCallback(() => {
@@ -202,24 +231,36 @@ export function useObjectSelection(
     }
   }, [followTick]);
 
-  // Tear down any in-flight gesture + listeners + follower on unmount, and drop
-  // any stale snap guides / drag flag (read via getState so no changing deps).
+  const clearLocalGesture = useCallback(() => {
+    cleanupRef.current?.();
+    cleanupRef.current = null;
+    gestureRef.current = null;
+    stopFollower();
+    moveTargetRef.current = null;
+    moveRenderRef.current = null;
+    const st = useRepurposeStore.getState();
+    st.setActiveSnapGuides([]);
+    st.setOverlayDragging(false);
+  }, [stopFollower]);
+
+  // Store ownership is authoritative. Undo/Redo, project replacement, another
+  // gesture, or an intervening edit synchronously invalidates local listeners and
+  // the smoothing follower before any queued callback can write again.
   useEffect(() => {
+    const unsubscribe = subscribeOverlayTransformGestureCancellation(
+      clearLocalGesture
+    );
     return () => {
-      cleanupRef.current?.();
-      cleanupRef.current = null;
-      gestureRef.current = null;
-      if (followRafRef.current !== null) {
-        cancelAnimationFrame(followRafRef.current);
-        followRafRef.current = null;
-      }
-      moveTargetRef.current = null;
-      moveRenderRef.current = null;
-      const st = useRepurposeStore.getState();
-      st.setActiveSnapGuides([]);
-      st.setOverlayDragging(false);
+      const token = gestureRef.current?.token;
+      if (token) cancelOverlayTransformGesture(token);
+      clearLocalGesture();
+      unsubscribe();
     };
-  }, []);
+  }, [
+    cancelOverlayTransformGesture,
+    clearLocalGesture,
+    subscribeOverlayTransformGestureCancellation,
+  ]);
 
   const runGesture = useCallback(
     (clientX: number, clientY: number, shift: boolean, alt: boolean) => {
@@ -228,9 +269,7 @@ export function useObjectSelection(
       if (!g || !rect) return;
       const pointerNorm: Point = normFromClient({ x: clientX, y: clientY }, rect);
 
-      // splitRatio is read fresh (it's the hard top-half boundary + a snap
-      // target) so a live split-handle drag can't leave this using a stale seam.
-      const splitRatio = useRepurposeStore.getState().splitRatio;
+      const splitRatio = g.splitRatio;
 
       let next;
       switch (g.handle) {
@@ -244,18 +283,23 @@ export function useObjectSelection(
           let snapped = raw;
           if (!alt) {
             const { overlays } = useRepurposeStore.getState();
+            const frame = getFrameSnapshot();
             const targets = buildSnapTargets({
               splitRatio,
               thirds: true,
               // Every OTHER overlay (exclude the dragged one) contributes its
               // AABB edges/center as alignment targets.
-              others: overlays
-                .filter((o) => o.id !== g.overlayId)
-                .map((o) => ({
-                  transform: o.transform,
-                  naturalWidth: o.naturalWidth,
-                  naturalHeight: o.naturalHeight,
-                })),
+              others: overlays.flatMap((o) => {
+                if (o.id === g.overlayId) return [];
+                const appearance = frame?.appearances.get(o.id);
+                return appearance?.interactive
+                  ? [{
+                      transform: appearance.transform,
+                      naturalWidth: o.naturalWidth,
+                      naturalHeight: o.naturalHeight,
+                    }]
+                  : [];
+              }),
               rect,
               // EQUAL-GAP snap: pass the dragged box's intrinsics so the target
               // builder can add "matches an existing neighbor gap" candidate lines
@@ -295,14 +339,14 @@ export function useObjectSelection(
             // Alt held: no magnetic snap this frame, so no guides to draw.
             setActiveSnapGuides([]);
           }
-          // 3) HARD top-half keep-out -- ALWAYS, even when Alt disabled the snap.
-          //    Order is solveMove -> (pull -> snap unless Alt) -> clamp (always).
-          const moveTarget = clampOverlayToTopHalf(
+          // Persist only the user's visual-space delta. The frame resolver owns
+          // seam correction, so its transient Y translation never enters history.
+          const moveTarget = solvePersistedOverlayTransformForVisual(
+            g.overlay,
             snapped,
-            g.start.naturalWidth,
-            g.start.naturalHeight,
+            g.outputTime,
             rect,
-            splitRatio
+            g.splitRatio
           );
           // 4) FEEL: don't write moveTarget straight -- park it and let the rAF
           //    follower ease the store toward it (glide, not teleport). Seed the
@@ -311,7 +355,10 @@ export function useObjectSelection(
           //    exactly to moveTarget so placement is precise.
           moveTargetRef.current = moveTarget;
           if (moveRenderRef.current === null) {
-            moveRenderRef.current = { x: g.start.transform.x, y: g.start.transform.y };
+            moveRenderRef.current = {
+              x: g.persistedTransform.x,
+              y: g.persistedTransform.y,
+            };
           }
           ensureFollower();
           return; // the follower owns the store write for moves
@@ -320,28 +367,14 @@ export function useObjectSelection(
         case "ne":
         case "se":
         case "sw":
-          // Resize skips snapping in v1 but still clamps below.
+          // Resize skips snapping in v1.
           next = solveCornerResize(g.start, g.handle, pointerNorm, rect, shift);
-          next = clampOverlayToTopHalf(
-            next,
-            g.start.naturalWidth,
-            g.start.naturalHeight,
-            rect,
-            splitRatio
-          );
           break;
         case "n":
         case "e":
         case "s":
         case "w":
           next = solveEdgeResize(g.start, g.handle, pointerNorm, rect, shift);
-          next = clampOverlayToTopHalf(
-            next,
-            g.start.naturalWidth,
-            g.start.naturalHeight,
-            rect,
-            splitRatio
-          );
           break;
         case "rotate":
           next = solveRotate(g.start, pointerNorm, rect, shift);
@@ -349,12 +382,27 @@ export function useObjectSelection(
         default:
           return;
       }
-      // updateOverlayTransform coalesces the whole gesture (ovxform:${id}) into
-      // one undo step; passing the full transform is fine (patch merges it).
+      // The store token owns the whole gesture as one undo step; passing the full
+      // transform is fine (the transaction merges it onto the current transform).
       // (MOVE returned early above -- its store write is the follower's job.)
-      updateOverlayTransform(g.overlayId, next);
+      updateOverlayTransformGesture(
+        g.token,
+        solvePersistedOverlayTransformForVisual(
+          g.overlay,
+          next,
+          g.outputTime,
+          rect,
+          g.splitRatio
+        )
+      );
     },
-    [getRect, updateOverlayTransform, setActiveSnapGuides, ensureFollower]
+    [
+      getRect,
+      getFrameSnapshot,
+      updateOverlayTransformGesture,
+      setActiveSnapGuides,
+      ensureFollower,
+    ]
   );
 
   // Wire the window-level move/up listeners for an in-flight gesture. Shared by
@@ -364,7 +412,7 @@ export function useObjectSelection(
       const onMove = (ev: PointerEvent) => {
         if (ev.pointerId !== pointerId) return;
         // Alt (ev.altKey) DISABLES the magnetic snap for this move (Manthan's
-        // chosen modifier); the top-half clamp still applies. Shift = axis-lock.
+        // chosen modifier). Shift = axis-lock.
         runGesture(ev.clientX, ev.clientY, ev.shiftKey, ev.altKey);
       };
       const onUp = (ev: PointerEvent) => {
@@ -376,18 +424,10 @@ export function useObjectSelection(
         const g = gestureRef.current;
         const target = moveTargetRef.current;
         if (g && g.handle === "move" && target) {
-          updateOverlayTransform(g.overlayId, target);
+          updateOverlayTransformGesture(g.token, target);
         }
-        stopFollower();
-        moveTargetRef.current = null;
-        moveRenderRef.current = null;
-        // Gesture over: drop the ephemeral snap guides so no stale line lingers,
-        // and clear the live-drag flag (identity-guarded, a no-op for a resize).
-        setActiveSnapGuides([]);
-        setOverlayDragging(false);
-        cleanupRef.current?.();
-        cleanupRef.current = null;
-        gestureRef.current = null;
+        if (g) endOverlayTransformGesture(g.token);
+        clearLocalGesture();
       };
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onUp);
@@ -398,15 +438,23 @@ export function useObjectSelection(
         window.removeEventListener("pointercancel", onUp);
       };
     },
-    [runGesture, setActiveSnapGuides, setOverlayDragging, stopFollower, updateOverlayTransform]
+    [
+      clearLocalGesture,
+      endOverlayTransformGesture,
+      runGesture,
+      updateOverlayTransformGesture,
+    ]
   );
 
   const routePointerDown = useCallback(
     (e: React.PointerEvent): PointerRoute => {
       const rect = getRect();
       if (!rect) return { kind: "empty" };
-      const { overlays, playhead, splitRatio, selectedOverlayId } =
+      const { overlays, selectedOverlayId, selectedOverlayIds } =
         useRepurposeStore.getState();
+      const frame = getFrameSnapshot();
+      if (!frame) return { kind: "empty" };
+      const { outputTime, splitRatio, appearances } = frame;
       const norm = normFromClient({ x: e.clientX, y: e.clientY }, rect);
 
       // 1) Topmost ACTIVE overlay under the pointer.
@@ -414,27 +462,44 @@ export function useObjectSelection(
       // (so a click on its own body never falls through to a lower overlay),
       // then fall back to the topmost active overlay generally.
       const active = overlays
-        .filter((o) => playhead >= o.timelineStart && playhead < o.timelineEnd)
-        .sort((a, b) => b.zIndex - a.zIndex); // z DESC -- topmost first
+        .flatMap((overlay) => {
+          const appearance = appearances.get(overlay.id);
+          if (!appearance) return [];
+          return appearance.interactive ? [{ overlay, appearance }] : [];
+        })
+        .sort((a, b) => b.overlay.zIndex - a.overlay.zIndex); // z DESC -- topmost first
       let hit: Overlay | null = null;
-      const sel = active.find((o) => o.id === selectedOverlayId) ?? null;
+      let hitTransform: OverlayTransform | null = null;
+      const primary = resolveEffectivePrimaryOverlay(
+        active.map(({ overlay }) => overlay),
+        selectedOverlayIds,
+        selectedOverlayId,
+        splitRatio
+      );
+      const selectedEntry = active.find(({ overlay }) => overlay.id === primary?.id);
+      const sel = selectedEntry?.overlay ?? null;
+      const selectedTransform = selectedEntry?.appearance.transform ?? null;
       if (
         sel &&
-        hitTestOverlay(norm, sel.transform, sel.naturalWidth, sel.naturalHeight, rect, HIT_PAD_PX)
+        selectedTransform &&
+        hitTestOverlay(norm, selectedTransform, sel.naturalWidth, sel.naturalHeight, rect, HIT_PAD_PX)
       ) {
         hit = sel;
+        hitTransform = selectedTransform;
       } else {
-        for (const o of active) {
+        for (const { overlay: o, appearance } of active) {
+          const transform = appearance.transform;
           if (
-            hitTestOverlay(norm, o.transform, o.naturalWidth, o.naturalHeight, rect, HIT_PAD_PX)
+            hitTestOverlay(norm, transform, o.naturalWidth, o.naturalHeight, rect, HIT_PAD_PX)
           ) {
             hit = o;
+            hitTransform = transform;
             break;
           }
         }
       }
 
-      if (hit) {
+      if (hit && hitTransform) {
         // SHIFT-CLICK = pure multi-select TOGGLE: add/remove this overlay from the
         // selection and DO NOT begin a move drag (a shift-click is a selection
         // gesture, not a drag). A move on a multi-selection is a v2 follow-up.
@@ -449,10 +514,10 @@ export function useObjectSelection(
         // is already Manthan's "disable snap" modifier for a move (see runGesture),
         // so overloading Alt for clone would collide. Cmd/Ctrl is unbound in the
         // pointer path, matches Figma/Sketch's modifier-drag-to-duplicate, and the
-        // clone is a real overlay so snap/clamp/the follower all work unchanged.
+        // clone is a real overlay so snap and the follower work unchanged.
         let dragOverlay: Overlay = hit;
         if (e.metaKey || e.ctrlKey) {
-          const copyId = duplicateOverlay(hit.id); // commits history + selects copy
+          const copyId = duplicateOverlay(hit.id, rect, splitRatio);
           if (copyId) {
             const copy =
               useRepurposeStore.getState().overlays.find((o) => o.id === copyId) ?? null;
@@ -470,11 +535,18 @@ export function useObjectSelection(
         // transform from the ORIGINAL hit (hit.transform), so the copy sits under
         // the pointer at grab time and the drag delta carries it off cleanly --
         // instead of jumping to the store's cosmetic +0.04 offset.
+        const token = beginOverlayTransformGesture(dragOverlay.id);
+        if (!token) return { kind: "overlay", id: dragOverlay.id };
         gestureRef.current = {
+          token,
           overlayId: dragOverlay.id,
           handle: "move",
+          overlay: { ...dragOverlay, transform: { ...dragOverlay.transform } },
+          outputTime,
+          splitRatio,
+          persistedTransform: { ...dragOverlay.transform },
           start: {
-            transform: { ...hit.transform },
+            transform: { ...hitTransform },
             naturalWidth: hit.naturalWidth,
             naturalHeight: hit.naturalHeight,
             pointerNorm: norm,
@@ -489,16 +561,25 @@ export function useObjectSelection(
       }
 
       // 2) Missed every overlay -> which base region did we land in?
-      const region: "screen" | "face" = norm.y < splitRatio ? "screen" : "face";
+      const region: "screen" | "face" =
+        splitRatio <= 0
+          ? "face"
+          : splitRatio >= 1
+            ? "screen"
+            : norm.y < splitRatio
+              ? "screen"
+              : "face";
       // We do NOT begin a gesture here -- the caller reuses its own region
       // reframe path (makeRegionPointerDown). Report the region + let it decide.
       return { kind: "base", region };
     },
     [
       getRect,
+      getFrameSnapshot,
       selectOverlay,
       toggleOverlaySelected,
       duplicateOverlay,
+      beginOverlayTransformGesture,
       attachGestureListeners,
       setOverlayDragging,
     ]
@@ -508,15 +589,39 @@ export function useObjectSelection(
     (handle: HandleId, e: React.PointerEvent) => {
       const rect = getRect();
       if (!rect) return;
-      const { overlays, selectedOverlayId } = useRepurposeStore.getState();
-      const ov = overlays.find((o) => o.id === selectedOverlayId);
+      const { overlays, selectedOverlayId, selectedOverlayIds } =
+        useRepurposeStore.getState();
+      const frame = getFrameSnapshot();
+      if (!frame) return;
+      const { outputTime, splitRatio, appearances } = frame;
+      const interactive = overlays.filter((overlay) =>
+        appearances.get(overlay.id)?.interactive
+      );
+      const ov = resolveEffectivePrimaryOverlay(
+        interactive,
+        selectedOverlayIds,
+        selectedOverlayId,
+        splitRatio
+      );
       if (!ov) return;
+      const appearance = appearances.get(ov.id);
+      if (!appearance) return;
+      if (!appearance.interactive) return;
       const norm = normFromClient({ x: e.clientX, y: e.clientY }, rect);
+      const token = beginOverlayTransformGesture(ov.id);
+      if (!token) return;
       gestureRef.current = {
+        token,
         overlayId: ov.id,
         handle,
+        overlay: { ...ov, transform: { ...ov.transform } },
+        outputTime,
+        splitRatio,
+        persistedTransform: { ...ov.transform },
         start: {
-          transform: { ...ov.transform },
+          transform: {
+            ...appearance.transform,
+          },
           naturalWidth: ov.naturalWidth,
           naturalHeight: ov.naturalHeight,
           pointerNorm: norm,
@@ -527,8 +632,102 @@ export function useObjectSelection(
       setOverlayDragging(true);
       attachGestureListeners(e.pointerId);
     },
-    [getRect, attachGestureListeners, setOverlayDragging]
+    [
+      getRect,
+      getFrameSnapshot,
+      beginOverlayTransformGesture,
+      attachGestureListeners,
+      setOverlayDragging,
+    ]
   );
 
-  return { routePointerDown, beginHandleGesture };
+  const adjustHandleByKeyboard = useCallback(
+    (handle: HandleId, key: string, shift: boolean) => {
+      if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(key)) {
+        return;
+      }
+      const rect = getRect();
+      const frame = getFrameSnapshot();
+      if (!rect || !frame) return;
+      const { overlays, selectedOverlayId, selectedOverlayIds } =
+        useRepurposeStore.getState();
+      const interactive = overlays.filter((overlay) =>
+        frame.appearances.get(overlay.id)?.interactive
+      );
+      const overlay = resolveEffectivePrimaryOverlay(
+        interactive,
+        selectedOverlayIds,
+        selectedOverlayId,
+        frame.splitRatio
+      );
+      if (!overlay) return;
+      const appearance = frame.appearances.get(overlay.id);
+      if (!appearance?.interactive) return;
+
+      let visual: OverlayTransform;
+      if (handle === "rotate") {
+        const direction = key === "ArrowRight" || key === "ArrowUp" ? 1 : -1;
+        const rotation = appearance.transform.rotation + direction * (shift ? 15 : 1);
+        visual = {
+          ...appearance.transform,
+          rotation: ((rotation % 360) + 540) % 360 - 180,
+        };
+      } else {
+        const [nw, ne, se, sw] = overlayCornersNorm(
+          appearance.transform,
+          overlay.naturalWidth,
+          overlay.naturalHeight,
+          rect
+        );
+        const points = {
+          nw,
+          n: { x: (nw.x + ne.x) / 2, y: (nw.y + ne.y) / 2 },
+          ne,
+          e: { x: (ne.x + se.x) / 2, y: (ne.y + se.y) / 2 },
+          se,
+          s: { x: (se.x + sw.x) / 2, y: (se.y + sw.y) / 2 },
+          sw,
+          w: { x: (sw.x + nw.x) / 2, y: (sw.y + nw.y) / 2 },
+        };
+        const pointerNorm = points[handle];
+        const stepPx = shift ? 10 : 1;
+        const nextPointer = {
+          x:
+            pointerNorm.x +
+            (key === "ArrowRight" ? stepPx / rect.width : key === "ArrowLeft" ? -stepPx / rect.width : 0),
+          y:
+            pointerNorm.y +
+            (key === "ArrowDown" ? stepPx / rect.height : key === "ArrowUp" ? -stepPx / rect.height : 0),
+        };
+        const start = {
+          transform: appearance.transform,
+          naturalWidth: overlay.naturalWidth,
+          naturalHeight: overlay.naturalHeight,
+          pointerNorm,
+        };
+        visual =
+          handle === "nw" || handle === "ne" || handle === "se" || handle === "sw"
+            ? solveCornerResize(start, handle, nextPointer, rect, false)
+            : solveEdgeResize(start, handle, nextPointer, rect, false);
+      }
+
+      const persisted = solvePersistedOverlayTransformForVisual(
+        overlay,
+        visual,
+        frame.outputTime,
+        rect,
+        frame.splitRatio
+      );
+      if (
+        persisted.x === overlay.transform.x &&
+        persisted.y === overlay.transform.y &&
+        persisted.scale === overlay.transform.scale &&
+        persisted.rotation === overlay.transform.rotation
+      ) return;
+      updateOverlayTransform(overlay.id, persisted);
+    },
+    [getFrameSnapshot, getRect, updateOverlayTransform]
+  );
+
+  return { routePointerDown, beginHandleGesture, adjustHandleByKeyboard };
 }

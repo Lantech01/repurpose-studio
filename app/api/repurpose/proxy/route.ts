@@ -17,7 +17,7 @@
 
 import { stat } from "node:fs/promises";
 
-import { resolveAllowed } from "@/app/api/repurpose/video/route";
+import { resolveAllowedVideoPath } from "@/lib/repurpose/media-paths.server";
 import { getProxyState, startProxyBuild, type ProxyState } from "@/lib/repurpose/proxy-cache";
 
 export const runtime = "nodejs";
@@ -26,14 +26,17 @@ export const dynamic = "force-dynamic";
 /** Wire shape: status always, outTimeSec while building. Never proxyPath. */
 type ProxyStateJson = {
   status: ProxyState["status"];
-  outTimeSec?: number;
+  progress?: number;
+  error?: ProxyState["error"];
 };
 
 /** Strip server-private fields (proxyPath) before anything leaves the process. */
 function toJson(state: ProxyState): ProxyStateJson {
-  return state.outTimeSec !== undefined
-    ? { status: state.status, outTimeSec: state.outTimeSec }
-    : { status: state.status };
+  return {
+    status: state.status,
+    ...(state.progress !== undefined ? { progress: state.progress } : {}),
+    ...(state.error ? { error: state.error } : {}),
+  };
 }
 
 /**
@@ -45,7 +48,7 @@ async function resolveSource(
   rawPath: string | null
 ): Promise<{ resolvedPath: string; mtimeMs: number; size: number } | null> {
   if (!rawPath) return null;
-  const resolvedPath = await resolveAllowed(rawPath);
+  const resolvedPath = await resolveAllowedVideoPath(rawPath);
   if (!resolvedPath) return null;
   try {
     const info = await stat(resolvedPath);

@@ -11,22 +11,44 @@ import {
   ArrowsOutLineHorizontal,
   FrameCorners,
   Magnet,
-  Waveform,
   MusicNotes,
   MusicNote,
   X,
 } from "@phosphor-icons/react";
 import { useRepurposeStore } from "@/lib/repurpose/store";
-import { sourceToTimelineTime, timelineToSourceTime } from "@/lib/repurpose/time-map";
-import type { Clip, Overlay } from "@/lib/repurpose/types";
-import { ingestOverlayFiles } from "@/lib/repurpose/overlay-ingest";
+import { DEFAULT_HEIGHT } from "@/lib/repurpose/compositor";
+import {
+  sourceToTimelineTime,
+  splitRatioAt,
+  timelineToSourceTime,
+} from "@/lib/repurpose/time-map";
+import { resolveEffectivePrimaryOverlay } from "@/lib/repurpose/overlay-geometry";
+import { effectiveSplitRatio } from "@/lib/repurpose/split-ratio";
+import type { Clip, Overlay, SfxAsset, SfxClip } from "@/lib/repurpose/types";
+import { sfxClipTimelineEnd, sfxSourceDuration } from "@/lib/repurpose/sfx-clips";
+import { resolveSfxSource } from "@/lib/repurpose/sfx-source";
+import { isApprovedSfxKey, SFX_CATALOG } from "@/lib/repurpose/sfx-effects";
+import { SFX_DRAG_MIME, type SfxDragPayload } from "@/lib/repurpose/sfx-drag";
+import { importSfxFile, isAudioLikeFile, type SfxImportOwner } from "@/lib/repurpose/sfx-ingest-client";
+import {
+  ingestOverlayFiles,
+  type OverlayImportOwner,
+} from "@/lib/repurpose/overlay-ingest";
 import { ClipBlock } from "./ClipBlock";
 import { OverlayBlock, useOverlayThumbnails } from "./OverlayBlock";
+import { SfxClipBlock } from "./SfxClipBlock";
+import type {
+  TimelinePointerLifecycle,
+  TimelinePointerOwnership,
+  TimelinePointerStart,
+} from "./timeline-pointer";
+import { useSfxWaveform } from "./useSfxWaveform";
 import { TransportBar } from "./TransportBar";
 import {
   useFaceWaveform,
   useAudioWaveform,
   sliceClipPeaks,
+  waveformRenderMetrics,
   type FaceWaveform,
 } from "./useFaceWaveform";
 import {
@@ -38,6 +60,8 @@ import {
   TRACK_GAP,
   OVERLAY_LANE_HEIGHT,
   OVERLAY_LANE_GAP,
+  SFX_LANE_HEIGHT,
+  SFX_LANE_GAP,
   RULER_HEIGHT,
   SNAP_PX,
   formatTimecode,
@@ -47,11 +71,15 @@ import {
   pxToTime,
   clamp,
   snapTime,
+  snapMovedSpan,
 } from "./timeline-utils";
+import { focusSfxTimelineTarget } from "./sfx-focus";
 
 export interface TimelineProps {
   /** Optional height override for the whole widget; defaults to fitting 3 tracks + ruler. */
   className?: string;
+  overlayImportOwner?: OverlayImportOwner;
+  sfxImportOwner?: SfxImportOwner;
 }
 
 /**
@@ -65,8 +93,12 @@ export interface TimelineProps {
  */
 type ReorderSibling = { id: string; center: number };
 
-type DragKind =
+type DragKind = {
+  pointerId: number;
+  captureTarget: HTMLElement;
+} & (
   | { type: "playhead" }
+  | { type: "word-range"; lifecycle: TimelinePointerLifecycle; initialPlayhead: number }
   | {
       type: "clip-body";
       clip: Clip;
@@ -89,7 +121,33 @@ type DragKind =
       startClientX: number;
       startTimelineStart: number;
       startTimelineEnd: number;
-    };
+    }
+  | {
+      type: "sfx";
+      clip: SfxClip;
+      edge: "body" | "start" | "end";
+      startClientX: number;
+      token: string | null;
+    }
+);
+
+function captureTimelinePointer(pointer: TimelinePointerStart): void {
+  try {
+    pointer.captureTarget.setPointerCapture(pointer.pointerId);
+  } catch {
+    // Pointer capture is optional in test DOMs and may fail for a detached target.
+  }
+}
+
+function releaseTimelinePointerCapture(drag: DragKind): void {
+  try {
+    if (drag.captureTarget.hasPointerCapture(drag.pointerId)) {
+      drag.captureTarget.releasePointerCapture(drag.pointerId);
+    }
+  } catch {
+    // The element may already be detached or capture may have been released by the browser.
+  }
+}
 
 // The Screen + Face recordings are FRAME-LOCKED -- one timeline drives both, so
 // every scene is always the same source range on both tracks. Rendering two
@@ -125,7 +183,11 @@ const TRACK_LABELS: { key: "clip"; label: string; icon: typeof MonitorPlay }[] =
  * trimClip takes an ABSOLUTE source target so a live drag recomputing from a
  * frozen anchor can never compound.
  */
-export function Timeline({ className }: TimelineProps) {
+export function Timeline({
+  className,
+  overlayImportOwner,
+  sfxImportOwner,
+}: TimelineProps) {
   const clips = useRepurposeStore((s) => s.clips);
   const playhead = useRepurposeStore((s) => s.playhead);
   const duration = useRepurposeStore((s) => s.duration);
@@ -141,10 +203,17 @@ export function Timeline({ className }: TimelineProps) {
   // words inside its own [srcStart, srcEnd) to draw per-word divider ticks.
   const words = useRepurposeStore((s) => s.words);
 
-  // Generated sound-effects track (a single full-length green block on the Audio
-  // row below the clips), or null when none has been generated yet.
-  const sfxTrack = useRepurposeStore((s) => s.sfxTrack);
-  const clearSfxTrack = useRepurposeStore((s) => s.clearSfxTrack);
+  const sfxClips = useRepurposeStore((s) => s.sfxClips);
+  const sfxAssets = useRepurposeStore((s) => s.sfxAssets);
+  const selectedSfxClipId = useRepurposeStore((s) => s.selectedSfxClipId);
+  const projectEpoch = useRepurposeStore((s) => s.projectEpoch);
+  const selectSfxClip = useRepurposeStore((s) => s.selectSfxClip);
+  const removeSfxClip = useRepurposeStore((s) => s.removeSfxClip);
+  const duplicateSfxClip = useRepurposeStore((s) => s.duplicateSfxClip);
+  const beginSfxGesture = useRepurposeStore((s) => s.beginSfxGesture);
+  const updateSfxGesture = useRepurposeStore((s) => s.updateSfxGesture);
+  const endSfxGesture = useRepurposeStore((s) => s.endSfxGesture);
+  const cancelSfxGesture = useRepurposeStore((s) => s.cancelSfxGesture);
 
   // Background music bed (a single indigo block on its own row between the clips
   // and the SFX row), or null when none has been loaded yet. Plays UNDER the
@@ -161,7 +230,6 @@ export function Timeline({ className }: TimelineProps) {
   // waveform (Descript-style) instead of a flat colored slab. Same shared decode
   // cache as the face clips; null while decoding -> the block renders plain.
   const musicWaveform = useAudioWaveform(musicTrack?.src ?? null);
-  const sfxWaveform = useAudioWaveform(sfxTrack?.src ?? null);
 
   const deleteClip = useRepurposeStore((s) => s.deleteClip);
   const restoreClip = useRepurposeStore((s) => s.restoreClip);
@@ -238,14 +306,19 @@ export function Timeline({ className }: TimelineProps) {
   // Seek the playhead to the FIRST word in the range so the preview parks at the
   // start of the selection, mirroring onWordCellClick's single-word seek.
   const onWordRangeSelect = useCallback(
-    (fromRawIndex: number, toRawIndex: number) => {
-      const lo = Math.min(fromRawIndex, toRawIndex);
+    (fromRawIndex: number | null, toRawIndex?: number) => {
+      if (fromRawIndex === null) {
+        selectWords(null);
+        return;
+      }
+      const resolvedTo = toRawIndex ?? fromRawIndex;
+      const lo = Math.min(fromRawIndex, resolvedTo);
       const first = words[lo];
       if (first) {
         const outT = sourceToTimelineTime(clips, first.start);
         if (outT != null) setPlayhead(outT);
       }
-      selectWords(fromRawIndex, toRawIndex);
+      selectWords(fromRawIndex, resolvedTo);
     },
     [words, clips, setPlayhead, selectWords]
   );
@@ -256,7 +329,6 @@ export function Timeline({ className }: TimelineProps) {
   const moveOverlay = useRepurposeStore((s) => s.moveOverlay);
   const trimOverlay = useRepurposeStore((s) => s.trimOverlay);
   const removeOverlay = useRepurposeStore((s) => s.removeOverlay);
-  const duplicateOverlay = useRepurposeStore((s) => s.duplicateOverlay);
   const selectOverlay = useRepurposeStore((s) => s.selectOverlay);
 
   // UI-owned poster-frame cache (keyed by overlay id, re-derived on reload).
@@ -264,6 +336,7 @@ export function Timeline({ className }: TimelineProps) {
 
   const [pixelsPerSecond, setPixelsPerSecond] = useState(DEFAULT_PPS);
   const [snapGuideX, setSnapGuideX] = useState<number | null>(null);
+  const [sfxDropError, setSfxDropError] = useState<string | null>(null);
   // Content-space x of the coral drop indicator while dragging a media file over
   // the tracks (null = no drag in progress). Shows exactly where a dropped
   // image/video overlay would start.
@@ -299,13 +372,16 @@ export function Timeline({ className }: TimelineProps) {
     for (const o of overlays) {
       targets.push(o.timelineStart, o.timelineEnd);
     }
+    for (const clip of sfxClips) {
+      targets.push(clip.timelineStart, sfxClipTimelineEnd(clip));
+    }
     // Marker pins are snap targets too, so a clip/overlay edge or the playhead
     // clicks to a marked beat -- the drag-side complement to [ / ] marker nav.
     for (const m of markers) {
       targets.push(m.t);
     }
     return targets;
-  }, [clips, overlays, markers, playhead, duration]);
+  }, [clips, overlays, sfxClips, markers, playhead, duration]);
 
   // Snap threshold in seconds -- or -1 (unreachable) when the magnet is OFF, so
   // snapTime never finds a target within range and returns the raw candidate.
@@ -370,6 +446,10 @@ export function Timeline({ className }: TimelineProps) {
     return Array.from(types).includes("Files");
   }, []);
 
+  const dragCarriesSfx = useCallback((e: React.DragEvent): boolean => (
+    Array.from(e.dataTransfer?.types ?? []).includes(SFX_DRAG_MIME)
+  ), []);
+
   const snappedDropTime = useCallback(
     (clientX: number): number => {
       const raw = clientXToTime(clientX);
@@ -381,7 +461,7 @@ export function Timeline({ className }: TimelineProps) {
 
   const handleTrackDragOver = useCallback(
     (e: React.DragEvent) => {
-      if (!dragCarriesFiles(e)) return;
+      if (!dragCarriesFiles(e) && !dragCarriesSfx(e)) return;
       // preventDefault marks this a valid drop target (without it the browser
       // navigates to the file / does nothing on drop).
       e.preventDefault();
@@ -389,7 +469,7 @@ export function Timeline({ className }: TimelineProps) {
       const t = snappedDropTime(e.clientX);
       setDropIndicatorX(timeToPx(t, pixelsPerSecond));
     },
-    [dragCarriesFiles, snappedDropTime, pixelsPerSecond]
+    [dragCarriesFiles, dragCarriesSfx, snappedDropTime, pixelsPerSecond]
   );
 
   const handleTrackDragLeave = useCallback((e: React.DragEvent) => {
@@ -403,16 +483,95 @@ export function Timeline({ className }: TimelineProps) {
 
   const handleTrackDrop = useCallback(
     (e: React.DragEvent) => {
-      if (!dragCarriesFiles(e)) return;
+      const carriesSfx = dragCarriesSfx(e);
+      const carriesFiles = dragCarriesFiles(e);
+      if (!carriesFiles && !carriesSfx) return;
       e.preventDefault();
       setDropIndicatorX(null);
-      const files = e.dataTransfer.files;
-      if (!files || files.length === 0) return;
       const atTime = snappedDropTime(e.clientX);
-      void ingestOverlayFiles(files, atTime);
+      if (carriesSfx) {
+        try {
+          const payload = JSON.parse(e.dataTransfer.getData(SFX_DRAG_MIME)) as SfxDragPayload;
+          if ("builtInKey" in payload && isApprovedSfxKey(payload.builtInKey)) {
+            const entry = SFX_CATALOG[payload.builtInKey];
+            useRepurposeStore.getState().addSfxClip({
+              name: entry.displayName,
+              source: { kind: "built-in", key: payload.builtInKey },
+              atTime,
+            });
+          } else if ("assetId" in payload) {
+            const asset = useRepurposeStore.getState().sfxAssets.find((item) => item.id === payload.assetId);
+            if (asset?.sourcePath) {
+              useRepurposeStore.getState().addSfxClip({
+                name: asset.name,
+                source: { kind: "imported", assetId: asset.id, srcDuration: asset.srcDuration },
+                atTime,
+              });
+            }
+          }
+        } catch {
+          // Ignore malformed internal payloads; paths are never accepted here.
+        }
+        return;
+      }
+      const files = Array.from(e.dataTransfer.files ?? []);
+      if (files.length === 0) return;
+      const audioFiles = files.filter(isAudioLikeFile);
+      const overlayFiles = files.filter((file) => !isAudioLikeFile(file));
+      if (audioFiles.length > 0 && sfxImportOwner) {
+        setSfxDropError(null);
+        void (async () => {
+          for (const file of audioFiles) {
+            try {
+              await importSfxFile(file, atTime, sfxImportOwner);
+            } catch (error) {
+              if (error instanceof DOMException && error.name === "AbortError") return;
+              const message = error instanceof Error ? error.message : "Sound-effect import failed.";
+              setSfxDropError(`${file.name}: ${message}`);
+              break;
+            }
+          }
+        })();
+      }
+      if (overlayFiles.length > 0) {
+        void ingestOverlayFiles(
+          overlayFiles,
+          atTime,
+          undefined,
+          overlayImportOwner
+        ).catch(() => undefined);
+      }
     },
-    [dragCarriesFiles, snappedDropTime]
+    [dragCarriesFiles, dragCarriesSfx, overlayImportOwner, sfxImportOwner, snappedDropTime]
   );
+
+  const deleteSfxClipAndRestoreFocus = useCallback((id: string) => {
+    const state = useRepurposeStore.getState();
+    const index = state.sfxClips.findIndex((clip) => clip.id === id);
+    if (index < 0) return;
+    const nearest = state.sfxClips[index + 1] ?? state.sfxClips[index - 1] ?? null;
+    removeSfxClip(id);
+    selectSfxClip(nearest?.id ?? null);
+    focusSfxTimelineTarget(nearest?.id ?? null);
+  }, [removeSfxClip, selectSfxClip]);
+
+  const handleSfxKeyboardMove = useCallback((id: string, delta: number) => {
+    const state = useRepurposeStore.getState();
+    const clip = state.sfxClips.find((candidate) => candidate.id === id);
+    if (clip) state.moveSfxClip(id, clip.timelineStart + delta);
+  }, []);
+
+  const handleSfxKeyboardTrim = useCallback((
+    id: string,
+    edge: "start" | "end",
+    delta: number
+  ) => {
+    const state = useRepurposeStore.getState();
+    const clip = state.sfxClips.find((candidate) => candidate.id === id);
+    if (!clip) return;
+    if (edge === "start") state.trimSfxClipLeft(id, clip.timelineStart + delta);
+    else state.trimSfxClipRight(id, sfxClipTimelineEnd(clip) + delta);
+  }, []);
 
   // ---- zoom -----------------------------------------------------------------
   // Zoom ANCHORED ON THE PLAYHEAD: the frame under the play mark must stay put on
@@ -577,8 +736,60 @@ export function Timeline({ className }: TimelineProps) {
     }
   }, []);
 
+  const canStartTimelineDrag = useCallback((_pointerId: number): boolean => (
+    dragRef.current === null
+  ), []);
+
+  const beginWordRangeDrag = useCallback((
+    pointer: TimelinePointerStart,
+    lifecycle: TimelinePointerLifecycle
+  ): boolean => {
+    if (!canStartTimelineDrag(pointer.pointerId)) return false;
+    captureTimelinePointer(pointer);
+    dragRef.current = {
+      type: "word-range",
+      ...pointer,
+      lifecycle,
+      initialPlayhead: useRepurposeStore.getState().playhead,
+    };
+    return true;
+  }, [canStartTimelineDrag]);
+
+  const ownsWordRangeDrag = useCallback((pointerId: number): boolean => (
+    dragRef.current?.type === "word-range"
+    && dragRef.current.pointerId === pointerId
+  ), []);
+
+  const completeWordRangeDrag = useCallback((pointerId: number): boolean => {
+    const drag = dragRef.current;
+    if (drag?.type !== "word-range" || drag.pointerId !== pointerId) return false;
+    dragRef.current = null;
+    releaseTimelinePointerCapture(drag);
+    drag.lifecycle.complete();
+    return true;
+  }, []);
+
+  const cancelWordRangeDrag = useCallback((pointerId: number): boolean => {
+    const drag = dragRef.current;
+    if (drag?.type !== "word-range" || drag.pointerId !== pointerId) return false;
+    dragRef.current = null;
+    releaseTimelinePointerCapture(drag);
+    drag.lifecycle.cancel();
+    setPlayhead(drag.initialPlayhead);
+    return true;
+  }, [setPlayhead]);
+
+  const timelinePointerOwnership: TimelinePointerOwnership = {
+    canStartTimelineDrag,
+    beginWordRangeDrag,
+    ownsWordRangeDrag,
+    completeWordRangeDrag,
+    cancelWordRangeDrag,
+  };
+
   const startPlayheadScrub = useCallback(
     (e: React.PointerEvent<HTMLDivElement>, seek: boolean) => {
+      if (!canStartTimelineDrag(e.pointerId)) return;
       // Grabbing the playhead again stops any in-flight release coast so it can't
       // fight the fresh scrub, and clears leftover velocity so a plain click
       // (no movement) after a prior fling can't coast off the clicked frame.
@@ -588,12 +799,17 @@ export function Timeline({ className }: TimelineProps) {
         const t = clientXToTime(e.clientX);
         setPlayhead(clamp(t, 0, duration));
       }
-      dragRef.current = { type: "playhead" };
+      const pointer = {
+        clientX: e.clientX,
+        pointerId: e.pointerId,
+        captureTarget: e.currentTarget,
+      };
+      captureTimelinePointer(pointer);
+      dragRef.current = { type: "playhead", ...pointer };
       lastScrubClientXRef.current = e.clientX;
       lastScrubTsRef.current = performance.now();
-      e.currentTarget.setPointerCapture(e.pointerId);
     },
-    [clientXToTime, setPlayhead, duration, stopCoast]
+    [canStartTimelineDrag, clientXToTime, setPlayhead, duration, stopCoast]
   );
 
   // Ruler + empty-track background: click/drag anywhere seeks the play mark to
@@ -622,7 +838,8 @@ export function Timeline({ className }: TimelineProps) {
 
   // ---- clip body drag (reorder) ---------------------------------------------
   const handleClipBodyDragStart = useCallback(
-    (clip: Clip, clientX: number) => {
+    (clip: Clip, pointer: TimelinePointerStart) => {
+      if (!canStartTimelineDrag(pointer.pointerId)) return;
       stopCoast();
       // Freeze the OTHER kept clips' centers now, at drag start. The reorder
       // target is computed against this stable snapshot on every move so a
@@ -631,62 +848,115 @@ export function Timeline({ className }: TimelineProps) {
         .filter((c) => c.kept && c.id !== clip.id)
         .map((c) => ({ id: c.id, center: (c.timelineStart + c.timelineEnd) / 2 }))
         .sort((a, b) => a.center - b.center);
+      captureTimelinePointer(pointer);
       dragRef.current = {
         type: "clip-body",
         clip,
-        startClientX: clientX,
+        startClientX: pointer.clientX,
         startTimelineStart: clip.timelineStart,
         siblings,
+        pointerId: pointer.pointerId,
+        captureTarget: pointer.captureTarget,
       };
     },
-    [clips, stopCoast]
+    [canStartTimelineDrag, clips, stopCoast]
   );
 
   // ---- clip edge drag (trim) -------------------------------------------------
   const handleClipEdgeDragStart = useCallback(
-    (clip: Clip, edge: "start" | "end", clientX: number) => {
+    (clip: Clip, edge: "start" | "end", pointer: TimelinePointerStart) => {
+      if (!canStartTimelineDrag(pointer.pointerId)) return;
       stopCoast();
+      captureTimelinePointer(pointer);
       dragRef.current = {
         type: "clip-edge",
         clip,
         edge,
-        startClientX: clientX,
+        startClientX: pointer.clientX,
         startSrcStart: clip.srcStart,
         startSrcEnd: clip.srcEnd,
+        pointerId: pointer.pointerId,
+        captureTarget: pointer.captureTarget,
       };
     },
-    [stopCoast]
+    [canStartTimelineDrag, stopCoast]
   );
 
   // ---- overlay body drag (slide in output time -- NO ripple) -----------------
   const handleOverlayBodyDragStart = useCallback(
-    (overlay: Overlay, clientX: number) => {
+    (overlay: Overlay, pointer: TimelinePointerStart) => {
+      if (!canStartTimelineDrag(pointer.pointerId)) return;
       stopCoast();
+      captureTimelinePointer(pointer);
       dragRef.current = {
         type: "overlay-body",
         overlay,
-        startClientX: clientX,
+        startClientX: pointer.clientX,
         startTimelineStart: overlay.timelineStart,
+        pointerId: pointer.pointerId,
+        captureTarget: pointer.captureTarget,
       };
     },
-    [stopCoast]
+    [canStartTimelineDrag, stopCoast]
   );
 
   // ---- overlay edge drag (trim one edge, frozen-anchor absolute target) -------
   const handleOverlayEdgeDragStart = useCallback(
-    (overlay: Overlay, edge: "start" | "end", clientX: number) => {
+    (overlay: Overlay, edge: "start" | "end", pointer: TimelinePointerStart) => {
+      if (!canStartTimelineDrag(pointer.pointerId)) return;
       stopCoast();
+      captureTimelinePointer(pointer);
       dragRef.current = {
         type: "overlay-edge",
         overlay,
         edge,
-        startClientX: clientX,
+        startClientX: pointer.clientX,
         startTimelineStart: overlay.timelineStart,
         startTimelineEnd: overlay.timelineEnd,
+        pointerId: pointer.pointerId,
+        captureTarget: pointer.captureTarget,
       };
     },
-    [stopCoast]
+    [canStartTimelineDrag, stopCoast]
   );
+
+  const handleSfxBodyDragStart = useCallback((clip: SfxClip, pointer: TimelinePointerStart) => {
+    if (!canStartTimelineDrag(pointer.pointerId)) return;
+    stopCoast();
+    captureTimelinePointer(pointer);
+    dragRef.current = {
+      type: "sfx",
+      clip,
+      edge: "body",
+      startClientX: pointer.clientX,
+      pointerId: pointer.pointerId,
+      captureTarget: pointer.captureTarget,
+      token: null,
+    };
+  }, [canStartTimelineDrag, stopCoast]);
+
+  const handleSfxEdgeDragStart = useCallback((clip: SfxClip, edge: "start" | "end", pointer: TimelinePointerStart) => {
+    if (!canStartTimelineDrag(pointer.pointerId)) return;
+    stopCoast();
+    captureTimelinePointer(pointer);
+    dragRef.current = {
+      type: "sfx",
+      clip,
+      edge,
+      startClientX: pointer.clientX,
+      pointerId: pointer.pointerId,
+      captureTarget: pointer.captureTarget,
+      token: null,
+    };
+  }, [canStartTimelineDrag, stopCoast]);
+
+  useEffect(() => useRepurposeStore.getState().subscribeSfxGestureCancellation(() => {
+    if (dragRef.current?.type === "sfx") {
+      releaseTimelinePointerCapture(dragRef.current);
+      dragRef.current = null;
+    }
+    setSnapGuideX(null);
+  }), []);
 
   // ---- scrub-release momentum coast (self-driven) ---------------------------
   // Runs on its OWN rAF, reading pixelsPerSecond / duration from refs so it is
@@ -733,6 +1003,8 @@ export function Timeline({ className }: TimelineProps) {
     const handleMove = (e: PointerEvent) => {
       const drag = dragRef.current;
       if (!drag) return;
+      if (e.pointerId !== drag.pointerId) return;
+      if (drag.type === "word-range") return;
       const {
         clientXToTime,
         clips,
@@ -765,6 +1037,46 @@ export function Timeline({ className }: TimelineProps) {
         }
         lastScrubClientXRef.current = e.clientX;
         lastScrubTsRef.current = now;
+        return;
+      }
+
+      if (drag.type === "sfx") {
+        const deltaPx = e.clientX - drag.startClientX;
+        if (!drag.token && Math.abs(deltaPx) < 4) return;
+        if (!drag.token) {
+          const kind = drag.edge === "body" ? "move" : drag.edge === "start" ? "left-trim" : "right-trim";
+          drag.token = beginSfxGesture(drag.clip.id, kind);
+        }
+        if (!drag.token) return;
+        const anchor = drag.edge === "end" ? sfxClipTimelineEnd(drag.clip) : drag.clip.timelineStart;
+        const ownEnd = sfxClipTimelineEnd(drag.clip);
+        const liveClip = useRepurposeStore.getState().sfxClips.find(
+          (clip) => clip.id === drag.clip.id
+        );
+        const liveEnd = liveClip ? sfxClipTimelineEnd(liveClip) : ownEnd;
+        const selfFilteredTargets = snapTargets.filter((target) => (
+            Math.abs(target - drag.clip.timelineStart) > .001
+            && Math.abs(target - ownEnd) > .001
+            && Math.abs(target - (liveClip?.timelineStart ?? drag.clip.timelineStart)) > .001
+            && Math.abs(target - liveEnd) > .001
+        ));
+        const candidate = anchor + pxToTime(deltaPx, pixelsPerSecond);
+        if (drag.edge === "body") {
+          const snappedMove = snapMovedSpan(
+            candidate,
+            drag.clip.sourceEnd - drag.clip.sourceStart,
+            selfFilteredTargets,
+            snapThresholdSeconds
+          );
+          setSnapGuideX(snappedMove.snapTarget === null
+            ? null
+            : timeToPx(snappedMove.snapTarget, pixelsPerSecond));
+          updateSfxGesture(drag.token, snappedMove.start);
+          return;
+        }
+        const { time, snapped } = snapTime(candidate, selfFilteredTargets, snapThresholdSeconds);
+        setSnapGuideX(snapped ? timeToPx(time, pixelsPerSecond) : null);
+        updateSfxGesture(drag.token, time);
         return;
       }
 
@@ -886,10 +1198,20 @@ export function Timeline({ className }: TimelineProps) {
       }
     };
 
-    const handleUp = () => {
+    const handleUp = (e: PointerEvent) => {
       const drag = dragRef.current;
+      if (drag && e.pointerId !== drag.pointerId) return;
+      if (drag?.type === "word-range") {
+        completeWordRangeDrag(e.pointerId);
+        setSnapGuideX(null);
+        return;
+      }
       dragRef.current = null;
       setSnapGuideX(null);
+      if (drag) releaseTimelinePointerCapture(drag);
+      if (drag?.type === "sfx") {
+        if (drag.token) endSfxGesture(drag.token);
+      }
       if (drag?.type === "playhead") {
         lastScrubClientXRef.current = null;
         // Hand the release velocity to the standalone coast driver. The coast
@@ -900,11 +1222,37 @@ export function Timeline({ className }: TimelineProps) {
       }
     };
 
+    const handleCancel = (e: PointerEvent) => {
+      const drag = dragRef.current;
+      if (drag && e.pointerId !== drag.pointerId) return;
+      if (drag?.type === "word-range") {
+        cancelWordRangeDrag(e.pointerId);
+        setSnapGuideX(null);
+        return;
+      }
+      dragRef.current = null;
+      setSnapGuideX(null);
+      if (drag) releaseTimelinePointerCapture(drag);
+      if (drag?.type === "sfx") {
+        if (drag.token) cancelSfxGesture(drag.token);
+      }
+    };
+
     window.addEventListener("pointermove", handleMove);
     window.addEventListener("pointerup", handleUp);
+    window.addEventListener("pointercancel", handleCancel);
     return () => {
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleCancel);
+      const drag = dragRef.current;
+      if (drag?.type === "word-range") {
+        cancelWordRangeDrag(drag.pointerId);
+      } else if (drag) {
+        dragRef.current = null;
+        releaseTimelinePointerCapture(drag);
+        if (drag.type === "sfx" && drag.token) cancelSfxGesture(drag.token);
+      }
       // NOTE: do NOT cancel momentumRafRef here. The coast is owned by its own
       // unmount-only effect (see below); cancelling it on every re-render is
       // exactly the bug this fix removes.
@@ -916,6 +1264,12 @@ export function Timeline({ className }: TimelineProps) {
     trimClip,
     moveOverlay,
     trimOverlay,
+    beginSfxGesture,
+    updateSfxGesture,
+    endSfxGesture,
+    cancelSfxGesture,
+    completeWordRangeDrag,
+    cancelWordRangeDrag,
   ]);
 
   // ---- keyboard: delete selected clip -----------------------------------------
@@ -932,21 +1286,46 @@ export function Timeline({ className }: TimelineProps) {
         target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.isContentEditable;
       if (isEditable) return;
 
+      const sfxState = useRepurposeStore.getState();
+      if ((e.key === "Delete" || e.key === "Backspace") && sfxState.selectedSfxClipId) {
+        e.preventDefault();
+        deleteSfxClipAndRestoreFocus(sfxState.selectedSfxClipId);
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && e.code === "KeyD" && sfxState.selectedSfxClipId) {
+        e.preventDefault();
+        const id = duplicateSfxClip(sfxState.selectedSfxClipId);
+        if (id) {
+          selectSfxClip(id);
+          focusSfxTimelineTarget(id);
+        }
+        return;
+      }
+
       // Overlay first, and short-circuit: selecting an overlay clears
       // selectedClipId in the store (mutual exclusion), so an overlay-delete and
       // a clip-delete can never both fire. This early-return is the one-line
       // guard keeping the two Delete / Cmd+D paths disjoint even if a stray clip
-      // id lingered -- a selected overlay is a media layer, never a scene, so its
-      // Delete removes the overlay and its Cmd+D duplicates the overlay.
-      if (selectedOverlayId) {
-        if (e.key === "Delete" || e.key === "Backspace") {
+      // id lingered -- a selected overlay is a media layer, never a scene.
+      // PreviewCanvas owns its Cmd+D because only it has live frame geometry.
+      const isDelete = e.key === "Delete" || e.key === "Backspace";
+      if (isDelete) {
+        const state = useRepurposeStore.getState();
+        const hasOverlaySelection =
+          state.selectedOverlayId !== null || state.selectedOverlayIds.length > 0;
+        if (hasOverlaySelection) {
+          const primary = resolveEffectivePrimaryOverlay(
+            state.overlays,
+            state.selectedOverlayIds,
+            state.selectedOverlayId,
+            effectiveSplitRatio(
+              splitRatioAt(state.clips, state.playhead, state.splitRatio),
+              DEFAULT_HEIGHT
+            )
+          );
+          if (!primary) return;
           e.preventDefault();
-          removeOverlay(selectedOverlayId);
-          return;
-        }
-        if ((e.metaKey || e.ctrlKey) && e.code === "KeyD") {
-          e.preventDefault();
-          duplicateOverlay(selectedOverlayId);
+          removeOverlay(primary.id);
           return;
         }
         // Any other key falls through to the Z-zoom shortcuts below.
@@ -986,13 +1365,15 @@ export function Timeline({ className }: TimelineProps) {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [
     selectedClipId,
-    selectedOverlayId,
     selectedWordRange,
     deleteWords,
     deleteClip,
     duplicateClip,
     removeOverlay,
-    duplicateOverlay,
+    removeSfxClip,
+    duplicateSfxClip,
+    deleteSfxClipAndRestoreFocus,
+    selectSfxClip,
     fitToWindow,
     zoomToSelection,
   ]);
@@ -1003,7 +1384,8 @@ export function Timeline({ className }: TimelineProps) {
   const handleBackgroundClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     if (e.target !== e.currentTarget) return;
     selectClip(null);
-  }, [selectClip]);
+    selectSfxClip(null);
+  }, [selectClip, selectSfxClip]);
 
   // ---- ruler ticks ------------------------------------------------------------
   const tickInterval = pickTickInterval(pixelsPerSecond);
@@ -1057,6 +1439,15 @@ export function Timeline({ className }: TimelineProps) {
   const overlayRowLanes = Math.max(1, overlayLaneCount);
   const overlayRowHeight =
     overlayRowLanes * OVERLAY_LANE_HEIGHT + (overlayRowLanes - 1) * OVERLAY_LANE_GAP;
+  const { lanes: sfxLanes, laneCount: sfxLaneCount } = useMemo(
+    () => packLanes(sfxClips.map((clip) => ({
+      start: clip.timelineStart,
+      end: sfxClipTimelineEnd(clip),
+    }))),
+    [sfxClips]
+  );
+  const sfxRowLanes = Math.max(1, sfxLaneCount);
+  const sfxRowHeight = sfxRowLanes * SFX_LANE_HEIGHT + (sfxRowLanes - 1) * SFX_LANE_GAP;
 
   // Vertical layout, top -> bottom: Overlays row (media ON TOP of the composite),
   // then the single unified clip track, then the Music row (background bed), then
@@ -1069,7 +1460,7 @@ export function Timeline({ className }: TimelineProps) {
   const clipRowTop = overlayRowHeight + TRACK_GAP;
   const musicRowTop = clipRowTop + TRACK_HEIGHT + TRACK_GAP;
   const audioRowTop = musicRowTop + TRACK_HEIGHT + TRACK_GAP;
-  const totalTracksHeight = audioRowTop + TRACK_HEIGHT;
+  const totalTracksHeight = audioRowTop + sfxRowHeight;
 
   return (
     <div className={`flex flex-col bg-neutral-950 border border-neutral-800 rounded-lg overflow-hidden ${className ?? ""}`}>
@@ -1191,7 +1582,7 @@ export function Timeline({ className }: TimelineProps) {
                 plays UNDER the picture. Last row, so it carries only TRACK_HEIGHT. */}
             <div
               className="flex items-center gap-1.5 px-2 text-[11px] text-emerald-300 border-b border-neutral-800/60"
-              style={{ height: TRACK_HEIGHT }}
+               style={{ height: sfxRowHeight }}
               title="Sound effects (plays under the picture)"
             >
               <MusicNotes size={13} weight="regular" className="shrink-0" />
@@ -1344,6 +1735,7 @@ export function Timeline({ className }: TimelineProps) {
                     onSelect={selectClip}
                     onDragBodyStart={handleClipBodyDragStart}
                     onDragEdgeStart={handleClipEdgeDragStart}
+                    timelinePointerOwnership={timelinePointerOwnership}
                     onDelete={deleteClip}
                     onRestore={restoreClip}
                     waveform={faceWaveform}
@@ -1478,64 +1870,45 @@ export function Timeline({ className }: TimelineProps) {
                 })()}
               </div>
 
-              {/* AUDIO row -- the generated sound-effects track, sitting BELOW
-                  the clip + music tracks since audio plays under the picture.
-                  One locked full-length GREEN block
-                  spanning 0..duration; not draggable (it's the whole-reel bed).
-                  Click the X to remove it. Emerald so it reads distinctly from
-                  coral clips and violet overlays. */}
-              <div
-                className="absolute left-0 right-0 border-b border-emerald-500/25"
-                style={{ top: audioRowTop, height: TRACK_HEIGHT }}
-              >
-                {sfxTrack && (() => {
-                  const sfxBlockWidth = timeToPx(safeDuration, pixelsPerSecond);
-                  return (
-                  <div
-                    className="group absolute flex items-center gap-1.5 overflow-hidden rounded-md border border-emerald-400/50 bg-emerald-500/20 px-2 text-[11px] font-medium text-emerald-100 shadow-[0_0_10px_rgba(16,185,129,0.25)]"
-                    style={{
-                      left: timeToPx(0, pixelsPerSecond),
-                      width: sfxBlockWidth,
-                      top: 4,
-                      height: TRACK_HEIGHT - 8,
-                    }}
-                    title="Generated sound-effects track (full reel). Plays in preview + export."
-                  >
-                    {/* Real waveform inside the block (Descript-style): darker
-                        emerald ink, bottom-anchored bars, behind the label. */}
-                    <TrackWaveform
-                      waveform={sfxWaveform}
-                      srcStart={0}
-                      srcEnd={Math.min(sfxTrack.durationSec, safeDuration)}
-                      // Audible span, NOT the block width: if the reel grew
-                      // after the SFX render, bars stop where the audio does.
-                      width={timeToPx(
-                        Math.min(sfxTrack.durationSec, safeDuration),
-                        pixelsPerSecond
-                      )}
-                      height={TRACK_HEIGHT - 8}
-                      color="#00140d"
-                    />
-                    <Waveform size={13} weight="bold" className="relative shrink-0 text-emerald-300" />
-                    <span className="relative truncate">SFX</span>
-                    {/* delete affordance -- appears on hover */}
-                    <button
-                      type="button"
-                      onPointerDown={(e) => e.stopPropagation()}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        clearSfxTrack();
-                      }}
-                      aria-label="Remove sound-effects track"
-                      title="Remove sound-effects track"
-                      className="absolute right-1 top-1/2 hidden h-4 w-4 -translate-y-1/2 place-items-center rounded-full bg-neutral-900/80 text-emerald-200 hover:bg-red-600/80 hover:text-white group-hover:grid"
-                    >
-                      <X size={10} weight="bold" />
-                    </button>
-                  </div>
-                  );
-                })()}
-              </div>
+              {/* AUDIO row -- editable sound-effect clips packed into mini-lanes
+                  below the picture and music tracks. */}
+               <div
+                 data-testid="sfx-row"
+                 data-sfx-focus-fallback
+                 role="region"
+                 aria-label="Sound effects timeline"
+                 tabIndex={0}
+                 className="absolute left-0 right-0 border-b border-emerald-500/25"
+                 style={{ top: audioRowTop, height: sfxRowHeight }}
+               >
+                 {sfxDropError && (
+                   <p role="alert" className="absolute left-2 top-1 z-40 max-w-[28rem] rounded bg-red-950/90 px-2 py-1 text-[10px] text-red-200">
+                     {sfxDropError}
+                   </p>
+                 )}
+                 {sfxClips.map((clip, index) => (
+                   <TimelineSfxBlock
+                     key={clip.id}
+                     clip={clip}
+                     assets={sfxAssets}
+                     left={timeToPx(clip.timelineStart, pixelsPerSecond)}
+                     width={timeToPx(sfxClipTimelineEnd(clip) - clip.timelineStart, pixelsPerSecond)}
+                     top={(sfxLanes[index] ?? 0) * (SFX_LANE_HEIGHT + SFX_LANE_GAP)}
+                     height={SFX_LANE_HEIGHT}
+                      selected={selectedSfxClipId === clip.id}
+                      projectDuration={duration}
+                      projectEpoch={projectEpoch}
+                      sourceDuration={sfxSourceDuration(clip.source)}
+                      timelineStep={1 / Math.max(1, Math.round(footageMeta?.fps || 30))}
+                      onSelect={selectSfxClip}
+                      onMoveBy={handleSfxKeyboardMove}
+                      onTrimBy={handleSfxKeyboardTrim}
+                     onBodyPointerDown={handleSfxBodyDragStart}
+                     onEdgePointerDown={handleSfxEdgeDragStart}
+                     onDelete={deleteSfxClipAndRestoreFocus}
+                   />
+                 ))}
+               </div>
 
               {/* scene-cut dividers -- a vertical line at every clip boundary
                   so each cut in the assembled short reads at a glance (matches
@@ -1647,6 +2020,34 @@ export function Timeline({ className }: TimelineProps) {
   );
 }
 
+function TimelineSfxBlock({
+  clip,
+  assets,
+  ...props
+}: {
+  clip: SfxClip;
+  assets: SfxAsset[];
+  left: number;
+  width: number;
+  top: number;
+  height: number;
+  selected: boolean;
+  projectDuration: number;
+  projectEpoch: number;
+  sourceDuration: number;
+  timelineStep: number;
+  onSelect: (id: string) => void;
+  onMoveBy: (id: string, delta: number) => void;
+  onTrimBy: (id: string, edge: "start" | "end", delta: number) => void;
+  onBodyPointerDown: (clip: SfxClip, pointer: TimelinePointerStart) => void;
+  onEdgePointerDown: (clip: SfxClip, edge: "start" | "end", pointer: TimelinePointerStart) => void;
+  onDelete: (id: string) => void;
+}) {
+  const source = resolveSfxSource(clip.source, assets);
+  const waveform = useSfxWaveform(source.url, props.selected, props.projectEpoch);
+  return <SfxClipBlock clip={clip} missing={source.missing} waveform={waveform} {...props} />;
+}
+
 
 // ===========================================================================
 // TrackWaveform -- Descript-style waveform INSIDE an audio bed block
@@ -1677,28 +2078,23 @@ function TrackWaveform({
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // One bin per ~2 CSS px (same density as the face clips' ClipWaveform).
-  const outBins = Math.max(4, Math.round(width / 2));
+  const renderMetrics = useMemo(() => waveformRenderMetrics(
+    width,
+    height,
+    typeof window === "undefined" ? 1 : window.devicePixelRatio || 1
+  ), [height, width]);
   const peaks = useMemo(
-    () => sliceClipPeaks(waveform, srcStart, srcEnd, outBins),
-    [waveform, srcStart, srcEnd, outBins]
+    () => sliceClipPeaks(waveform, srcStart, srcEnd, renderMetrics.binCount),
+    [waveform, srcStart, srcEnd, renderMetrics.binCount]
   );
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const dpr = Math.min(typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1, 2);
-    const w = Math.max(1, Math.floor(width));
-    const h = Math.max(1, Math.floor(height));
-    // Browsers cap a canvas dimension at ~32767px and this block spans the WHOLE
-    // reel: 60s at max zoom (400px/s) on a 2x display = 48,000 backing px --
-    // past the cap the canvas silently allocates nothing and the waveform
-    // vanishes. Clamp the backing scale so width stays comfortably under it;
-    // bars get slightly softer at extreme zoom instead of disappearing.
-    const scale = Math.min(dpr, 16384 / w);
-    canvas.width = Math.max(1, Math.floor(w * scale));
-    canvas.height = Math.max(1, Math.floor(h * scale));
+    const { backingHeight, backingWidth, cssHeight: h, cssWidth: w, scale } = renderMetrics;
+    canvas.width = backingWidth;
+    canvas.height = backingHeight;
 
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
@@ -1718,7 +2114,7 @@ function TrackWaveform({
       const x = i * barW;
       ctx.fillRect(x, h - amp, Math.max(1, barW * 0.7), amp);
     }
-  }, [peaks, width, height, color]);
+  }, [peaks, renderMetrics, color]);
 
   if (peaks.length === 0) return null;
 
@@ -1728,8 +2124,8 @@ function TrackWaveform({
     // bars must stop at the real audio end, not stretch across the silence.
     <canvas
       ref={canvasRef}
-      className="pointer-events-none absolute left-0 top-0 h-full rounded-md opacity-60"
-      style={{ width }}
+      className="pointer-events-none absolute left-0 top-0 rounded-md opacity-60"
+      style={{ width: renderMetrics.cssWidth, height: renderMetrics.cssHeight }}
       aria-hidden
     />
   );

@@ -5,6 +5,7 @@ import { TrashSimple, ArrowCounterClockwise, Star } from "@phosphor-icons/react"
 import type { Clip, Word } from "@/lib/repurpose/types";
 import { formatTimecode } from "./timeline-utils";
 import { sliceClipPeaks, type FaceWaveform } from "./useFaceWaveform";
+import type { TimelinePointerOwnership, TimelinePointerStart } from "./timeline-pointer";
 
 interface ClipBlockProps {
   clip: Clip;
@@ -14,8 +15,9 @@ interface ClipBlockProps {
   trackHeight: number;
   isSelected: boolean;
   onSelect: (id: string) => void;
-  onDragBodyStart: (clip: Clip, pointerX: number) => void;
-  onDragEdgeStart: (clip: Clip, edge: "start" | "end", pointerX: number) => void;
+  onDragBodyStart: (clip: Clip, pointer: TimelinePointerStart) => void;
+  onDragEdgeStart: (clip: Clip, edge: "start" | "end", pointer: TimelinePointerStart) => void;
+  timelinePointerOwnership: TimelinePointerOwnership;
   onDelete: (id: string) => void;
   onRestore: (id: string) => void;
   /**
@@ -57,7 +59,7 @@ interface ClipBlockProps {
    * lo/hi via the store's selectWords. Absent -> only single-word clicks work,
    * and a body drag falls back to moving the clip.
    */
-  onWordRangeSelect?: (fromRawIndex: number, toRawIndex: number) => void;
+  onWordRangeSelect?: (fromRawIndex: number | null, toRawIndex?: number) => void;
   /** The raw index of the currently shared-selected word, for cell highlight. */
   selectedWordIndex?: number | null;
   /**
@@ -367,6 +369,7 @@ export function ClipBlock({
   onSelect,
   onDragBodyStart,
   onDragEdgeStart,
+  timelinePointerOwnership,
   onDelete,
   onRestore,
   waveform = null,
@@ -399,7 +402,14 @@ export function ClipBlock({
   // `focus` the last cell swept to, and `moved` flips true once the sweep leaves
   // the anchor cell (so a no-move release is treated as a plain single click, not
   // a 1-word range). null when no word-range drag is active.
-  const wordDragRef = useRef<{ anchor: number; focus: number; moved: boolean } | null>(null);
+  const wordDragRef = useRef<{
+    anchor: number;
+    focus: number;
+    moved: boolean;
+    pointerId: number;
+    captureTarget: HTMLElement;
+    initialRange: { lo: number; hi: number } | null;
+  } | null>(null);
 
   const clipWidth = Math.max(width, 6);
 
@@ -416,6 +426,27 @@ export function ClipBlock({
   // Mirror MIN_CELL_PX_FOR_TEXT so the visual + interactive thresholds agree.
   const wordsAreReadable =
     wordCells.length > 0 && clipWidth / wordCells.length >= MIN_CELL_PX_FOR_TEXT;
+
+  const finishWordRangeDrag = useCallback((completion: "complete" | "cancel") => {
+    const drag = wordDragRef.current;
+    if (!drag) return;
+    wordDragRef.current = null;
+    suppressClickRef.current = true;
+    pointerDownXRef.current = null;
+    if (completion === "complete") {
+      if (!drag.moved && onWordCellClick) onWordCellClick(drag.anchor);
+      return;
+    }
+    if (drag.moved && onWordRangeSelect) {
+      onWordRangeSelect(drag.initialRange?.lo ?? null, drag.initialRange?.hi);
+    }
+  }, [onWordCellClick, onWordRangeSelect]);
+
+  const cancelWordRangeDrag = timelinePointerOwnership.cancelWordRangeDrag;
+  useEffect(() => () => {
+    const drag = wordDragRef.current;
+    if (drag) cancelWordRangeDrag(drag.pointerId);
+  }, [cancelWordRangeDrag]);
 
   // Hit-test a client-x against this clip's word cells -> the rawIndex of the cell
   // it lands in, or null if it falls in no cell (e.g. a sub-pixel gap). Clamps to
@@ -462,6 +493,10 @@ export function ClipBlock({
         const rect = e.currentTarget.getBoundingClientRect();
         const hit = hitTestWordCell(e.clientX, rect);
         if (hit != null) {
+          if (!timelinePointerOwnership.canStartTimelineDrag(e.pointerId)) {
+            suppressClickRef.current = true;
+            return;
+          }
           // SHIFT+click: extend the CURRENT selection to the clicked word. The
           // anchor is the existing selection's low end (or, if nothing is
           // selected yet, the clicked word itself -> a 1-word selection). No drag
@@ -478,15 +513,37 @@ export function ClipBlock({
           // sweep that leaves this block still tracks. The actual range fires on
           // move (once the sweep changes cells) and a no-move release falls back
           // to a single-word click in handleBodyPointerUp.
-          wordDragRef.current = { anchor: hit, focus: hit, moved: false };
-          e.currentTarget.setPointerCapture(e.pointerId);
+          const pointer = {
+            clientX: e.clientX,
+            pointerId: e.pointerId,
+            captureTarget: e.currentTarget,
+          };
+          wordDragRef.current = {
+            anchor: hit,
+            focus: hit,
+            moved: false,
+            pointerId: e.pointerId,
+            captureTarget: e.currentTarget,
+            initialRange: selectedWordRange ? { ...selectedWordRange } : null,
+          };
+          if (!timelinePointerOwnership.beginWordRangeDrag(pointer, {
+            complete: () => finishWordRangeDrag("complete"),
+            cancel: () => finishWordRangeDrag("cancel"),
+          })) {
+            wordDragRef.current = null;
+            suppressClickRef.current = true;
+          }
           return;
         }
       }
 
       // CLIP-MOVE mode: select the scene + start the body (reorder) drag.
       onSelect(clip.id);
-      onDragBodyStart(clip, e.clientX);
+      onDragBodyStart(clip, {
+        clientX: e.clientX,
+        pointerId: e.pointerId,
+        captureTarget: e.currentTarget,
+      });
     },
     [
       clip,
@@ -494,6 +551,8 @@ export function ClipBlock({
       onWordRangeSelect,
       hitTestWordCell,
       selectedWordRange,
+      timelinePointerOwnership,
+      finishWordRangeDrag,
       onSelect,
       onDragBodyStart,
     ]
@@ -507,7 +566,12 @@ export function ClipBlock({
   const handleBodyPointerMove = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
       const drag = wordDragRef.current;
-      if (!drag || !onWordRangeSelect) return;
+      if (
+        !drag
+        || e.pointerId !== drag.pointerId
+        || !timelinePointerOwnership.ownsWordRangeDrag(e.pointerId)
+        || !onWordRangeSelect
+      ) return;
       const rect = e.currentTarget.getBoundingClientRect();
       const focus = hitTestWordCell(e.clientX, rect);
       if (focus == null || focus === drag.focus) return;
@@ -515,7 +579,7 @@ export function ClipBlock({
       if (focus !== drag.anchor) drag.moved = true;
       onWordRangeSelect(drag.anchor, focus);
     },
-    [onWordRangeSelect, hitTestWordCell]
+    [onWordRangeSelect, hitTestWordCell, timelinePointerOwnership]
   );
 
   // Pointer-up ends an armed word-range drag. A sweep that never left the anchor
@@ -526,15 +590,19 @@ export function ClipBlock({
   const handleBodyPointerUp = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
       const drag = wordDragRef.current;
-      if (!drag) return;
-      wordDragRef.current = null;
-      suppressClickRef.current = true;
-      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
-        e.currentTarget.releasePointerCapture(e.pointerId);
-      }
-      if (!drag.moved && onWordCellClick) onWordCellClick(drag.anchor);
+      if (!drag || e.pointerId !== drag.pointerId) return;
+      timelinePointerOwnership.completeWordRangeDrag(e.pointerId);
     },
-    [onWordCellClick]
+    [timelinePointerOwnership]
+  );
+
+  const handleBodyPointerCancel = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      const drag = wordDragRef.current;
+      if (!drag || e.pointerId !== drag.pointerId) return;
+      timelinePointerOwnership.cancelWordRangeDrag(e.pointerId);
+    },
+    [timelinePointerOwnership]
   );
 
   // Body click: when word cells are readable and the pointer barely moved (a
@@ -640,7 +708,11 @@ export function ClipBlock({
       e.stopPropagation();
       e.preventDefault();
       onSelect(clip.id);
-      onDragEdgeStart(clip, edge, e.clientX);
+      onDragEdgeStart(clip, edge, {
+        clientX: e.clientX,
+        pointerId: e.pointerId,
+        captureTarget: e.currentTarget,
+      });
     },
     [clip, onSelect, onDragEdgeStart]
   );
@@ -690,6 +762,7 @@ export function ClipBlock({
       onPointerDown={handleBodyPointerDown}
       onPointerMove={handleBodyPointerMove}
       onPointerUp={handleBodyPointerUp}
+      onPointerCancel={handleBodyPointerCancel}
       onClick={handleBodyClick}
       onDoubleClick={handleBodyDoubleClick}
     >
@@ -774,11 +847,13 @@ export function ClipBlock({
 
       {/* left trim edge */}
       <div
+        data-trim-edge="start"
         className="absolute left-0 top-0 h-full w-2 hover:bg-[#FF6B35]/50 rounded-l-md"
         onPointerDown={handleEdgePointerDown("start")}
       />
       {/* right trim edge */}
       <div
+        data-trim-edge="end"
         className="absolute right-0 top-0 h-full w-2 hover:bg-[#FF6B35]/50 rounded-r-md"
         onPointerDown={handleEdgePointerDown("end")}
       />

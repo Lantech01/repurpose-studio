@@ -25,7 +25,6 @@ import {
   TextAa,
   Prohibit,
   CursorClick,
-  ArrowUUpLeft,
 } from "@phosphor-icons/react";
 import { useRepurposeStore } from "@/lib/repurpose/store";
 import {
@@ -46,7 +45,7 @@ import {
   loadCaptionFonts,
   type CaptionFontId,
 } from "@/lib/repurpose/caption-fonts";
-import { timelineToSourceTime } from "@/lib/repurpose/time-map";
+import { splitRatioAt, timelineToSourceTime } from "@/lib/repurpose/time-map";
 
 // Template preview tile logical size (CSS px). Backing store is DPR-scaled.
 const TILE_W = 84;
@@ -96,8 +95,23 @@ export function CaptionPanel({ className }: CaptionPanelProps) {
   const setCaptionTemplate = useRepurposeStore((s) => s.setCaptionTemplate);
   const patchCaptionStyle = useRepurposeStore((s) => s.patchCaptionStyle);
   const patchCaptionBlock = useRepurposeStore((s) => s.patchCaptionBlock);
-  const setBlockPosition = useRepurposeStore((s) => s.setBlockPosition);
-  const clearBlockPosition = useRepurposeStore((s) => s.clearBlockPosition);
+  const attachCaptionBlock = useRepurposeStore((s) => s.attachCaptionBlock);
+  const detachCaptionBlock = useRepurposeStore((s) => s.detachCaptionBlock);
+  const beginCaptionPositionGesture = useRepurposeStore(
+    (s) => s.beginCaptionPositionGesture
+  );
+  const updateCaptionPositionGesture = useRepurposeStore(
+    (s) => s.updateCaptionPositionGesture
+  );
+  const endCaptionPositionGesture = useRepurposeStore(
+    (s) => s.endCaptionPositionGesture
+  );
+  const cancelCaptionPositionGesture = useRepurposeStore(
+    (s) => s.cancelCaptionPositionGesture
+  );
+  const subscribeCaptionGestureCancellation = useRepurposeStore(
+    (s) => s.subscribeCaptionGestureCancellation
+  );
   const editWordText = useRepurposeStore((s) => s.editWordText);
   const ensureCaptionBlocks = useRepurposeStore((s) => s.ensureCaptionBlocks);
   const selectedCaptionBlockId = useRepurposeStore((s) => s.selectedCaptionBlockId);
@@ -109,6 +123,7 @@ export function CaptionPanel({ className }: CaptionPanelProps) {
   const clips = useRepurposeStore((s) => s.clips);
   const playhead = useRepurposeStore((s) => s.playhead);
   const splitRatio = useRepurposeStore((s) => s.splitRatio);
+  const settledSplitRatio = splitRatioAt(clips, playhead, splitRatio);
 
   // SELF-REPAIR: whenever we have a transcript but no caption blocks (a project
   // loaded/restored via a path that never chunked), rebuild so captions are
@@ -177,22 +192,9 @@ export function CaptionPanel({ className }: CaptionPanelProps) {
     : [];
   const selectedText = selectedWords.join(" ");
 
-  // The selected block's effective vertical position as an ABSOLUTE fraction of
-  // output height (same 0..1 units setBlockPosition takes), so the per-scene
-  // nudge slider reflects where THIS block actually sits.
   const selectedResolved = selectedBlock
     ? resolveBlockStyle(captionStyle, selectedBlock)
     : null;
-  const selectedPositionYPct = selectedResolved
-    ? selectedResolved.pinToSplit
-      ? splitRatio + selectedResolved.splitOffsetPct
-      : selectedResolved.positionYPct
-    : 0.7;
-  // Does THIS block carry a per-scene position override (vs. following global)?
-  const selectedHasPositionOverride =
-    selectedBlock?.overrideStyle !== undefined &&
-    (selectedBlock.overrideStyle.positionYPct !== undefined ||
-      selectedBlock.overrideStyle.splitOffsetPct !== undefined);
 
   // Commit a text edit: diff the typed words against the block's current shown
   // words and push each CHANGED slot through editWordText, which writes the
@@ -519,22 +521,36 @@ export function CaptionPanel({ className }: CaptionPanelProps) {
                   type="button"
                   onClick={resetAllOverrides}
                   disabled={!hasBlockOverrides}
-                  title="Clear every per-block override"
+                  title="Clear every per-block text and style override"
                   className="rounded-md border border-border px-2 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40 disabled:hover:text-muted-foreground"
                 >
-                  Reset all
+                  Reset block overrides
                 </button>
               </div>
 
               {selectedBlock ? (
                 <BlockEditor
                   key={selectedBlock.id}
+                  blockId={selectedBlock.id}
                   text={selectedText}
-                  positionYPct={selectedPositionYPct}
-                  hasPositionOverride={selectedHasPositionOverride}
+                  attached={selectedResolved?.pinToSplit ?? false}
+                  positionYPct={selectedResolved?.positionYPct ?? 0.7}
                   onCommitText={commitSelectedText}
-                  onNudge={(v) => setBlockPosition(selectedBlock.id, v)}
-                  onClearPosition={() => clearBlockPosition(selectedBlock.id)}
+                  onDetach={() =>
+                    selectedResolved &&
+                    detachCaptionBlock(
+                      selectedBlock.id,
+                      settledSplitRatio + selectedResolved.splitOffsetPct
+                    )
+                  }
+                  beginPositionGesture={beginCaptionPositionGesture}
+                  updatePositionGesture={updateCaptionPositionGesture}
+                  endPositionGesture={endCaptionPositionGesture}
+                  cancelPositionGesture={cancelCaptionPositionGesture}
+                  subscribePositionCancellation={
+                    subscribeCaptionGestureCancellation
+                  }
+                  onAttach={() => attachCaptionBlock(selectedBlock.id)}
                   onDeselect={() => selectCaptionBlock(null)}
                 />
               ) : (
@@ -585,20 +601,32 @@ function Section({
 // cut, timing, or `words[]`.
 // ---------------------------------------------------------------------------
 function BlockEditor({
+  blockId,
   text,
+  attached,
   positionYPct,
-  hasPositionOverride,
   onCommitText,
-  onNudge,
-  onClearPosition,
+  onDetach,
+  beginPositionGesture,
+  updatePositionGesture,
+  endPositionGesture,
+  cancelPositionGesture,
+  subscribePositionCancellation,
+  onAttach,
   onDeselect,
 }: {
+  blockId: string;
   text: string;
+  attached: boolean;
   positionYPct: number;
-  hasPositionOverride: boolean;
   onCommitText: (raw: string) => void;
-  onNudge: (positionYPct: number) => void;
-  onClearPosition: () => void;
+  onDetach: () => void;
+  beginPositionGesture: (blockId: string) => string | null;
+  updatePositionGesture: (token: string, positionYPct: number) => void;
+  endPositionGesture: (token: string) => void;
+  cancelPositionGesture: (token: string) => void;
+  subscribePositionCancellation: (listener: () => void) => () => void;
+  onAttach: () => void;
   onDeselect: () => void;
 }) {
   // Local draft so keystrokes don't round-trip through the store per character
@@ -654,32 +682,37 @@ function BlockEditor({
         </span>
       </div>
 
-      {/* Per-scene vertical nudge -- only THIS block moves. */}
+      {/* Explicit per-block placement mode. The renderer owns visual clamping. */}
       <div className="flex flex-col gap-1">
         <div className="flex items-center justify-between">
-          <span className="text-[11px] text-muted-foreground">
-            This scene position
-          </span>
+          <span className="text-[11px] text-muted-foreground">Placement mode</span>
           <button
             type="button"
-            onClick={onClearPosition}
-            disabled={!hasPositionOverride}
-            title="Revert this scene to the global caption position"
+            onClick={attached ? onDetach : onAttach}
             className="flex items-center gap-1 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40 disabled:hover:text-muted-foreground"
           >
-            <ArrowUUpLeft size={12} weight="bold" />
-            Reset
+            {attached ? "Soltar legenda" : "Fixar na divisao"}
           </button>
         </div>
-        <SliderRow
-          label="Higher / lower"
-          value={positionYPct}
-          min={0.4}
-          max={0.92}
-          step={0.005}
-          display={`${Math.round(positionYPct * 100)}%`}
-          onChange={onNudge}
-        />
+        {attached ? (
+          <span className="px-1 text-[10px] leading-snug text-muted-foreground">
+            Attached to the split and following the global offset.
+          </span>
+        ) : (
+          <SliderRow
+            label="Posicao absoluta da legenda"
+            value={positionYPct}
+            min={0}
+            max={1}
+            step={0.005}
+            display={`${Math.round(positionYPct * 100)}%`}
+            beginGesture={() => beginPositionGesture(blockId)}
+            updateGesture={updatePositionGesture}
+            endGesture={endPositionGesture}
+            cancelGesture={cancelPositionGesture}
+            subscribeCancellation={subscribePositionCancellation}
+          />
+        )}
       </div>
     </div>
   );
@@ -696,6 +729,11 @@ function SliderRow({
   step,
   display,
   onChange,
+  beginGesture,
+  updateGesture,
+  endGesture,
+  cancelGesture,
+  subscribeCancellation,
 }: {
   label: string;
   value: number;
@@ -703,8 +741,66 @@ function SliderRow({
   max: number;
   step: number;
   display: string;
-  onChange: (v: number) => void;
+  onChange?: (v: number) => void;
+  beginGesture?: () => string | null;
+  updateGesture?: (token: string, value: number) => void;
+  endGesture?: (token: string) => void;
+  cancelGesture?: (token: string) => void;
+  subscribeCancellation?: (listener: () => void) => () => void;
 }) {
+  const tokenRef = useRef<string | null>(null);
+  const pointerIdRef = useRef<number | null>(null);
+  const keyboardRef = useRef(false);
+  const transactional = beginGesture !== undefined;
+
+  const clearLocalGesture = () => {
+    tokenRef.current = null;
+    pointerIdRef.current = null;
+    keyboardRef.current = false;
+  };
+  const begin = () => {
+    if (!beginGesture) return null;
+    if (!tokenRef.current) tokenRef.current = beginGesture();
+    return tokenRef.current;
+  };
+  const end = () => {
+    const token = tokenRef.current;
+    clearLocalGesture();
+    if (token) endGesture?.(token);
+  };
+  const cancel = () => {
+    const token = tokenRef.current;
+    clearLocalGesture();
+    if (token) cancelGesture?.(token);
+  };
+  const update = (next: number) => {
+    if (!transactional) {
+      onChange?.(next);
+      return;
+    }
+    const token = tokenRef.current;
+    if (token) updateGesture?.(token, next);
+  };
+  const isRangeKey = (key: string) =>
+    key.startsWith("Arrow") ||
+    key === "PageUp" ||
+    key === "PageDown" ||
+    key === "Home" ||
+    key === "End";
+
+  useEffect(() => {
+    if (!subscribeCancellation) return;
+    return subscribeCancellation(clearLocalGesture);
+  }, [subscribeCancellation]);
+  useEffect(
+    () => () => {
+      const token = tokenRef.current;
+      clearLocalGesture();
+      if (token) cancelGesture?.(token);
+    },
+    [cancelGesture]
+  );
+
   return (
     <div className="flex flex-col gap-1 px-1 pb-1">
       <div className="flex items-center justify-between">
@@ -715,11 +811,59 @@ function SliderRow({
       </div>
       <input
         type="range"
+        aria-label={label}
         min={min}
         max={max}
         step={step}
         value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
+        onPointerDown={(e) => {
+          if (!transactional) return;
+          if (begin()) pointerIdRef.current = e.pointerId;
+        }}
+        onPointerUp={(e) => {
+          if (pointerIdRef.current === e.pointerId) end();
+        }}
+        onPointerCancel={(e) => {
+          if (pointerIdRef.current === e.pointerId) cancel();
+        }}
+        onChange={(e) => update(Number(e.target.value))}
+        onKeyDown={(e) => {
+          if (transactional) e.stopPropagation();
+          if (e.key === "Escape" && transactional) {
+            e.preventDefault();
+            cancel();
+            return;
+          }
+          if (transactional && isRangeKey(e.key) && !keyboardRef.current) {
+            if (!begin()) return;
+            keyboardRef.current = true;
+          }
+          let next: number | null = null;
+          if (e.key === "ArrowRight" || e.key === "ArrowUp") {
+            next = value + step;
+          } else if (e.key === "ArrowLeft" || e.key === "ArrowDown") {
+            next = value - step;
+          } else if (e.key === "PageUp") {
+            next = value + step * 10;
+          } else if (e.key === "PageDown") {
+            next = value - step * 10;
+          } else if (e.key === "Home") {
+            next = min;
+          } else if (e.key === "End") {
+            next = max;
+          }
+          if (next === null) return;
+          e.preventDefault();
+          update(Math.max(min, Math.min(max, next)));
+        }}
+        onKeyUp={(e) => {
+          if (!transactional) return;
+          e.stopPropagation();
+          if (keyboardRef.current && isRangeKey(e.key)) end();
+        }}
+        onBlur={() => {
+          if (transactional) end();
+        }}
         className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-secondary accent-[#FF6B35]"
       />
     </div>

@@ -17,7 +17,11 @@
 
 import { useEffect } from "react";
 import { useRepurposeStore } from "@/lib/repurpose/store";
-import { ingestOverlayFile } from "@/lib/repurpose/overlay-ingest";
+import {
+  classifyOverlayFile,
+  ingestOverlayFile,
+  type OverlayImportOwner,
+} from "@/lib/repurpose/overlay-ingest";
 
 /** True when the event's target is a place a normal text paste should win. */
 function isEditableTarget(target: EventTarget | null): boolean {
@@ -35,8 +39,13 @@ function isEditableTarget(target: EventTarget | null): boolean {
  * at the current playhead (copy-to-disk, then addOverlay). Text pastes and pastes
  * into editable fields / the transcript panel are left to the browser.
  */
-export function useOverlayPaste(): void {
+export function useOverlayPaste(
+  enabled: boolean,
+  overlayImportOwner?: OverlayImportOwner
+): void {
   useEffect(() => {
+    if (!enabled) return;
+
     const onPaste = (e: ClipboardEvent) => {
       // Don't steal a real text paste into an input / the transcript.
       if (isEditableTarget(e.target)) return;
@@ -48,9 +57,8 @@ export function useOverlayPaste(): void {
       let mediaFile: File | null = null;
       for (const item of Array.from(items)) {
         if (item.kind !== "file") continue;
-        if (!item.type.startsWith("image/") && !item.type.startsWith("video/")) continue;
         const file = item.getAsFile();
-        if (file) {
+        if (file && classifyOverlayFile(file)) {
           mediaFile = file;
           break;
         }
@@ -61,12 +69,17 @@ export function useOverlayPaste(): void {
       e.preventDefault();
       const atTime = useRepurposeStore.getState().playhead;
       // Place at the canvas center (default drop point) at the current playhead.
-      void ingestOverlayFile(mediaFile, atTime).catch((err) => {
-        console.error("Overlay paste ingest failed:", err);
-      });
+      // Shared ingest publishes operation state; this catch only prevents an
+      // unhandled rejection and must not outlive/overwrite editor teardown.
+      void ingestOverlayFile(
+        mediaFile,
+        atTime,
+        undefined,
+        overlayImportOwner
+      ).catch(() => undefined);
     };
 
     window.addEventListener("paste", onPaste);
     return () => window.removeEventListener("paste", onPaste);
-  }, []);
+  }, [enabled, overlayImportOwner]);
 }

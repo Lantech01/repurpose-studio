@@ -36,7 +36,7 @@
 // Take, FootageMeta).
 // ===========================================================================
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Export, FilmSlate, Warning, Info, CaretDown, GridNine, ArrowLeft } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
@@ -62,6 +62,24 @@ import { useProjectPersistence } from "./useProjectPersistence";
 import { useBlockBrowserZoom } from "./useBlockBrowserZoom";
 import { useOverlayPaste } from "./useOverlayPaste";
 import { slugifyName } from "./naming";
+import {
+  cancelOverlayImport,
+  clearOverlayImport,
+  createOverlayImportOwner,
+  registerOverlayImportOwner,
+  releaseOverlayImportOwner,
+  subscribeOverlayImport,
+  type OverlayImportOwner,
+  type OverlayImportState,
+} from "@/lib/repurpose/overlay-ingest";
+import {
+  cancelSfxImport,
+  createSfxImportOwner,
+  registerSfxImportOwner,
+  releaseSfxImportOwner,
+  type SfxImportOwner,
+} from "@/lib/repurpose/sfx-ingest-client";
+import { VideoImportProgress } from "./VideoImportProgress";
 
 // ---------------------------------------------------------------------------
 // Placeholder Shorts list for the top-bar selector. Real data (per-Short
@@ -98,16 +116,25 @@ function PreviewPanel() {
       // stage. The canvas itself stays pure black (the real reel fill).
       className="flex h-full min-h-0 flex-col items-center justify-center bg-[#1F0608] p-6"
     >
-      {/* The 9:16 preview is HEIGHT-constrained so it never overflows the
-          column (which is what pushed the FACE half past the timeline before).
-          The wrapper is h-full with a 9:16 aspect-ratio, so the browser derives
-          its WIDTH from the available height -- capped at 340px on tall
-          viewports. PreviewCanvas (w-full + its own ratio) then fills it.
+      {/* The 9:16 preview is constrained so it never overflows the column
+          (which is what pushed the FACE half past the timeline before).
+          Container units select the tightest of the available width, height,
+          and 340px cap without setting both dimensions (which would distort
+          the aspect ratio). PreviewCanvas then fills that wrapper.
           min-h-0 lets the flex child actually shrink to the column height.
           The framing "how it works" copy lives in the Inspector (an ⓘ fold) so
           it never eats the center canvas -- see FramingHelp below. */}
-      <div className="flex min-h-0 w-full flex-1 items-center justify-center">
-        <div className="relative h-full max-w-[340px] shrink" style={{ aspectRatio: "9 / 16" }}>
+      <div
+        className="flex min-h-0 w-full flex-1 items-center justify-center"
+        style={{ containerType: "size" }}
+      >
+        <div
+          className="relative shrink-0"
+          style={{
+            aspectRatio: "9 / 16",
+            width: "min(340px, 100cqw, calc(100cqh * 9 / 16))",
+          }}
+        >
           <PreviewCanvas className="!h-full" />
         </div>
       </div>
@@ -162,7 +189,15 @@ function FramingHelp() {
 // vertically if content overflows, mirrors the transcript rail's fixed width.
 // ---------------------------------------------------------------------------
 
-function InspectorRail() {
+function InspectorRail({
+  overlayImportOwner,
+  sfxImportOwner,
+  projectId,
+}: {
+  overlayImportOwner: OverlayImportOwner;
+  sfxImportOwner: SfxImportOwner;
+  projectId: string;
+}) {
   return (
     <div
       id="inspector-panel"
@@ -174,12 +209,11 @@ function InspectorRail() {
         </h2>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto p-4">
-        {/* Footage / transcript ingest -- prominent while footage is missing,
-            collapses to a "Re-import footage" fold once it's loaded. Owns the
-            demo auto-load + caption backfill on mount. */}
-        <FilesPanel />
+        {/* Timeline-defining sources come first; the generic media library is
+            optional and must not look like the empty project's starting point. */}
+        <SourcesPanel overlayImportOwner={overlayImportOwner} />
         <div className="mt-6 border-t border-border pt-4">
-          <SourcesPanel />
+          <FilesPanel />
         </div>
         <div className="mt-6 border-t border-border pt-4">
           <ColorAdjustPanel />
@@ -191,7 +225,7 @@ function InspectorRail() {
           <MusicPanel />
         </div>
         <div className="mt-6 border-t border-border pt-4">
-          <SfxPanel />
+          <SfxPanel projectId={projectId} sfxImportOwner={sfxImportOwner} />
         </div>
         <div className="mt-6 border-t border-border pt-4">
           <FramingHelp />
@@ -201,13 +235,23 @@ function InspectorRail() {
   );
 }
 
-function TimelinePanel() {
+function TimelinePanel({
+  overlayImportOwner,
+  sfxImportOwner,
+}: {
+  overlayImportOwner: OverlayImportOwner;
+  sfxImportOwner: SfxImportOwner;
+}) {
   return (
     <div
       id="timeline-panel"
       className="flex h-full flex-col border-t border-border bg-card p-2"
     >
-      <Timeline className="flex-1 min-h-0" />
+      <Timeline
+        className="flex-1 min-h-0"
+        overlayImportOwner={overlayImportOwner}
+        sfxImportOwner={sfxImportOwner}
+      />
     </div>
   );
 }
@@ -222,6 +266,7 @@ function TopBar({
   onSelectShort,
   durationLabel,
   onExport,
+  onCancelExport,
   exporting,
   exportProgress,
   resolution,
@@ -233,6 +278,7 @@ function TopBar({
   onSelectShort: (id: string) => void;
   durationLabel: string;
   onExport: () => void;
+  onCancelExport: () => void;
   exporting: boolean;
   /** Navigate back to the projects hub (/repurpose-studio). */
   onBackToHub: () => void;
@@ -338,8 +384,8 @@ function TopBar({
 
         <Button
           size="sm"
-          onClick={onExport}
-          disabled={exporting}
+          onClick={exporting ? onCancelExport : onExport}
+          aria-label={exporting ? "Cancel export" : undefined}
           className="relative min-w-[150px] gap-1.5 overflow-hidden"
         >
           {/* Progress fill -- a translucent bar that grows left-to-right behind
@@ -379,6 +425,15 @@ const EXPORT_STATUS_LABEL: Record<string, string> = {
 
 export function RepurposeEditor({ projectId }: { projectId: string }) {
   const router = useRouter();
+  const overlayImportLifecycle = useMemo(
+    () => ({ projectId, owner: createOverlayImportOwner() }),
+    [projectId]
+  );
+  const overlayImportOwner = overlayImportLifecycle.owner;
+  const sfxImportOwner = useMemo(
+    () => createSfxImportOwner(projectId),
+    [projectId]
+  );
   const [selectedShortId, setSelectedShortId] = useState(SHORT_OPTIONS[0].id);
   const [exporting, setExporting] = useState(false);
   // Live export progress ({label, pct}) or null when idle. Drives the Export
@@ -390,17 +445,57 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
   // Last export error message, or null. Surfaced as a dismissible banner so a
   // failed export is visible instead of only hitting the console.
   const [exportError, setExportError] = useState<string | null>(null);
+  const [exportWarning, setExportWarning] = useState<string | null>(null);
+  const [overlayImport, setOverlayImport] =
+    useState<OverlayImportState | null>(null);
   // Chosen output resolution. Default 1080p (standard Reel delivery); 4K
   // upscales for platforms that keep more of the source.
   const [resolution, setResolution] = useState<ExportResolution>("1080p");
   const duration = useRepurposeStore((s) => s.duration);
+  const projectEpoch = useRepurposeStore((s) => s.projectEpoch);
+  const exportControllerRef = useRef<AbortController | null>(null);
 
   // Per-project disk persistence: loads THIS project (by route id) on mount,
   // debounce-autosaves edits to disk, auto-creates the dated-slug project on the
   // first real content and router.replaces the URL to it. Returns the resolved
   // project name (derived from the transcript, then frozen) and
   // `footageNeedsReimport` (true when restored footage used dead blob: URLs).
-  const { footageNeedsReimport, projectName } = useProjectPersistence(projectId);
+  const {
+    footageNeedsReimport,
+    projectName,
+    ready,
+    loadError,
+    saveError,
+    retryLoad,
+    saveConflict,
+    resolveSaveConflict,
+  } = useProjectPersistence(projectId);
+  const editorEnabled = ready && !loadError && !saveConflict;
+
+  useEffect(() => {
+    registerOverlayImportOwner(overlayImportOwner);
+    const unsubscribe = subscribeOverlayImport(
+      setOverlayImport,
+      overlayImportOwner
+    );
+    return () => {
+      unsubscribe();
+      releaseOverlayImportOwner(overlayImportOwner);
+    };
+  }, [overlayImportOwner]);
+
+  useEffect(() => {
+    registerSfxImportOwner(sfxImportOwner);
+    return () => releaseSfxImportOwner(sfxImportOwner);
+  }, [sfxImportOwner]);
+
+  useEffect(() => {
+    if (!editorEnabled) {
+      cancelOverlayImport(overlayImportOwner);
+      clearOverlayImport(overlayImportOwner);
+      cancelSfxImport(sfxImportOwner);
+    }
+  }, [editorEnabled, overlayImportOwner, sfxImportOwner]);
 
   // Build the selector options: each Short reads "<Project Title> · Short N".
   // Before a transcript loads there's no title yet, so fall back to the plain
@@ -418,12 +513,19 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
   // the studio is open -- zooming the timeline must never also zoom the app.
   // React's root wheel listener is passive, so this needs the native
   // non-passive document listener inside the hook.
-  useBlockBrowserZoom();
+  useBlockBrowserZoom(editorEnabled);
 
   // Paste an image/video from the clipboard -> overlay at the playhead. Gated
   // off inputs / textareas / contentEditable / the transcript panel so a normal
   // text paste there still runs natively.
-  useOverlayPaste();
+  useOverlayPaste(editorEnabled, overlayImportOwner);
+
+  useEffect(() => {
+    return () => {
+      exportControllerRef.current?.abort();
+      exportControllerRef.current = null;
+    };
+  }, [projectId, projectEpoch]);
 
   const durationLabel = useMemo(() => formatDuration(duration), [duration]);
 
@@ -438,8 +540,11 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
     const selectedLabel =
       shortOptions.find((o) => o.id === selectedShortId)?.label ?? selectedShortId;
     const exportStem = slugifyName(selectedLabel) || selectedShortId;
+    const controller = new AbortController();
+    exportControllerRef.current = controller;
     setExporting(true);
     setExportError(null);
+    setExportWarning(null);
     setExportProgress({ label: "Preparing", pct: 0 });
     try {
       const result = await exportShort({
@@ -456,13 +561,15 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
         captionsEnabled: state.captionsEnabled,
         captionStyle: state.captionStyle,
         captionBlocks: state.captionBlocks,
-        // Generated sound-effects track (a full-length WAV) mixed into the export
-        // audio alongside the face-cam. Null when none was generated.
-        sfxTrack: state.sfxTrack,
+        // Editable sound-effect clips mixed into the output timeline.
+        sfxClips: state.sfxClips,
+        sfxAssets: state.sfxAssets,
         musicTrack: state.musicTrack,
         resolution,
+        abortSignal: controller.signal,
         fileName: `${exportStem}${resolution === "4k" ? "-4k" : ""}.mp4`,
         onProgress: (p) => {
+          if (controller.signal.aborted) return;
           setExportProgress({
             label: EXPORT_STATUS_LABEL[p.status] ?? "Exporting",
             pct: Math.round(p.progress),
@@ -473,17 +580,120 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
       // the click guard above already covers that, so a null here is unexpected.
       if (result === null) {
         setExportError("Export produced no output. Check that footage is loaded.");
+      } else if (result.warnings.length > 0) {
+        setExportWarning(result.warnings.join(" "));
       }
     } catch (err) {
-      console.error("Repurpose export failed:", err);
-      setExportError(
-        err instanceof Error ? err.message : "Export failed. See console for details."
-      );
+      if (!(err instanceof DOMException && err.name === "AbortError")) {
+        console.error("Repurpose export failed:", err);
+        setExportError(
+          err instanceof Error ? err.message : "Export failed. See console for details."
+        );
+      }
     } finally {
+      if (exportControllerRef.current === controller) {
+        exportControllerRef.current = null;
+      }
       setExporting(false);
       setExportProgress(null);
     }
   }, [exporting, selectedShortId, resolution, shortOptions]);
+
+  const cancelExport = useCallback(() => {
+    exportControllerRef.current?.abort();
+  }, []);
+
+  if (!ready || loadError || saveConflict) {
+    return (
+      <div className="fixed inset-0 flex items-center justify-center bg-background p-6 text-foreground dark">
+        {saveConflict ? (
+          <div
+            role="alert"
+            className="w-full max-w-2xl rounded-lg border border-amber-500/40 bg-card p-5 shadow-2xl"
+          >
+            <div className="flex items-start gap-3">
+              <Warning
+                size={20}
+                weight="fill"
+                className="mt-0.5 shrink-0 text-amber-400"
+              />
+              <div className="min-w-0 flex-1">
+                <p className="text-sm leading-relaxed text-amber-100">
+                  {saveConflict.reason === "PROJECT_FILE_CORRUPT" ? (
+                    <>
+                      <span className="font-semibold">
+                        O arquivo do projeto está corrompido.
+                      </span>{" "}
+                      Salve uma cópia para preservar suas alterações ou recarregue
+                      para tentar recuperar o arquivo original.
+                    </>
+                  ) : (
+                    <>
+                      <span className="font-semibold">Conflito ao salvar.</span> O
+                      projeto foi alterado em outra janela. Recarregue a versão mais
+                      recente ou preserve suas alterações em uma cópia.
+                    </>
+                  )}
+                </p>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void resolveSaveConflict("reload")}
+                    className="rounded-md border border-amber-400/40 px-3 py-2 text-xs font-semibold text-amber-100 transition-colors hover:bg-amber-400/10"
+                  >
+                    Recarregar projeto
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void resolveSaveConflict("save-copy")}
+                    className="rounded-md bg-amber-400 px-3 py-2 text-xs font-semibold text-amber-950 transition-opacity hover:opacity-90"
+                  >
+                    Salvar uma cópia
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : loadError ? (
+          <div
+            role="alert"
+            className="w-full max-w-md rounded-lg border border-red-500/40 bg-card p-5 shadow-2xl"
+          >
+            <div className="flex items-start gap-3">
+              <Warning
+                size={20}
+                weight="fill"
+                className="mt-0.5 shrink-0 text-red-500"
+              />
+              <div className="min-w-0 flex-1">
+                <h1 className="text-sm font-semibold text-foreground">
+                  Não foi possível carregar o projeto
+                </h1>
+                <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                  {loadError}
+                </p>
+                <button
+                  type="button"
+                  onClick={retryLoad}
+                  className="mt-4 rounded-md bg-primary px-3 py-2 text-xs font-semibold text-primary-foreground transition-opacity hover:opacity-90"
+                >
+                  Tentar novamente
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div
+            role="status"
+            aria-live="polite"
+            className="rounded-lg border border-border bg-card px-5 py-4 text-sm text-muted-foreground shadow-xl"
+          >
+            Carregando projeto...
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     // FIXED SHELL: position:fixed + inset-0 takes the editor out of document
@@ -499,12 +709,21 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
         onSelectShort={setSelectedShortId}
         durationLabel={durationLabel}
         onExport={handleExport}
+        onCancelExport={cancelExport}
         exporting={exporting}
         exportProgress={exportProgress}
         resolution={resolution}
         onResolutionChange={setResolution}
         onBackToHub={() => router.push("/repurpose-studio")}
       />
+
+      {overlayImport && (
+        <VideoImportProgress
+          state={overlayImport}
+          onCancel={() => cancelOverlayImport(overlayImportOwner)}
+          className="shrink-0 rounded-none border-x-0 border-t-0 px-4 py-2.5"
+        />
+      )}
 
       {/* Export-error banner -- dismissible. Shown when an export throws or
           produces no output, so a failure is visible instead of console-only. */}
@@ -524,6 +743,38 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
           >
             Dismiss
           </button>
+        </div>
+      )}
+
+      {exportWarning && (
+        <div
+          role="status"
+          aria-label="Export warning"
+          aria-live="polite"
+          className="flex shrink-0 items-start gap-2.5 border-b border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-200"
+        >
+          <Warning size={16} weight="fill" className="mt-px shrink-0 text-amber-400" />
+          <p className="flex-1 leading-relaxed">
+            <span className="font-semibold">Export warning.</span> {exportWarning}
+          </p>
+          <button
+            type="button"
+            aria-label="Dismiss export warning"
+            onClick={() => setExportWarning(null)}
+            className="shrink-0 rounded px-1.5 py-0.5 font-medium text-amber-200 hover:bg-amber-500/20"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {saveError && (
+        <div
+          role="alert"
+          className="flex shrink-0 items-center gap-2.5 border-b border-red-500/40 bg-red-500/10 px-4 py-2.5 text-xs text-red-200"
+        >
+          <Warning size={16} weight="fill" className="shrink-0 text-red-400" />
+          <p className="leading-relaxed">{saveError}</p>
         </div>
       )}
 
@@ -561,14 +812,14 @@ export function RepurposeEditor({ projectId }: { projectId: string }) {
         </main>
 
         <aside className="flex w-80 min-h-0 shrink-0 flex-col overflow-hidden">
-          <InspectorRail />
+          <InspectorRail overlayImportOwner={overlayImportOwner} sfxImportOwner={sfxImportOwner} projectId={projectId} />
         </aside>
       </div>
 
       {/* Timeline docked full-width along the bottom -- always the last thing on
           the page, never pushed below a scroll. */}
       <div className="h-60 min-h-0 shrink-0 overflow-hidden">
-        <TimelinePanel />
+        <TimelinePanel overlayImportOwner={overlayImportOwner} sfxImportOwner={sfxImportOwner} />
       </div>
     </div>
   );

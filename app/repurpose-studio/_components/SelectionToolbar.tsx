@@ -46,13 +46,186 @@ import {
 } from "@phosphor-icons/react";
 import { useRepurposeStore } from "@/lib/repurpose/store";
 import {
+  normalizeOverlayAppearance,
+  type OverlayFrameSnapshot,
+} from "@/lib/repurpose/overlay-effects";
+import {
   MIN_OVERLAY_SCALE,
   MAX_OVERLAY_SCALE,
+  isOverlayBandVisible,
+  resolveEffectivePrimaryOverlay,
   type PreviewRect,
 } from "@/lib/repurpose/overlay-geometry";
-import type { OverlayTransform, ClipTransition } from "@/lib/repurpose/types";
+import type {
+  OverlayEffect,
+  OverlayEffectType,
+  OverlaySlideDirection,
+  OverlayTransform,
+  ClipTransition,
+} from "@/lib/repurpose/types";
 
 const CORAL = "#FF6B35";
+
+const EFFECT_OPTIONS: ReadonlyArray<{ value: OverlayEffectType; label: string }> = [
+  { value: "none", label: "Nenhum" },
+  { value: "zoom", label: "Zoom" },
+  { value: "slide", label: "Slide" },
+  { value: "pop", label: "Pop" },
+  { value: "fade", label: "Fade" },
+];
+
+const DIRECTION_OPTIONS: ReadonlyArray<{
+  value: OverlaySlideDirection;
+  label: string;
+}> = [
+  { value: "left", label: "Esquerda" },
+  { value: "right", label: "Direita" },
+  { value: "up", label: "Cima" },
+  { value: "down", label: "Baixo" },
+];
+
+type AppearanceGestureField =
+  | "entranceDuration"
+  | "exitDuration"
+  | "cornerRadius";
+
+function AppearanceSlider({
+  id,
+  field,
+  label,
+  visibleLabel,
+  value,
+  min,
+  max,
+  step,
+  enabled,
+  canBegin,
+  format,
+}: {
+  id: string;
+  field: AppearanceGestureField;
+  label: string;
+  visibleLabel: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  enabled: boolean;
+  canBegin: () => boolean;
+  format: (value: number) => string;
+}) {
+  const beginGesture = useRepurposeStore((s) => s.beginOverlayAppearanceGesture);
+  const updateGesture = useRepurposeStore((s) => s.updateOverlayAppearanceGesture);
+  const endGesture = useRepurposeStore((s) => s.endOverlayAppearanceGesture);
+  const cancelGesture = useRepurposeStore((s) => s.cancelOverlayAppearanceGesture);
+  const subscribeCancellation = useRepurposeStore(
+    (s) => s.subscribeOverlayAppearanceGestureCancellation
+  );
+  const tokenRef = useRef<string | null>(null);
+  const pointerIdRef = useRef<number | null>(null);
+  const keyboardRef = useRef(false);
+  const interactionGenerationRef = useRef(0);
+  const armedGenerationRef = useRef<number | null>(null);
+
+  const begin = useCallback(() => {
+    if (!canBegin()) return null;
+    if (!tokenRef.current) tokenRef.current = beginGesture(id, field);
+    return tokenRef.current;
+  }, [beginGesture, canBegin, field, id]);
+  const end = useCallback(() => {
+    const token = tokenRef.current;
+    tokenRef.current = null;
+    pointerIdRef.current = null;
+    keyboardRef.current = false;
+    armedGenerationRef.current = null;
+    if (token) endGesture(token);
+  }, [endGesture]);
+  const cancel = useCallback(() => {
+    const token = tokenRef.current;
+    tokenRef.current = null;
+    pointerIdRef.current = null;
+    keyboardRef.current = false;
+    interactionGenerationRef.current += 1;
+    armedGenerationRef.current = null;
+    if (token) cancelGesture(token);
+  }, [cancelGesture]);
+
+  useEffect(() => subscribeCancellation(() => {
+    tokenRef.current = null;
+    pointerIdRef.current = null;
+    keyboardRef.current = false;
+    interactionGenerationRef.current += 1;
+    armedGenerationRef.current = null;
+  }), [subscribeCancellation]);
+  useEffect(() => () => cancel(), [cancel]);
+
+  const update = (next: number) => {
+    const token = tokenRef.current;
+    if (!token || armedGenerationRef.current === null) return;
+    updateGesture(token, next);
+  };
+  const isRangeKey = (key: string) =>
+    key.startsWith("Arrow") ||
+    key === "PageUp" ||
+    key === "PageDown" ||
+    key === "Home" ||
+    key === "End";
+
+  return (
+    <label className="flex items-center gap-1 text-[10px] text-zinc-400">
+      <span className="w-12 shrink-0">{visibleLabel}</span>
+      <input
+        aria-label={label}
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        disabled={!enabled}
+        onPointerDown={(event) => {
+          const token = begin();
+          if (!token) return;
+          const generation = interactionGenerationRef.current + 1;
+          interactionGenerationRef.current = generation;
+          armedGenerationRef.current = generation;
+          pointerIdRef.current = event.pointerId;
+        }}
+        onPointerUp={(event) => {
+          if (pointerIdRef.current === event.pointerId) end();
+        }}
+        onPointerCancel={(event) => {
+          if (pointerIdRef.current === event.pointerId) cancel();
+        }}
+        onKeyDown={(event) => {
+          event.stopPropagation();
+          if (event.key === "Escape") {
+            event.preventDefault();
+            cancel();
+          } else if (isRangeKey(event.key)) {
+            if (!keyboardRef.current) {
+              const token = begin();
+              if (!token) return;
+              const generation = interactionGenerationRef.current + 1;
+              interactionGenerationRef.current = generation;
+              armedGenerationRef.current = generation;
+              keyboardRef.current = true;
+            }
+          }
+        }}
+        onKeyUp={(event) => {
+          event.stopPropagation();
+          if (keyboardRef.current && isRangeKey(event.key)) end();
+        }}
+        onBlur={end}
+        onChange={(event) => update(parseFloat(event.target.value))}
+        className="h-1 min-w-0 flex-1 cursor-pointer accent-[#FF6B35] disabled:opacity-40"
+      />
+      <span className="w-9 text-right tabular-nums text-zinc-300">
+        {format(value)}
+      </span>
+    </label>
+  );
+}
 
 /**
  * One zoom control row for the rail: a LOG-mapped slider + a typeable % input.
@@ -102,6 +275,7 @@ function ZoomRow({
         <Minus size={11} weight="bold" />
       </button>
       <input
+        aria-label={`${title} slider`}
         type="range"
         min={0}
         max={1}
@@ -122,6 +296,7 @@ function ZoomRow({
         <Plus size={11} weight="bold" />
       </button>
       <input
+        aria-label={`${title} percentage`}
         type="text"
         inputMode="numeric"
         value={draft ?? String(pct)}
@@ -180,6 +355,10 @@ const TRANSITION_PRESET: Record<
 export interface SelectionToolbarProps {
   /** Reads the preview canvas's current on-screen rect (CSS px). Null if unmounted. */
   getRect: () => PreviewRect | null;
+  /** Reads the exact overlay sample used by the latest compositor frame. */
+  getFrameSnapshot: () => OverlayFrameSnapshot | null;
+  /** Reads the settled frame split used by persisted mutations. */
+  getSettledSplitRatio: () => number;
 }
 
 /** What the toolbar is currently pinned to, resolved each frame. */
@@ -192,6 +371,7 @@ type ToolbarTarget =
       anchorY: number;
       transform: OverlayTransform;
       opacity: number;
+      selectedCount: number;
     }
   | {
       kind: "base";
@@ -200,7 +380,11 @@ type ToolbarTarget =
     }
   | null;
 
-export function SelectionToolbar({ getRect }: SelectionToolbarProps) {
+export function SelectionToolbar({
+  getRect,
+  getFrameSnapshot,
+  getSettledSplitRatio,
+}: SelectionToolbarProps) {
   const [target, setTarget] = useState<ToolbarTarget>(null);
   const targetRef = useRef<ToolbarTarget>(null);
   const rafRef = useRef<number | null>(null);
@@ -220,7 +404,47 @@ export function SelectionToolbar({ getRect }: SelectionToolbarProps) {
   const setClipTransition = useRepurposeStore((s) => s.setClipTransition);
   const alignOverlays = useRepurposeStore((s) => s.alignOverlays);
   const distributeOverlays = useRepurposeStore((s) => s.distributeOverlays);
-  const selectedCount = useRepurposeStore((s) => s.selectedOverlayIds.length);
+  const setOverlayEntranceEffect = useRepurposeStore(
+    (s) => s.setOverlayEntranceEffect
+  );
+  const setOverlayExitEffect = useRepurposeStore((s) => s.setOverlayExitEffect);
+  const setOverlayCornerRadius = useRepurposeStore(
+    (s) => s.setOverlayCornerRadius
+  );
+  const targetOverlayId = target?.kind === "overlay" ? target.id : null;
+  const authoredOverlay = useRepurposeStore((s) =>
+    targetOverlayId
+      ? s.overlays.find((overlay) => overlay.id === targetOverlayId)
+      : undefined
+  );
+  const isCurrentInteractivePrimary = useCallback(
+    (id: string) => {
+      const state = useRepurposeStore.getState();
+      const overlay = state.overlays.find((candidate) => candidate.id === id);
+      const frame = getFrameSnapshot();
+      const effectivePrimary = frame
+        ? resolveEffectivePrimaryOverlay(
+            state.overlays.filter(
+              (candidate) => frame.appearances.get(candidate.id)?.interactive
+            ),
+            state.selectedOverlayIds,
+            state.selectedOverlayId,
+            frame.splitRatio
+          )
+        : null;
+      return !!overlay &&
+        effectivePrimary?.id === id &&
+        isOverlayBandVisible(overlay.band, getSettledSplitRatio());
+    },
+    [getFrameSnapshot, getSettledSplitRatio]
+  );
+  const mutateVisibleOverlay = useCallback(
+    (id: string, mutation: () => void) => {
+      if (!isCurrentInteractivePrimary(id)) return;
+      mutation();
+    },
+    [isCurrentInteractivePrimary]
+  );
 
   // Live punch state for the base-clip target so the two punch buttons can
   // render as toggles (add vs REMOVE). target may be null or an overlay, so the
@@ -251,28 +475,46 @@ export function SelectionToolbar({ getRect }: SelectionToolbarProps) {
       const rect = getRect();
       const state = useRepurposeStore.getState();
       const sel = state.getSelectedObject();
+      const frame = getFrameSnapshot();
+      const splitRatio = frame?.splitRatio ?? getSettledSplitRatio();
+      const appearances = frame?.appearances;
+      const eligibleOverlays = state.selectedOverlayIds.flatMap((id) => {
+        const overlay = state.overlays.find((candidate) => candidate.id === id);
+        return overlay &&
+          appearances?.get(overlay.id)?.interactive &&
+          overlay.naturalWidth > 0 &&
+          overlay.naturalHeight > 0
+          ? [overlay]
+          : [];
+      });
+      const effectivePrimary = resolveEffectivePrimaryOverlay(
+        eligibleOverlays,
+        state.selectedOverlayIds,
+        state.selectedOverlayId,
+        splitRatio
+      );
       let next: ToolbarTarget = null;
-      if (rect && sel) {
-        if (sel.type === "overlay") {
-          const ov = state.overlays.find((o) => o.id === sel.id);
-          if (ov && ov.naturalWidth > 0 && ov.naturalHeight > 0) {
-            const aspect = ov.naturalHeight / ov.naturalWidth;
-            const wPx = ov.transform.scale * rect.width;
-            const hPx = wPx * aspect;
-            const cx = ov.transform.x * rect.width;
-            const cy = ov.transform.y * rect.height;
-            // Top-center of the UN-rotated box; the toolbar sits a bit above it.
-            // Using the un-rotated top keeps the toolbar stable while rotating.
-            next = {
-              kind: "overlay",
-              id: ov.id,
-              anchorX: cx,
-              anchorY: cy - hPx / 2,
-              transform: ov.transform,
-              opacity: ov.opacity,
-            };
-          }
-        } else {
+      if (rect) {
+        const ov = effectivePrimary;
+        if (ov) {
+          const transform = appearances!.get(ov.id)!.transform;
+          const aspect = ov.naturalHeight / ov.naturalWidth;
+          const wPx = transform.scale * rect.width;
+          const hPx = wPx * aspect;
+          const cx = transform.x * rect.width;
+          const cy = transform.y * rect.height;
+          // Top-center of the UN-rotated box; the toolbar sits a bit above it.
+          // Using the un-rotated top keeps the toolbar stable while rotating.
+          next = {
+            kind: "overlay",
+            id: ov.id,
+            anchorX: cx,
+            anchorY: cy - hPx / 2,
+            transform,
+            opacity: ov.opacity,
+            selectedCount: eligibleOverlays.length,
+          };
+        } else if (state.selectedOverlayIds.length === 0 && sel?.type === "clip") {
           // Base clip -- only offer reset-framing when it's the ACTIVE scene the
           // preview is editing (the selected clip). Region is derived from which
           // half the playhead scene occupies is not meaningful here, so we key
@@ -294,7 +536,8 @@ export function SelectionToolbar({ getRect }: SelectionToolbarProps) {
             Math.abs(prev.anchorX - next.anchorX) > 0.5 ||
             Math.abs(prev.anchorY - next.anchorY) > 0.5 ||
             Math.abs(prev.transform.scale - next.transform.scale) > 1e-4 ||
-            Math.abs(prev.opacity - next.opacity) > 1e-3)) ||
+            Math.abs(prev.opacity - next.opacity) > 1e-3 ||
+            prev.selectedCount !== next.selectedCount)) ||
         (prev?.kind === "base" &&
           next?.kind === "base" &&
           prev.clipId !== next.clipId);
@@ -323,7 +566,7 @@ export function SelectionToolbar({ getRect }: SelectionToolbarProps) {
     return () => {
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     };
-  }, [getRect]);
+  }, [getFrameSnapshot, getRect, getSettledSplitRatio]);
 
   const onResetFraming = useCallback(
     (clipId: string) => {
@@ -415,7 +658,13 @@ export function SelectionToolbar({ getRect }: SelectionToolbarProps) {
       <div
         ref={railRef}
         className="pointer-events-auto fixed z-30 flex max-h-[80vh] flex-col items-stretch gap-1 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-900/95 p-1.5 shadow-2xl backdrop-blur"
-        style={{ left: -9999, top: "50%", transform: "translateY(-50%)" }}
+        style={{
+          left: -9999,
+          top: "50%",
+          transform: "translateY(-50%)",
+          zIndex: 30,
+          pointerEvents: "auto",
+        }}
         onPointerDown={(e) => e.stopPropagation()}
       >
         {/* Per-scene zoom: SCREEN (top region) then FACE (bottom region).
@@ -546,6 +795,102 @@ export function SelectionToolbar({ getRect }: SelectionToolbarProps) {
     );
   }
 
+  if (!authoredOverlay) return null;
+  const authoredAppearance = normalizeOverlayAppearance(authoredOverlay);
+  const canMutateAppearance = isOverlayBandVisible(
+    authoredOverlay.band,
+    getSettledSplitRatio()
+  );
+  const setEffect = (
+    kind: "entrance" | "exit",
+    effect: OverlayEffect
+  ) => {
+    mutateVisibleOverlay(target.id, () => {
+      if (kind === "entrance") setOverlayEntranceEffect(target.id, effect);
+      else setOverlayExitEffect(target.id, effect);
+    });
+  };
+  const renderEffectGroup = (
+    kind: "entrance" | "exit",
+    title: "Entrada" | "Saida",
+    effect: OverlayEffect
+  ) => {
+    const suffix = kind === "entrance" ? "entrada" : "saida";
+    return (
+      <fieldset className="min-w-[150px] space-y-1 rounded border border-zinc-800 px-1.5 pb-1.5">
+        <legend className="px-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-400">
+          {title}
+        </legend>
+        <label className="flex items-center gap-1 text-[10px] text-zinc-400">
+          <span className="w-12 shrink-0">Efeito</span>
+          <select
+            aria-label={`Efeito de ${suffix}`}
+            value={effect.type}
+            disabled={!canMutateAppearance}
+            onChange={(event) => {
+              const type = event.target.value as OverlayEffectType;
+              setEffect(kind, {
+                type,
+                durationSec: effect.durationSec,
+                ...(type === "slide"
+                  ? {
+                      direction:
+                        effect.type === "slide"
+                          ? effect.direction ?? "left"
+                          : "left",
+                    }
+                  : {}),
+              });
+            }}
+            className="h-6 min-w-0 flex-1 rounded border border-zinc-700 bg-zinc-800 px-1 text-[11px] text-zinc-200 outline-none focus:border-[#FF6B35] disabled:opacity-40"
+          >
+            {EFFECT_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        {effect.type === "slide" && (
+          <label className="flex items-center gap-1 text-[10px] text-zinc-400">
+            <span className="w-12 shrink-0">Direcao</span>
+            <select
+              aria-label={`Direcao da ${suffix}`}
+              value={effect.direction ?? "left"}
+              disabled={!canMutateAppearance}
+              onChange={(event) =>
+                setEffect(kind, {
+                  ...effect,
+                  direction: event.target.value as OverlaySlideDirection,
+                })
+              }
+              className="h-6 min-w-0 flex-1 rounded border border-zinc-700 bg-zinc-800 px-1 text-[11px] text-zinc-200 outline-none focus:border-[#FF6B35] disabled:opacity-40"
+            >
+              {DIRECTION_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+        <AppearanceSlider
+          id={target.id}
+          field={kind === "entrance" ? "entranceDuration" : "exitDuration"}
+          label={`Duracao da ${suffix}`}
+          visibleLabel="Duracao"
+          value={effect.durationSec}
+          min={0.1}
+          max={2}
+          step={0.01}
+          enabled={canMutateAppearance}
+          canBegin={() => isCurrentInteractivePrimary(target.id)}
+          format={(value) => `${value.toFixed(2)}s`}
+        />
+      </fieldset>
+    );
+  };
+
   // Overlay toolbar: DOCKED as a vertical rail hugging the preview panel's LEFT
   // inner edge (right up against the transcript rail), NOT the canvas edge --
   // which left it floating mid-way in the dead space. `position: fixed`; its
@@ -557,10 +902,17 @@ export function SelectionToolbar({ getRect }: SelectionToolbarProps) {
   return (
     <div
       ref={railRef}
+      data-overlay-id={target.id}
       className="pointer-events-auto fixed z-30 flex max-h-[80vh] flex-col items-stretch gap-1 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-900/95 p-1.5 shadow-2xl backdrop-blur"
       // Off-screen until the rAF tick sets the real left/top from the panel rect
       // (prevents a one-frame flash at 0,0 on select).
-      style={{ left: -9999, top: "50%", transform: "translateY(-50%)" }}
+      style={{
+        left: -9999,
+        top: "50%",
+        transform: "translateY(-50%)",
+        zIndex: 30,
+        pointerEvents: "auto",
+      }}
       // Stop pointer-downs on the toolbar from reaching the preview router
       // beneath (which would deselect / begin a drag).
       onPointerDown={(e) => e.stopPropagation()}
@@ -571,10 +923,14 @@ export function SelectionToolbar({ getRect }: SelectionToolbarProps) {
       <ZoomRow
         icon={<ArrowsOutCardinal size={14} weight="bold" style={{ color: CORAL }} />}
         title="Overlay scale (fraction of frame width)"
-        value={target.transform.scale}
+        value={authoredOverlay.transform.scale}
         min={MIN_OVERLAY_SCALE}
         max={MAX_OVERLAY_SCALE}
-        onChange={(scale) => updateOverlayTransform(target.id, { scale })}
+        onChange={(scale) =>
+          mutateVisibleOverlay(target.id, () =>
+            updateOverlayTransform(target.id, { scale })
+          )
+        }
       />
 
       <div className="mx-1 my-0.5 h-px bg-zinc-700" />
@@ -590,30 +946,85 @@ export function SelectionToolbar({ getRect }: SelectionToolbarProps) {
           min={0}
           max={1}
           step={0.01}
-          value={target.opacity}
-          onChange={(e) => setOverlayOpacity(target.id, parseFloat(e.target.value))}
+          value={authoredOverlay.opacity}
+          onChange={(e) => {
+            const opacity = parseFloat(e.target.value);
+            mutateVisibleOverlay(target.id, () =>
+              setOverlayOpacity(target.id, opacity)
+            );
+          }}
           className="h-1 w-14 cursor-pointer accent-[#FF6B35]"
         />
         <span className="w-8 text-right text-xs tabular-nums text-zinc-300">
-          {Math.round(target.opacity * 100)}%
+          {Math.round(authoredOverlay.opacity * 100)}%
         </span>
       </label>
+
+      <div className="mx-1 my-0.5 h-px bg-zinc-700" />
+
+      {renderEffectGroup(
+        "entrance",
+        "Entrada",
+        authoredAppearance.entranceEffect
+      )}
+      {renderEffectGroup("exit", "Saida", authoredAppearance.exitEffect)}
+      <fieldset className="min-w-[150px] space-y-1 rounded border border-zinc-800 px-1.5 pb-1.5">
+        <legend className="px-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-400">
+          Cantos
+        </legend>
+        <AppearanceSlider
+          id={target.id}
+          field="cornerRadius"
+          label="Raio dos cantos"
+          visibleLabel="Raio"
+          value={authoredAppearance.cornerRadius}
+          min={0}
+          max={0.5}
+          step={0.01}
+          enabled={canMutateAppearance}
+          canBegin={() => isCurrentInteractivePrimary(target.id)}
+          format={(value) => `${Math.round(value * 100)}%`}
+        />
+        <div className="grid grid-cols-2 gap-1">
+          {([
+            ["Quadrado", 0],
+            ["Suave", 0.04],
+            ["Redondo", 0.16],
+            ["Maximo", 0.5],
+          ] as const).map(([label, value]) => (
+            <button
+              key={label}
+              type="button"
+              aria-label={`${label} ${Math.round(value * 100)}%`}
+              disabled={!canMutateAppearance}
+              onClick={() =>
+                mutateVisibleOverlay(target.id, () =>
+                  setOverlayCornerRadius(target.id, value)
+                )
+              }
+              className="h-6 rounded bg-zinc-800 px-1 text-[10px] text-zinc-300 hover:bg-zinc-700 disabled:opacity-40"
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </fieldset>
 
       <div className="mx-1 my-0.5 h-px bg-zinc-700" />
 
       {/* Z-order controls (overlays only) -- a 2x2 grid to stay compact in the
           rail. */}
       <div className="grid grid-cols-2 gap-1">
-        <button className={btn} title="Send to back (Shift+[)" onClick={() => setOverlayZ(target.id, "back")}>
+        <button className={btn} title="Send to back (Shift+[)" onClick={() => mutateVisibleOverlay(target.id, () => setOverlayZ(target.id, "back"))}>
           <ArrowLineDown size={15} weight="bold" />
         </button>
-        <button className={btn} title="Send backward ([)" onClick={() => setOverlayZ(target.id, "backward")}>
+        <button className={btn} title="Send backward ([)" onClick={() => mutateVisibleOverlay(target.id, () => setOverlayZ(target.id, "backward"))}>
           <ArrowDown size={15} weight="bold" />
         </button>
-        <button className={btn} title="Bring forward (])" onClick={() => setOverlayZ(target.id, "forward")}>
+        <button className={btn} title="Bring forward (])" onClick={() => mutateVisibleOverlay(target.id, () => setOverlayZ(target.id, "forward"))}>
           <ArrowUp size={15} weight="bold" />
         </button>
-        <button className={btn} title="Bring to front (Shift+])" onClick={() => setOverlayZ(target.id, "front")}>
+        <button className={btn} title="Bring to front (Shift+])" onClick={() => mutateVisibleOverlay(target.id, () => setOverlayZ(target.id, "front"))}>
           <ArrowLineUp size={15} weight="bold" />
         </button>
       </div>
@@ -622,49 +1033,49 @@ export function SelectionToolbar({ getRect }: SelectionToolbarProps) {
           Acts on the WHOLE selection (not just the primary). Rect comes from
           getRect so the pure-geometry store actions have the preview box. A 3x3
           grid keeps the 8 buttons compact inside the vertical rail. */}
-      {selectedCount > 1 && (
+      {target.selectedCount > 1 && (
         <>
           <div className="mx-1 my-0.5 h-px bg-zinc-700" />
           <div className="grid grid-cols-3 gap-1">
           <button
             className={btn}
             title="Align left edges"
-            onClick={() => { const r = getRect(); if (r) alignOverlays("left", r); }}
+            onClick={() => { const r = getRect(); if (r) alignOverlays("left", r, getSettledSplitRatio()); }}
           >
             <AlignLeft size={15} weight="bold" />
           </button>
           <button
             className={btn}
             title="Align horizontal centers"
-            onClick={() => { const r = getRect(); if (r) alignOverlays("hcenter", r); }}
+            onClick={() => { const r = getRect(); if (r) alignOverlays("hcenter", r, getSettledSplitRatio()); }}
           >
             <AlignCenterVertical size={15} weight="bold" />
           </button>
           <button
             className={btn}
             title="Align right edges"
-            onClick={() => { const r = getRect(); if (r) alignOverlays("right", r); }}
+            onClick={() => { const r = getRect(); if (r) alignOverlays("right", r, getSettledSplitRatio()); }}
           >
             <AlignRight size={15} weight="bold" />
           </button>
           <button
             className={btn}
             title="Align top edges"
-            onClick={() => { const r = getRect(); if (r) alignOverlays("top", r); }}
+            onClick={() => { const r = getRect(); if (r) alignOverlays("top", r, getSettledSplitRatio()); }}
           >
             <AlignTop size={15} weight="bold" />
           </button>
           <button
             className={btn}
             title="Align vertical centers"
-            onClick={() => { const r = getRect(); if (r) alignOverlays("vcenter", r); }}
+            onClick={() => { const r = getRect(); if (r) alignOverlays("vcenter", r, getSettledSplitRatio()); }}
           >
             <AlignCenterHorizontal size={15} weight="bold" />
           </button>
           <button
             className={btn}
             title="Align bottom edges"
-            onClick={() => { const r = getRect(); if (r) alignOverlays("bottom", r); }}
+            onClick={() => { const r = getRect(); if (r) alignOverlays("bottom", r, getSettledSplitRatio()); }}
           >
             <AlignBottom size={15} weight="bold" />
           </button>
@@ -673,18 +1084,18 @@ export function SelectionToolbar({ getRect }: SelectionToolbarProps) {
           <button
             className={btn}
             title="Distribute horizontally (needs 3+)"
-            disabled={selectedCount < 3}
-            style={{ opacity: selectedCount < 3 ? 0.35 : 1 }}
-            onClick={() => { const r = getRect(); if (r) distributeOverlays("h", r); }}
+            disabled={target.selectedCount < 3}
+            style={{ opacity: target.selectedCount < 3 ? 0.35 : 1 }}
+            onClick={() => { const r = getRect(); if (r) distributeOverlays("h", r, getSettledSplitRatio()); }}
           >
             <ColumnsPlusRight size={15} weight="bold" />
           </button>
           <button
             className={btn}
             title="Distribute vertically (needs 3+)"
-            disabled={selectedCount < 3}
-            style={{ opacity: selectedCount < 3 ? 0.35 : 1 }}
-            onClick={() => { const r = getRect(); if (r) distributeOverlays("v", r); }}
+            disabled={target.selectedCount < 3}
+            style={{ opacity: target.selectedCount < 3 ? 0.35 : 1 }}
+            onClick={() => { const r = getRect(); if (r) distributeOverlays("v", r, getSettledSplitRatio()); }}
           >
             <RowsPlusBottom size={15} weight="bold" />
           </button>
@@ -698,7 +1109,9 @@ export function SelectionToolbar({ getRect }: SelectionToolbarProps) {
       <button
         className="flex h-7 items-center justify-center gap-1 rounded text-xs text-red-300 hover:bg-red-950/50"
         title="Delete overlay (Delete)"
-        onClick={() => removeOverlay(target.id)}
+        onClick={() =>
+          mutateVisibleOverlay(target.id, () => removeOverlay(target.id))
+        }
       >
         <Trash size={15} weight="bold" />
         Delete

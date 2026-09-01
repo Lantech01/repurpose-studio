@@ -4,7 +4,7 @@
 // WHY THIS EXISTS: overlays (free-floating image/video media dropped onto the
 // timeline) must survive a page reload. A browser blob: URL dies on refresh and
 // a raw OS path can't be assigned to <img>/<video>. So this route is the durable
-// bridge: POST persists the picked file to disk (~/Downloads/repurpose-overlays)
+// bridge: POST persists the picked file to a configurable local asset root
 // and hands back a stable absolute path; GET streams an IMAGE back over HTTP so
 // the compositor can draw it. It is the IMAGE sibling of /api/repurpose/video --
 // videos keep flowing through that route; this one adds still-image serving with
@@ -23,13 +23,14 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
+import { resolveRepurposeAssetDir } from "@/lib/repurpose/asset-root";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
 
 // Where persisted overlay media lands. mkdir -p'd on first write.
-const OVERLAY_DIR = path.join(os.homedir(), "Downloads", "repurpose-overlays");
+const OVERLAY_DIR = resolveRepurposeAssetDir();
 
 // Kebab-case, 2..61 chars. Same shape as the reel-overlay upload route.
 const NAME_RE = /^[a-z0-9][a-z0-9-]{1,60}$/;
@@ -51,6 +52,7 @@ const ALLOWED_EXT = new Set([
 // Roots a GET is allowed to read from. Mirrors /api/repurpose/video's allow-list
 // (overlays live under ~/Downloads); generated/temp inputs live in the OS temp dir.
 const ALLOWED_ROOTS: string[] = [
+  OVERLAY_DIR,
   path.join(os.homedir(), "Downloads"),
   path.join(os.homedir(), "Desktop"),
   path.join(os.homedir(), "Documents"),
@@ -190,7 +192,7 @@ export async function GET(request: Request): Promise<Response> {
 // POST — persist a picked overlay file to disk, return its absolute path.
 // ---------------------------------------------------------------------------
 // Multipart body with field "file" + "name" (kebab-case). Writes the bytes to
-// ~/Downloads/repurpose-overlays/<name>-<shorthash>.<ext>. The short hash (from
+// <asset-root>/<name>-<shorthash>.<ext>. The short hash (from
 // name + size + time) keeps re-adds of the same-named file from clobbering an
 // earlier overlay that's still referenced on the timeline.
 
